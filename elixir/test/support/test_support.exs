@@ -99,6 +99,9 @@ defmodule SymphonyElixir.TestSupport do
           tracker_project_slug: "project",
           tracker_repo_owner: nil,
           tracker_repo_name: nil,
+          tracker_project_title: nil,
+          tracker_project_owner_login: nil,
+          tracker_project_owner_type: nil,
           tracker_assignee: nil,
           tracker_active_states: ["Todo", "In Progress"],
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
@@ -138,6 +141,9 @@ defmodule SymphonyElixir.TestSupport do
     tracker_project_slug = Keyword.get(config, :tracker_project_slug)
     tracker_repo_owner = Keyword.get(config, :tracker_repo_owner)
     tracker_repo_name = Keyword.get(config, :tracker_repo_name)
+    tracker_project_title = Keyword.get(config, :tracker_project_title)
+    tracker_project_owner_login = Keyword.get(config, :tracker_project_owner_login)
+    tracker_project_owner_type = Keyword.get(config, :tracker_project_owner_type)
     tracker_assignee = Keyword.get(config, :tracker_assignee)
     tracker_active_states = Keyword.get(config, :tracker_active_states)
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
@@ -178,6 +184,9 @@ defmodule SymphonyElixir.TestSupport do
         "  project_slug: #{yaml_value(tracker_project_slug)}",
         "  repo_owner: #{yaml_value(tracker_repo_owner)}",
         "  repo_name: #{yaml_value(tracker_repo_name)}",
+        "  project_title: #{yaml_value(tracker_project_title)}",
+        "  project_owner_login: #{yaml_value(tracker_project_owner_login)}",
+        "  project_owner_type: #{yaml_value(tracker_project_owner_type)}",
         "  assignee: #{yaml_value(tracker_assignee)}",
         "  active_states: #{yaml_value(tracker_active_states)}",
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",

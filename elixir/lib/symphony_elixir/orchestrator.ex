@@ -347,6 +347,12 @@ defmodule SymphonyElixir.Orchestrator do
     select_worker_host(state, preferred_worker_host)
   end
 
+  @doc false
+  @spec reconcile_issue_primitives_for_test(map()) :: :ok | {:error, term()}
+  def reconcile_issue_primitives_for_test(%{} = issue) do
+    reconcile_issue_primitives(issue)
+  end
+
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
 
   defp reconcile_running_issue_states([issue | rest], state, active_states, terminal_states) do
@@ -674,7 +680,11 @@ defmodule SymphonyElixir.Orchestrator do
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %{} = refreshed_issue} ->
-        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
+        refreshed_issue
+        |> reconcile_tracker_primitives_for_dispatch()
+        |> then(fn reconciled_issue ->
+          do_dispatch_issue(state, reconciled_issue, attempt, preferred_worker_host)
+        end)
 
       {:skip, :missing} ->
         Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
@@ -694,13 +704,20 @@ defmodule SymphonyElixir.Orchestrator do
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
     recipient = self()
 
-    case select_worker_host(state, preferred_worker_host) do
-      :no_worker_capacity ->
-        Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
-        state
+    case reconcile_issue_primitives(issue) do
+      :ok ->
+        case select_worker_host(state, preferred_worker_host) do
+          :no_worker_capacity ->
+            Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
+            state
 
-      worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+          worker_host ->
+            spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        end
+
+      {:error, reason} ->
+        Logger.warning("Primitive reconciliation failed for #{issue_context(issue)}: #{inspect(reason)}")
+        state
     end
   end
 
@@ -775,6 +792,20 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
+
+  defp reconcile_tracker_primitives_for_dispatch(%{} = issue) do
+    case Tracker.reconcile_issue_primitives(issue) do
+      :ok ->
+        issue
+
+      {:error, reason} ->
+        Logger.warning("Continuing without tracker primitive reconciliation for #{issue_context(issue)}: #{inspect(reason)}")
+
+        issue
+    end
+  end
+
+  defp reconcile_tracker_primitives_for_dispatch(issue), do: issue
 
   defp complete_issue(%State{} = state, issue_id) do
     %{
@@ -977,6 +1008,68 @@ defmodule SymphonyElixir.Orchestrator do
   defp pick_retry_workspace_path(previous_retry, metadata) do
     metadata[:workspace_path] || Map.get(previous_retry, :workspace_path)
   end
+
+  defp reconcile_issue_primitives(%{} = issue) do
+    if Config.settings!().tracker.kind == "github" do
+      issue_id = issue.id
+      assignees = normalize_desired_assignees(issue)
+      labels = normalize_desired_labels(issue)
+      blocked_by_ids = normalize_desired_blocked_by_ids(issue)
+      milestone_number = desired_milestone_number(issue)
+
+      with :ok <- SymphonyElixir.GitHub.Adapter.reconcile_issue_milestone(issue_id, milestone_number),
+           :ok <- SymphonyElixir.GitHub.Adapter.reconcile_issue_assignees(issue_id, assignees),
+           :ok <- SymphonyElixir.GitHub.Adapter.reconcile_issue_labels(issue_id, labels),
+           :ok <- SymphonyElixir.GitHub.Adapter.reconcile_issue_blocked_by(issue_id, blocked_by_ids) do
+        :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  defp reconcile_issue_primitives(_issue), do: :ok
+
+  defp desired_milestone_number(%{tracker_metadata: %{"milestone" => %{"number" => number}}})
+       when is_integer(number),
+       do: number
+
+  defp desired_milestone_number(_issue), do: nil
+
+  defp normalize_desired_assignees(%{assignee_id: assignee_id}) when is_binary(assignee_id) do
+    assignee_id
+    |> String.trim()
+    |> case do
+      "" -> []
+      value -> [value]
+    end
+  end
+
+  defp normalize_desired_assignees(_issue), do: []
+
+  defp normalize_desired_labels(%{labels: labels}) when is_list(labels) do
+    labels
+    |> Enum.filter(&is_binary/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.map(&String.downcase/1)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp normalize_desired_labels(_issue), do: []
+
+  defp normalize_desired_blocked_by_ids(%{blocked_by: blocked_by}) when is_list(blocked_by) do
+    blocked_by
+    |> Enum.flat_map(fn
+      %{id: issue_id} when is_binary(issue_id) and issue_id != "" -> [issue_id]
+      _ -> []
+    end)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp normalize_desired_blocked_by_ids(_issue), do: []
 
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry
 
