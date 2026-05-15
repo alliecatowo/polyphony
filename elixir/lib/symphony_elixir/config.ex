@@ -4,6 +4,7 @@ defmodule SymphonyElixir.Config do
   """
 
   alias SymphonyElixir.Config.Schema
+  alias SymphonyElixir.GitHub.Auth
   alias SymphonyElixir.Workflow
 
   @default_prompt_template """
@@ -122,7 +123,7 @@ defmodule SymphonyElixir.Config do
       settings.tracker.kind not in ["github", "linear", "memory"] ->
         {:error, {:unsupported_tracker_kind, settings.tracker.kind}}
 
-      settings.tracker.kind == "github" and not present_string?(settings.tracker.api_key) ->
+      settings.tracker.kind == "github" and not Auth.github_auth_available?(settings.tracker) ->
         {:error, :missing_github_api_token}
 
       settings.tracker.kind == "github" and not present_string?(settings.tracker.repo_owner) ->

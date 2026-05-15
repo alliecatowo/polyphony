@@ -49,6 +49,48 @@ mise exec -- mix build
 mise exec -- ./bin/symphony ./WORKFLOW.md
 ```
 
+## GitHub App Webhook (Local)
+
+If you run a private GitHub App with a local tunnel/Funnel, start the webhook receiver with:
+
+```bash
+cd elixir
+mise run webhook
+```
+
+Expose it publicly with Tailscale Funnel:
+
+```bash
+cd elixir
+mise run funnel
+```
+
+Turn Funnel back off:
+
+```bash
+cd elixir
+mise run funnel-stop
+```
+
+This exposes:
+
+- `POST /github/webhook`
+
+Required environment variable:
+
+- `GITHUB_WEBHOOK_SECRET`
+
+The `webhook` task auto-loads `../.env` when present.
+
+Current auth note:
+
+- Webhook verification uses `GITHUB_WEBHOOK_SECRET`.
+- Tracker API auth selection for GitHub (`tracker.kind: github`) is:
+  1. `tracker.api_key` from `WORKFLOW.md` (including `$GITHUB_TOKEN` resolution), if present.
+  2. Otherwise, `GITHUB_APP_ID` + `GITHUB_PRIVATE_KEY`: Polyphony mints an app JWT, discovers the installation for
+     `tracker.repo_owner`/`tracker.repo_name`, then mints and caches an installation access token.
+- `GITHUB_INSTALLATION_ID` is not required.
+
 ## Configuration
 
 `WORKFLOW.md` provides YAML front matter plus prompt body. Example shape:

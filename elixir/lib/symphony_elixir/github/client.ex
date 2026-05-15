@@ -10,7 +10,7 @@ defmodule SymphonyElixir.GitHub.Client do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, GitHub.Issue}
+  alias SymphonyElixir.{Config, GitHub.Auth, GitHub.Issue}
 
   @issue_page_size 50
   @max_error_body_log_bytes 1_000
@@ -709,7 +709,7 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp validate_tracker!(tracker) do
     cond do
-      is_nil(tracker.api_key) -> {:error, :missing_github_api_token}
+      not Auth.github_auth_available?(tracker) -> {:error, :missing_github_api_token}
       not is_binary(tracker.repo_owner) -> {:error, :missing_github_repo_owner}
       not is_binary(tracker.repo_name) -> {:error, :missing_github_repo_name}
       true -> :ok
@@ -1622,16 +1622,12 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp graphql_headers do
-    case Config.settings!().tracker.api_key do
-      nil ->
-        {:error, :missing_github_api_token}
-
-      token ->
-        {:ok,
-         [
-           {"Authorization", "Bearer #{token}"},
-           {"Content-Type", "application/json"}
-         ]}
+    with {:ok, token} <- Auth.authorization_token(Config.settings!().tracker) do
+      {:ok,
+       [
+         {"Authorization", "Bearer #{token}"},
+         {"Content-Type", "application/json"}
+       ]}
     end
   end
 
@@ -1657,17 +1653,13 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp rest_headers do
-    case Config.settings!().tracker.api_key do
-      token when is_binary(token) and token != "" ->
-        {:ok,
-         [
-           {"Authorization", "Bearer #{token}"},
-           {"Accept", "application/vnd.github+json"},
-           {"X-GitHub-Api-Version", "2022-11-28"}
-         ]}
-
-      _ ->
-        {:error, :missing_github_api_token}
+    with {:ok, token} <- Auth.authorization_token(Config.settings!().tracker) do
+      {:ok,
+       [
+         {"Authorization", "Bearer #{token}"},
+         {"Accept", "application/vnd.github+json"},
+         {"X-GitHub-Api-Version", "2022-11-28"}
+       ]}
     end
   end
 

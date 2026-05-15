@@ -917,6 +917,29 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.codex.command == "#{codex_bin} app-server"
   end
 
+  test "github tracker validates when api key is absent but github app credentials are present" do
+    previous_app_id = System.get_env("GITHUB_APP_ID")
+    previous_private_key = System.get_env("GITHUB_PRIVATE_KEY")
+
+    System.put_env("GITHUB_APP_ID", "12345")
+    System.put_env("GITHUB_PRIVATE_KEY", "placeholder")
+
+    on_exit(fn ->
+      restore_env("GITHUB_APP_ID", previous_app_id)
+      restore_env("GITHUB_PRIVATE_KEY", previous_private_key)
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://api.github.com/graphql",
+      tracker_api_token: nil,
+      tracker_repo_owner: "acme",
+      tracker_repo_name: "polyphony"
+    )
+
+    assert :ok = Config.validate!()
+  end
+
   test "config no longer resolves legacy env: references" do
     workspace_env_var = "SYMP_WORKSPACE_ROOT_#{System.unique_integer([:positive])}"
     api_key_env_var = "SYMP_LINEAR_API_KEY_#{System.unique_integer([:positive])}"

@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.GitHubClientIntegrationTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.GitHub.Auth
   alias SymphonyElixir.GitHub.Client
   alias SymphonyElixir.GitHub.Issue, as: GitHubIssue
 
@@ -16,12 +17,137 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
     )
 
     previous_req_options = Req.default_options()
+    previous_app_id = System.get_env("GITHUB_APP_ID")
+    previous_private_key = System.get_env("GITHUB_PRIVATE_KEY")
+    previous_app_cfg_id = Application.get_env(:symphony_elixir, :github_app_id)
+    previous_app_cfg_key = Application.get_env(:symphony_elixir, :github_private_key)
 
     on_exit(fn ->
       Req.default_options(previous_req_options)
+      restore_env("GITHUB_APP_ID", previous_app_id)
+      restore_env("GITHUB_PRIVATE_KEY", previous_private_key)
+      if is_nil(previous_app_cfg_id), do: Application.delete_env(:symphony_elixir, :github_app_id), else: Application.put_env(:symphony_elixir, :github_app_id, previous_app_cfg_id)
+      if is_nil(previous_app_cfg_key), do: Application.delete_env(:symphony_elixir, :github_private_key), else: Application.put_env(:symphony_elixir, :github_private_key, previous_app_cfg_key)
+      Auth.clear_cache()
     end)
 
+    Auth.clear_cache()
+
     :ok
+  end
+
+  test "prefers tracker api key when present even if github app creds are set" do
+    System.put_env("GITHUB_APP_ID", "123")
+    System.put_env("GITHUB_PRIVATE_KEY", "not-used")
+
+    test_pid = self()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      if conn.method == "POST" do
+        send(test_pid, {:auth_header, List.keyfind(conn.req_headers, "authorization", 0)})
+      end
+
+      Req.Test.json(conn, %{"data" => %{"nodes" => []}})
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+    assert {:ok, _token} = Auth.authorization_token(Config.settings!().tracker)
+
+    assert {:ok, []} = Client.fetch_issue_states_by_ids(["I1"])
+    assert_receive {:auth_header, {"authorization", "Bearer ghs_test_token"}}
+  end
+
+  test "uses github app installation token with dynamic installation discovery when api key is missing" do
+    app_id = "12345"
+    private_key = generate_rsa_private_key_pem()
+    Application.put_env(:symphony_elixir, :github_app_id, app_id)
+    Application.put_env(:symphony_elixir, :github_private_key, private_key)
+    System.put_env("GITHUB_APP_ID", app_id)
+    System.put_env("GITHUB_PRIVATE_KEY", private_key)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://example.test/graphql",
+      tracker_api_token: nil,
+      tracker_repo_owner: "acme",
+      tracker_repo_name: "polyphony",
+      tracker_active_states: ["OPEN"],
+      tracker_terminal_states: ["CLOSED"]
+    )
+
+    test_pid = self()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      send(test_pid, {:request, conn.method, conn.request_path, List.keyfind(conn.req_headers, "authorization", 0)})
+
+      cond do
+        conn.method == "GET" and conn.request_path == "/repos/acme/polyphony/installation" ->
+          Req.Test.json(conn, %{"id" => 9876})
+
+        conn.method == "POST" and conn.request_path == "/app/installations/9876/access_tokens" ->
+          Req.Test.json(conn, %{"token" => "ghs_installation_token", "expires_at" => "2099-01-01T00:00:00Z"})
+
+        conn.method == "POST" ->
+          Req.Test.json(conn, %{"data" => %{"nodes" => []}})
+      end
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+    assert {:ok, _token} = Auth.authorization_token(Config.settings!().tracker)
+
+    assert {:ok, []} = Client.fetch_issue_states_by_ids(["I1"])
+    assert_receive {:request, "GET", "/repos/acme/polyphony/installation", {"authorization", install_discovery_auth}}
+    assert String.starts_with?(install_discovery_auth, "Bearer ey")
+    assert_receive {:request, "POST", "/app/installations/9876/access_tokens", {"authorization", token_mint_auth}}
+    assert String.starts_with?(token_mint_auth, "Bearer ey")
+    assert_receive {:request, "POST", "/graphql", {"authorization", "Bearer ghs_installation_token"}}
+  end
+
+  test "reuses cached installation token for subsequent github requests" do
+    app_id = "12345"
+    private_key = generate_rsa_private_key_pem()
+    Application.put_env(:symphony_elixir, :github_app_id, app_id)
+    Application.put_env(:symphony_elixir, :github_private_key, private_key)
+    System.put_env("GITHUB_APP_ID", app_id)
+    System.put_env("GITHUB_PRIVATE_KEY", private_key)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://example.test/graphql",
+      tracker_api_token: nil,
+      tracker_repo_owner: "acme",
+      tracker_repo_name: "polyphony",
+      tracker_active_states: ["OPEN"],
+      tracker_terminal_states: ["CLOSED"]
+    )
+
+    counters = :counters.new(2, [])
+    test_pid = self()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      cond do
+        conn.method == "GET" and conn.request_path == "/repos/acme/polyphony/installation" ->
+          :counters.add(counters, 1, 1)
+          Req.Test.json(conn, %{"id" => 9876})
+
+        conn.method == "POST" and conn.request_path == "/app/installations/9876/access_tokens" ->
+          :counters.add(counters, 2, 1)
+          Req.Test.json(conn, %{"token" => "ghs_cached_installation_token", "expires_at" => "2099-01-01T00:00:00Z"})
+
+        conn.method == "POST" ->
+          send(test_pid, {:graphql_auth, List.keyfind(conn.req_headers, "authorization", 0)})
+          Req.Test.json(conn, %{"data" => %{"nodes" => []}})
+      end
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+
+    assert {:ok, []} = Client.fetch_issue_states_by_ids(["I1"])
+    assert_receive {:graphql_auth, {"authorization", "Bearer ghs_cached_installation_token"}}
+    assert {:ok, []} = Client.fetch_issue_states_by_ids(["I2"])
+    assert_receive {:graphql_auth, {"authorization", "Bearer ghs_cached_installation_token"}}
+    assert :counters.get(counters, 1) == 1
+    assert :counters.get(counters, 2) == 1
   end
 
   test "fetch_candidate_issues paginates across cursors and filters by project status field" do
@@ -1331,5 +1457,11 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
       "    #{status_name}:\n#{entries}"
     end)
     |> Enum.join("\n")
+  end
+
+  defp generate_rsa_private_key_pem do
+    rsa_key = :public_key.generate_key({:rsa, 2048, 65_537})
+    der = :public_key.der_encode(:RSAPrivateKey, rsa_key)
+    :public_key.pem_encode([{:RSAPrivateKey, der, :not_encrypted}]) |> to_string()
   end
 end
