@@ -1,10 +1,16 @@
 defmodule SymphonyElixir.GitHub.Client do
   @moduledoc """
-  GitHub GraphQL client for polling candidate issues.
+  GitHub tracker client.
+
+  Supports:
+  - reading issues via GraphQL for orchestration polling
+  - writing issue comments/state via REST
+  - writing Project v2 field values via GraphQL mutations
+  - parent/sub-issue graph mutations via GraphQL
   """
 
   require Logger
-  alias SymphonyElixir.{Config, Linear.Issue}
+  alias SymphonyElixir.{Config, GitHub.Issue}
 
   @issue_page_size 50
   @max_error_body_log_bytes 1_000
@@ -125,6 +131,66 @@ defmodule SymphonyElixir.GitHub.Client do
   }
   """
 
+  @mutation_update_project_field """
+  mutation SymphonyGitHubUpdateProjectField(
+    $projectId: ID!,
+    $itemId: ID!,
+    $fieldId: ID!,
+    $value: ProjectV2FieldValue!
+  ) {
+    updateProjectV2ItemFieldValue(
+      input: {projectId: $projectId, itemId: $itemId, fieldId: $fieldId, value: $value}
+    ) {
+      projectV2Item { id }
+    }
+  }
+  """
+
+  @mutation_clear_project_field """
+  mutation SymphonyGitHubClearProjectField(
+    $projectId: ID!,
+    $itemId: ID!,
+    $fieldId: ID!
+  ) {
+    clearProjectV2ItemFieldValue(
+      input: {projectId: $projectId, itemId: $itemId, fieldId: $fieldId}
+    ) {
+      projectV2Item { id }
+    }
+  }
+  """
+
+  @mutation_add_sub_issue """
+  mutation SymphonyGitHubAddSubIssue($issueId: ID!, $subIssueId: ID!) {
+    addSubIssue(input: {issueId: $issueId, subIssueId: $subIssueId}) {
+      issue { id }
+      subIssue { id }
+    }
+  }
+  """
+
+  @mutation_remove_sub_issue """
+  mutation SymphonyGitHubRemoveSubIssue($issueId: ID!, $subIssueId: ID!) {
+    removeSubIssue(input: {issueId: $issueId, subIssueId: $subIssueId}) {
+      issue { id }
+      subIssue { id }
+    }
+  }
+  """
+
+  @mutation_reprioritize_sub_issue """
+  mutation SymphonyGitHubReprioritizeSubIssue(
+    $issueId: ID!,
+    $subIssueId: ID!,
+    $afterId: ID
+  ) {
+    reprioritizeSubIssue(input: {issueId: $issueId, subIssueId: $subIssueId, afterId: $afterId}) {
+      issue { id }
+      subIssue { id }
+    }
+  }
+  """
+
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
     tracker = Config.settings!().tracker
@@ -189,13 +255,16 @@ defmodule SymphonyElixir.GitHub.Client do
 
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) when is_binary(issue_id) and is_binary(body) do
-    with {:ok, issue_number} <- parse_issue_number(issue_id),
+    comment = String.trim(body)
+
+    with true <- comment != "" or {:error, :empty_comment_body},
+         {:ok, issue_number} <- parse_issue_number(issue_id),
          {:ok, tracker} <- repo_tracker_config(),
          {:ok, headers} <- rest_headers(),
          {:ok, %{status: status}} when status in [200, 201] <-
            Req.post("https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}/comments",
              headers: headers,
-             json: %{"body" => body}
+             json: %{"body" => comment}
            ) do
       :ok
     else
@@ -214,11 +283,12 @@ defmodule SymphonyElixir.GitHub.Client do
     with {:ok, issue_number} <- parse_issue_number(issue_id),
          {:ok, tracker} <- repo_tracker_config(),
          {:ok, headers} <- rest_headers(),
-         state <- normalize_rest_issue_state(state_name),
+         {state, state_reason} <- normalize_rest_issue_state(state_name),
+         payload <- issue_state_payload(state, state_reason),
          {:ok, %{status: status}} when status in [200] <-
            Req.patch("https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}",
              headers: headers,
-             json: %{"state" => state}
+             json: payload
            ) do
       :ok
     else
@@ -228,6 +298,74 @@ defmodule SymphonyElixir.GitHub.Client do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  @spec update_project_item_field_value(String.t(), String.t(), String.t(), map()) :: :ok | {:error, term()}
+  def update_project_item_field_value(project_id, item_id, field_id, value)
+      when is_binary(project_id) and is_binary(item_id) and is_binary(field_id) and is_map(value) do
+    with :ok <- ensure_present(project_id, :project_id),
+         :ok <- ensure_present(item_id, :item_id),
+         :ok <- ensure_present(field_id, :field_id),
+         :ok <- validate_project_field_value(value),
+         {:ok, _body} <-
+           graphql_mutation(@mutation_update_project_field, %{
+             projectId: project_id,
+             itemId: item_id,
+             fieldId: field_id,
+             value: value
+           }) do
+      :ok
+    end
+  end
+
+  @spec clear_project_item_field_value(String.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def clear_project_item_field_value(project_id, item_id, field_id)
+      when is_binary(project_id) and is_binary(item_id) and is_binary(field_id) do
+    with :ok <- ensure_present(project_id, :project_id),
+         :ok <- ensure_present(item_id, :item_id),
+         :ok <- ensure_present(field_id, :field_id),
+         {:ok, _body} <-
+           graphql_mutation(@mutation_clear_project_field, %{
+             projectId: project_id,
+             itemId: item_id,
+             fieldId: field_id
+           }) do
+      :ok
+    end
+  end
+
+  @spec add_sub_issue(String.t(), String.t()) :: :ok | {:error, term()}
+  def add_sub_issue(issue_id, sub_issue_id) when is_binary(issue_id) and is_binary(sub_issue_id) do
+    with :ok <- ensure_present(issue_id, :issue_id),
+         :ok <- ensure_present(sub_issue_id, :sub_issue_id),
+         {:ok, _body} <- graphql_mutation(@mutation_add_sub_issue, %{issueId: issue_id, subIssueId: sub_issue_id}) do
+      :ok
+    end
+  end
+
+  @spec remove_sub_issue(String.t(), String.t()) :: :ok | {:error, term()}
+  def remove_sub_issue(issue_id, sub_issue_id) when is_binary(issue_id) and is_binary(sub_issue_id) do
+    with :ok <- ensure_present(issue_id, :issue_id),
+         :ok <- ensure_present(sub_issue_id, :sub_issue_id),
+         {:ok, _body} <- graphql_mutation(@mutation_remove_sub_issue, %{issueId: issue_id, subIssueId: sub_issue_id}) do
+      :ok
+    end
+  end
+
+  @spec reprioritize_sub_issue(String.t(), String.t(), String.t() | nil) :: :ok | {:error, term()}
+  def reprioritize_sub_issue(issue_id, sub_issue_id, after_id \\ nil)
+      when is_binary(issue_id) and is_binary(sub_issue_id) and (is_binary(after_id) or is_nil(after_id)) do
+    with :ok <- ensure_present(issue_id, :issue_id),
+         :ok <- ensure_present(sub_issue_id, :sub_issue_id),
+         :ok <- validate_optional_id(after_id, :after_id),
+         {:ok, _body} <-
+           graphql_mutation(@mutation_reprioritize_sub_issue, %{
+             issueId: issue_id,
+             subIssueId: sub_issue_id,
+             afterId: after_id
+           }) do
+      :ok
     end
   end
 
@@ -624,14 +762,59 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp normalize_rest_issue_state(state_name) do
     case state_name |> normalize_state_name() do
-      "done" -> "closed"
-      "closed" -> "closed"
-      "completed" -> "closed"
-      "cancelled" -> "closed"
-      "canceled" -> "closed"
-      _ -> "open"
+      "done" -> {"closed", "completed"}
+      "closed" -> {"closed", nil}
+      "completed" -> {"closed", "completed"}
+      "cancelled" -> {"closed", "not_planned"}
+      "canceled" -> {"closed", "not_planned"}
+      "not_planned" -> {"closed", "not_planned"}
+      "open" -> {"open", nil}
+      "reopen" -> {"open", nil}
+      "reopened" -> {"open", nil}
+      _ -> {"open", nil}
     end
   end
+
+  defp issue_state_payload("closed", state_reason) when is_binary(state_reason) do
+    %{"state" => "closed", "state_reason" => state_reason}
+  end
+
+  defp issue_state_payload(state, _state_reason), do: %{"state" => state}
+
+  defp graphql_mutation(mutation, variables) when is_binary(mutation) and is_map(variables) do
+    with {:ok, body} <- graphql(mutation, variables) do
+      case Map.get(body, "errors") do
+        nil ->
+          {:ok, body}
+
+        errors when is_list(errors) ->
+          {:error, {:github_graphql_errors, errors}}
+      end
+    end
+  end
+
+  defp validate_project_field_value(value) when is_map(value) do
+    allowed_keys = MapSet.new(["date", "iterationId", "number", "singleSelectOptionId", "text"])
+    keys = value |> Map.keys() |> Enum.map(&to_string/1)
+
+    cond do
+      keys == [] ->
+        {:error, :invalid_project_field_value}
+
+      Enum.all?(keys, &MapSet.member?(allowed_keys, &1)) ->
+        :ok
+
+      true ->
+        {:error, :unsupported_project_field_value}
+    end
+  end
+
+  defp ensure_present(value, field_name) when is_binary(value) do
+    if String.trim(value) == "", do: {:error, {:missing_required, field_name}}, else: :ok
+  end
+
+  defp validate_optional_id(nil, _field_name), do: :ok
+  defp validate_optional_id(value, field_name), do: ensure_present(value, field_name)
 
   defp summarize_error_body(body) when is_binary(body) do
     body

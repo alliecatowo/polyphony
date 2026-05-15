@@ -1,11 +1,11 @@
 defmodule SymphonyElixir.AgentRunner do
   @moduledoc """
-  Executes a single Linear issue in its workspace with Codex.
+  Executes a single tracker issue in its workspace with Codex.
   """
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
 
   @type worker_host :: String.t() | nil
 
@@ -52,7 +52,7 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp send_codex_update(recipient, %Issue{id: issue_id}, message)
+  defp send_codex_update(recipient, %{id: issue_id}, message)
        when is_binary(issue_id) and is_pid(recipient) do
     send(recipient, {:codex_worker_update, issue_id, message})
     :ok
@@ -60,7 +60,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp send_codex_update(_recipient, _issue, _message), do: :ok
 
-  defp send_worker_runtime_info(recipient, %Issue{id: issue_id}, worker_host, workspace)
+  defp send_worker_runtime_info(recipient, %{id: issue_id}, worker_host, workspace)
        when is_binary(issue_id) and is_pid(recipient) and is_binary(workspace) do
     send(
       recipient,
@@ -144,9 +144,9 @@ defmodule SymphonyElixir.AgentRunner do
     """
   end
 
-  defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
+  defp continue_with_issue?(%{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do
-      {:ok, [%Issue{} = refreshed_issue | _]} ->
+      {:ok, [%{} = refreshed_issue | _]} ->
         if active_issue_state?(refreshed_issue.state) do
           {:continue, refreshed_issue}
         else
@@ -197,7 +197,7 @@ defmodule SymphonyElixir.AgentRunner do
     |> String.downcase()
   end
 
-  defp issue_context(%Issue{id: issue_id, identifier: identifier}) do
+  defp issue_context(%{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
   end
 end

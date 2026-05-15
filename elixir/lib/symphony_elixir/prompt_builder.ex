@@ -3,11 +3,15 @@ defmodule SymphonyElixir.PromptBuilder do
   Builds agent prompts from normalized tracker issue data.
   """
 
-  alias SymphonyElixir.{Config, Workflow}
+  alias SymphonyElixir.Config
+  alias SymphonyElixir.GitHub.Issue, as: GitHubIssue
+  alias SymphonyElixir.Linear.Issue, as: LinearIssue
+  alias SymphonyElixir.Workflow
 
   @render_opts [strict_variables: true, strict_filters: true]
+  @type tracker_issue :: GitHubIssue.t() | LinearIssue.t()
 
-  @spec build_prompt(SymphonyElixir.Linear.Issue.t(), keyword()) :: String.t()
+  @spec build_prompt(tracker_issue(), keyword()) :: String.t()
   def build_prompt(issue, opts \\ []) do
     template =
       Workflow.current()

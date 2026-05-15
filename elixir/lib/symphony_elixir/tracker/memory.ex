@@ -5,14 +5,17 @@ defmodule SymphonyElixir.Tracker.Memory do
 
   @behaviour SymphonyElixir.Tracker
 
-  alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.GitHub.Issue, as: GitHubIssue
+  alias SymphonyElixir.Linear.Issue, as: LinearIssue
 
-  @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
+  @type tracker_issue :: GitHubIssue.t() | LinearIssue.t()
+
+  @spec fetch_candidate_issues() :: {:ok, [tracker_issue()]} | {:error, term()}
   def fetch_candidate_issues do
     {:ok, issue_entries()}
   end
 
-  @spec fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
+  @spec fetch_issues_by_states([String.t()]) :: {:ok, [tracker_issue()]} | {:error, term()}
   def fetch_issues_by_states(state_names) do
     normalized_states =
       state_names
@@ -20,17 +23,17 @@ defmodule SymphonyElixir.Tracker.Memory do
       |> MapSet.new()
 
     {:ok,
-     Enum.filter(issue_entries(), fn %Issue{state: state} ->
+     Enum.filter(issue_entries(), fn %{state: state} ->
        MapSet.member?(normalized_states, normalize_state(state))
      end)}
   end
 
-  @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
+  @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [tracker_issue()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids) do
     wanted_ids = MapSet.new(issue_ids)
 
     {:ok,
-     Enum.filter(issue_entries(), fn %Issue{id: id} ->
+     Enum.filter(issue_entries(), fn %{id: id} ->
        MapSet.member?(wanted_ids, id)
      end)}
   end
@@ -52,7 +55,11 @@ defmodule SymphonyElixir.Tracker.Memory do
   end
 
   defp issue_entries do
-    Enum.filter(configured_issues(), &match?(%Issue{}, &1))
+    Enum.filter(configured_issues(), fn
+      %GitHubIssue{} -> true
+      %LinearIssue{} -> true
+      _ -> false
+    end)
   end
 
   defp send_event(message) do
