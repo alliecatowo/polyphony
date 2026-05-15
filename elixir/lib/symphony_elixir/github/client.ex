@@ -356,7 +356,7 @@ defmodule SymphonyElixir.GitHub.Client do
 
     with :ok <- validate_tracker!(tracker),
          {:ok, project_ctx} <- ensure_project_context(tracker),
-         {:ok, _} <- ensure_project_fields(project_ctx.project_id, tracker.required_project_fields),
+         {:ok, _} <- ensure_project_fields(project_ctx.project_id, tracker.required_project_fields, tracker),
          {:ok, _} <- ensure_repository_issues_in_project(tracker, project_ctx.project_id),
          {:ok, issues} <- fetch_project_issues(project_ctx.project_id, tracker.repo_owner, tracker.repo_name) do
       {:ok, Enum.filter(issues, &active_candidate_issue?(&1, tracker.active_states, tracker.terminal_states))}
@@ -701,12 +701,12 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp ensure_project_fields(project_id, required_project_fields) do
+  defp ensure_project_fields(project_id, required_project_fields, tracker) do
     with {:ok, body} <- graphql(@project_fields_query, %{projectId: project_id}),
          fields when is_list(fields) <- get_in(body, ["data", "node", "fields", "nodes"]) do
       existing_fields_by_name = existing_fields_index(fields)
 
-      required_specs = required_project_field_specs(required_project_fields)
+      required_specs = required_project_field_specs(required_project_fields, tracker)
 
       Enum.reduce_while(required_specs, {:ok, :ensured}, fn {field_name, definition}, _acc ->
         case ensure_required_project_field(project_id, existing_fields_by_name, field_name, definition) do
@@ -1702,9 +1702,13 @@ defmodule SymphonyElixir.GitHub.Client do
     normalized_field_name = normalize_state_name(field_name)
     current = Map.get(current_by_name, normalized_field_name)
     field_id = get_in(current || %{}, ["field", "id"])
+    current_type = Map.get(current || %{}, "type")
 
     cond do
       normalized_field_name == "" ->
+        :ok
+
+      builtin_project_field_type?(current_type) ->
         :ok
 
       not is_binary(field_id) or field_id == "" ->
@@ -1714,6 +1718,20 @@ defmodule SymphonyElixir.GitHub.Client do
         apply_project_field_delta(project_id, item_id, field_id, current, desired_value)
     end
   end
+
+  defp builtin_project_field_type?(type) when is_binary(type) do
+    type in [
+      "ProjectV2ItemFieldLabelValue",
+      "ProjectV2ItemFieldMilestoneValue",
+      "ProjectV2ItemFieldRepositoryValue",
+      "ProjectV2ItemFieldReviewerValue",
+      "ProjectV2ItemFieldUserValue",
+      "ProjectV2ItemFieldPullRequestValue",
+      "ProjectV2ItemIssueFieldValue"
+    ]
+  end
+
+  defp builtin_project_field_type?(_), do: false
 
   defp apply_project_field_delta(project_id, item_id, field_id, current, desired_value) do
     current_value = normalized_project_field_comparable(current)
@@ -2001,21 +2019,28 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp required_project_field_specs(required_project_fields) when map_size(required_project_fields) == 0 do
+  defp required_project_field_specs(required_project_fields, _tracker)
+       when is_map(required_project_fields) and map_size(required_project_fields) > 0,
+       do: required_project_fields
+
+  defp required_project_field_specs(_required_project_fields, tracker) do
     %{
+      "Status" => %{"type" => "single_select", "options" => default_status_field_options(tracker)},
       "Points" => %{"type" => "number"},
       "Progress" => %{"type" => "number"}
     }
   end
 
-  defp required_project_field_specs(required_project_fields) when is_map(required_project_fields),
-    do: required_project_fields
-
-  defp required_project_field_specs(_required_project_fields) do
-    %{
-      "Points" => %{"type" => "number"},
-      "Progress" => %{"type" => "number"}
-    }
+  defp default_status_field_options(%{} = tracker) do
+    (List.wrap(Map.get(tracker, :active_states)) ++ List.wrap(Map.get(tracker, :terminal_states)))
+    |> Enum.map(&to_string/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq_by(&String.downcase/1)
+    |> case do
+      [] -> ["OPEN", "DONE"]
+      options -> options
+    end
   end
 
   defp existing_fields_index(fields) do

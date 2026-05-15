@@ -756,6 +756,48 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
     assert_receive {:update_project_field_value, %{"fieldId" => "F_TEXT", "value" => %{"text" => "agent note"}}}
   end
 
+  test "project custom field reconciliation skips built-in labels/milestone/relation fields" do
+    test_pid = self()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      query = get_in(conn.body_params, ["query"]) || ""
+
+      if conn.method == "POST" and String.contains?(query, "UpdateProjectFieldValue") do
+        send(test_pid, {:unexpected_project_mutation, conn.body_params["variables"]})
+      end
+
+      Req.Test.json(conn, %{"data" => %{}})
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+
+    issue = %GitHubIssue{
+      id: "I-BUILTIN-1",
+      tracker_metadata: %{
+        "project_items" => [
+          %{
+            "id" => "ITEM-1",
+            "project" => %{"id" => "PROJ-1"},
+            "field_values" => [
+              %{"type" => "ProjectV2ItemFieldLabelValue", "field" => %{"id" => "FL", "name" => "Labels"}},
+              %{"type" => "ProjectV2ItemFieldMilestoneValue", "field" => %{"id" => "FM", "name" => "Milestone"}},
+              %{"type" => "ProjectV2ItemIssueFieldValue", "field" => %{"id" => "FR", "name" => "Related"}}
+            ]
+          }
+        ]
+      }
+    }
+
+    assert :ok =
+             Client.reconcile_issue_project_custom_fields(issue, %{
+               "Labels" => ["bug", "urgent"],
+               "Milestone" => %{"number" => 7},
+               "Related" => %{"text" => "do-not-mutate"}
+             })
+
+    refute_receive {:unexpected_project_mutation, _}
+  end
+
   test "linked pull request metadata is signal-only for state projection safety" do
     test_pid = self()
 
@@ -983,6 +1025,81 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
 
     refute_receive {:create_project_field, "Status", _}
     refute_receive {:create_project_field_option, _, _}
+  end
+
+  test "bootstrap creates project when missing and ensures default status points progress fields" do
+    test_pid = self()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      query = get_in(conn.body_params, ["query"]) || ""
+      vars = get_in(conn.body_params, ["variables"]) || %{}
+
+      cond do
+        String.contains?(query, "OwnerLookup") ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "organization" => %{
+                "id" => "ORG1",
+                "projectsV2" => %{"nodes" => []}
+              }
+            }
+          })
+
+        String.contains?(query, "ProjectFields") ->
+          project_fields_calls = Process.get(:project_fields_calls, 0) + 1
+          Process.put(:project_fields_calls, project_fields_calls)
+
+          fields =
+            if project_fields_calls == 1 do
+              []
+            else
+              [
+                %{
+                  "id" => "F_STATUS",
+                  "name" => "Status",
+                  "dataType" => "SINGLE_SELECT",
+                  "options" => []
+                }
+              ]
+            end
+
+          Req.Test.json(conn, %{"data" => %{"node" => %{"fields" => %{"nodes" => fields}}}})
+
+        String.contains?(query, "CreateProjectField") ->
+          send(test_pid, {:create_project_field, vars["name"], vars["dataType"]})
+          Req.Test.json(conn, %{"data" => %{"createProjectV2Field" => %{"projectV2Field" => %{"id" => "FN"}}}})
+
+        String.contains?(query, "SymphonyGitHubCreateProject") ->
+          send(test_pid, {:create_project, vars["title"]})
+          Req.Test.json(conn, %{"data" => %{"createProjectV2" => %{"projectV2" => %{"id" => "PROJNEW", "title" => "Polyphony", "url" => "u", "number" => 2}}}})
+
+        String.contains?(query, "SymphonyGitHubUpdateSingleSelectField") ->
+          send(test_pid, {:update_single_select, vars["name"], vars["singleSelectOptions"]})
+          Req.Test.json(conn, %{"data" => %{"updateProjectV2Field" => %{"projectV2Field" => %{"id" => "FS"}}}})
+
+        String.contains?(query, "RepositoryIssues") ->
+          Req.Test.json(conn, %{"data" => %{"repository" => %{"issues" => %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}}}}})
+
+        String.contains?(query, "ProjectIssues") ->
+          Req.Test.json(conn, %{"data" => %{"node" => %{"items" => %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}}}}})
+
+        true ->
+          Req.Test.json(conn, %{"data" => %{}})
+      end
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+    assert {:ok, []} = Client.fetch_candidate_issues()
+
+    assert_receive {:create_project, "Polyphony"}
+    assert_receive {:create_project_field, "Status", "SINGLE_SELECT"}
+    assert_receive {:create_project_field, "Points", "NUMBER"}
+    assert_receive {:create_project_field, "Progress", "NUMBER"}
+
+    assert_receive {:update_single_select, "Status", options}
+    option_names = Enum.map(options, &(&1["name"] || &1[:name]))
+    assert "OPEN" in option_names
+    assert "CLOSED" in option_names
   end
 
   defp issue_node(id, number, state, opts \\ []) do
