@@ -286,6 +286,16 @@ defmodule SymphonyElixir.GitHub.Client do
   }
   """
 
+  @repository_projects_query """
+  query SymphonyGitHubRepositoryProjects($owner: String!, $name: String!) {
+    repository(owner: $owner, name: $name) {
+      projectsV2(first: 100) {
+        nodes { id title url number }
+      }
+    }
+  }
+  """
+
   @project_fields_query """
   query SymphonyGitHubProjectFields($projectId: ID!) {
     node(id: $projectId) {
@@ -403,13 +413,18 @@ defmodule SymphonyElixir.GitHub.Client do
     payload = %{"query" => query, "variables" => variables}
 
     with {:ok, headers} <- graphql_headers(),
-         {:ok, %{status: 200, body: body}} <- post_graphql_request(payload, headers) do
+         {:ok, %{status: 200, body: body}} <- post_graphql_request(payload, headers),
+         :ok <- ensure_no_graphql_errors(body) do
       {:ok, body}
     else
       {:ok, response} ->
         Logger.error("GitHub GraphQL request failed status=#{response.status} body=#{summarize_error_body(response.body)}")
 
         {:error, {:github_api_status, response.status}}
+
+      {:error, {:github_graphql_errors, errors}} ->
+        Logger.error("GitHub GraphQL response errors=#{inspect(errors)}")
+        {:error, {:github_graphql_errors, errors}}
 
       {:error, reason} ->
         Logger.error("GitHub GraphQL request failed: #{inspect(reason)}")
@@ -721,16 +736,75 @@ defmodule SymphonyElixir.GitHub.Client do
     owner_type = normalize_owner_type(tracker.project_owner_type)
     project_title = normalized_project_title(tracker.project_title)
 
-    with {:ok, body} <-
-           graphql(@owner_lookup_query, %{
-             login: owner_login,
-             isOrg: owner_type == "organization",
-             isUser: owner_type == "user"
-           }),
-         {:ok, owner} <- extract_owner_node(body, owner_type),
-         {:ok, project} <- find_or_create_project(owner, project_title) do
-      {:ok, %{owner_login: owner_login, owner_type: owner_type, owner_id: owner["id"], project_id: project["id"]}}
+    with {:ok, maybe_repo_project} <- find_repository_project(tracker.repo_owner, tracker.repo_name, project_title) do
+      case maybe_repo_project do
+        %{"id" => project_id} when is_binary(project_id) ->
+          {:ok,
+           %{
+             owner_login: owner_login,
+             owner_type: owner_type,
+             owner_id: nil,
+             project_id: project_id
+           }}
+
+        _ ->
+          with {:ok, body} <-
+                 graphql(@owner_lookup_query, %{
+                   login: owner_login,
+                   isOrg: owner_type == "organization",
+                   isUser: owner_type == "user"
+                 }),
+               {:ok, owner} <- extract_owner_node(body, owner_type),
+               {:ok, project} <- find_or_create_project(owner, project_title) do
+            {:ok,
+             %{
+               owner_login: owner_login,
+               owner_type: owner_type,
+               owner_id: owner["id"],
+               project_id: project["id"]
+             }}
+          else
+            {:error, {:github_graphql_errors, errors}} ->
+              if create_project_permission_error?(errors) do
+                {:error, :github_project_create_forbidden}
+              else
+                {:error, {:github_graphql_errors, errors}}
+              end
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+      end
+    else
+      {:error, reason} ->
+        {:error, reason}
     end
+  end
+
+  defp find_repository_project(owner, repo, project_title)
+       when is_binary(owner) and owner != "" and is_binary(repo) and repo != "" do
+    with {:ok, body} <- graphql(@repository_projects_query, %{owner: owner, name: repo}),
+         projects when is_list(projects) <- get_in(body, ["data", "repository", "projectsV2", "nodes"]) do
+      match =
+        Enum.find(projects, fn project ->
+          normalize_state_name(project["title"] || "") == normalize_state_name(project_title)
+        end)
+
+      {:ok, match}
+    else
+      {:error, reason} -> {:error, reason}
+      _ -> {:ok, nil}
+    end
+  end
+
+  defp find_repository_project(_owner, _repo, _project_title), do: {:ok, nil}
+
+  defp create_project_permission_error?(errors) when is_list(errors) do
+    Enum.any?(errors, fn error ->
+      message = to_string(Map.get(error, "message", ""))
+      type = to_string(Map.get(error, "type", ""))
+      type == "FORBIDDEN" and String.contains?(String.downcase(message), "does not have permission to create projects")
+    end)
   end
 
   defp ensure_project_fields(project_id, required_project_fields, tracker) do
@@ -2128,10 +2202,17 @@ defmodule SymphonyElixir.GitHub.Client do
              %{"id" => _} = project <- get_in(body, ["data", "createProjectV2", "projectV2"]) do
           {:ok, project}
         else
+          {:error, reason} -> {:error, reason}
           _ -> {:error, :github_project_create_failed}
         end
     end
   end
+
+  defp ensure_no_graphql_errors(%{"errors" => errors}) when is_list(errors) and errors != [] do
+    {:error, {:github_graphql_errors, errors}}
+  end
+
+  defp ensure_no_graphql_errors(_body), do: :ok
 
   defp required_project_field_specs(required_project_fields, _tracker)
        when is_map(required_project_fields) and map_size(required_project_fields) > 0,

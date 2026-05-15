@@ -57,13 +57,39 @@ defmodule SymphonyElixir.GitHub.Auth do
   end
 
   defp discover_installation_id(app_jwt, owner, repo, opts) do
-    headers = [
-      {"Authorization", "Bearer #{app_jwt}"},
-      {"Accept", "application/vnd.github+json"},
-      {"X-GitHub-Api-Version", "2022-11-28"}
-    ]
+    headers = github_headers(app_jwt)
 
-    case request(:get, "https://api.github.com/repos/#{owner}/#{repo}/installation", nil, headers, opts) do
+    with {:error, {:github_api_status, 404}} <- discover_repo_installation_id(owner, repo, headers, opts),
+         {:error, user_reason} <- discover_owner_installation_id(owner, "users", headers, opts),
+         {:error, org_reason} <- discover_owner_installation_id(owner, "orgs", headers, opts) do
+      reason = first_non_not_found_reason(user_reason, org_reason)
+
+      case reason do
+        :not_found -> {:error, :github_app_installation_not_found}
+        other -> {:error, other}
+      end
+    end
+  end
+
+  defp discover_repo_installation_id(owner, repo, headers, opts) do
+    discover_installation_id_from_url(
+      "https://api.github.com/repos/#{owner}/#{repo}/installation",
+      headers,
+      opts
+    )
+  end
+
+  defp discover_owner_installation_id(owner, owner_kind, headers, opts)
+       when owner_kind in ["users", "orgs"] do
+    discover_installation_id_from_url(
+      "https://api.github.com/#{owner_kind}/#{owner}/installation",
+      headers,
+      opts
+    )
+  end
+
+  defp discover_installation_id_from_url(url, headers, opts) do
+    case request(:get, url, nil, headers, opts) do
       {:ok, %{status: 200, body: %{"id" => id}}} when is_integer(id) ->
         {:ok, id}
 
@@ -78,12 +104,21 @@ defmodule SymphonyElixir.GitHub.Auth do
     end
   end
 
-  defp create_installation_token(app_jwt, installation_id, opts) do
-    headers = [
+  defp first_non_not_found_reason({:github_api_status, 404}, {:github_api_status, 404}), do: :not_found
+  defp first_non_not_found_reason(reason, {:github_api_status, 404}), do: reason
+  defp first_non_not_found_reason({:github_api_status, 404}, reason), do: reason
+  defp first_non_not_found_reason(reason, _other), do: reason
+
+  defp github_headers(app_jwt) do
+    [
       {"Authorization", "Bearer #{app_jwt}"},
       {"Accept", "application/vnd.github+json"},
       {"X-GitHub-Api-Version", "2022-11-28"}
     ]
+  end
+
+  defp create_installation_token(app_jwt, installation_id, opts) do
+    headers = github_headers(app_jwt)
 
     case request(:post, "https://api.github.com/app/installations/#{installation_id}/access_tokens", %{}, headers, opts) do
       {:ok, %{status: status, body: %{"token" => token, "expires_at" => expires_at}}}
