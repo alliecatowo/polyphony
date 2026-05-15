@@ -256,8 +256,125 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
              Client.create_comment("#7", "nope")
   end
 
+  test "normalization includes milestone assignee label and parent dependency helpers" do
+    Req.Test.stub(__MODULE__, fn conn ->
+      payload = %{
+        "data" => %{
+          "nodes" => [
+            issue_node("I42", 42, "OPEN",
+              assignees: [%{"login" => "allie"}],
+              labels: [%{"name" => "Bug"}, %{"name" => "Needs-Review"}],
+              milestone: %{
+                "id" => "M1",
+                "number" => 9,
+                "title" => "v1",
+                "dueOn" => "2026-06-01T00:00:00Z",
+                "state" => "OPEN",
+                "description" => "launch"
+              },
+              parent: %{
+                "id" => "PARENT1",
+                "number" => 7,
+                "title" => "Parent",
+                "state" => "OPEN",
+                "url" => "https://github.com/acme/polyphony/issues/7"
+              }
+            )
+          ]
+        }
+      }
+
+      Req.Test.json(conn, payload)
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+
+    assert {:ok, [issue]} = Client.fetch_issue_states_by_ids(["I42"])
+    assert issue.assignee_id == "allie"
+    assert issue.labels == ["bug", "needs-review"]
+    assert issue.blocked_by == [%{id: "PARENT1", identifier: "#7", state: "OPEN"}]
+
+    assert %{
+             "milestone" => %{
+               "id" => "M1",
+               "number" => 9,
+               "title" => "v1",
+               "state" => "OPEN",
+               "description" => "launch",
+               "due_on" => "2026-06-01T00:00:00Z"
+             },
+             "parent" => %{
+               "id" => "PARENT1",
+               "identifier" => "#7",
+               "title" => "Parent",
+               "state" => "OPEN"
+             }
+           } = issue.tracker_metadata
+  end
+
+  test "project field helper captures labels and milestone field variants in tracker metadata" do
+    Req.Test.stub(__MODULE__, fn conn ->
+      payload = %{
+        "data" => %{
+          "nodes" => [
+            issue_node("I99", 99, "OPEN",
+              project_item_field_values: [
+                %{
+                  "__typename" => "ProjectV2ItemFieldLabelValue",
+                  "labels" => %{"nodes" => [%{"id" => "L1", "name" => "backend"}]},
+                  "field" => %{"id" => "FL", "name" => "Labels"}
+                },
+                %{
+                  "__typename" => "ProjectV2ItemFieldMilestoneValue",
+                  "milestone" => %{"id" => "M2", "number" => 10, "title" => "Beta", "dueOn" => nil, "state" => "OPEN"},
+                  "field" => %{"id" => "FM", "name" => "Milestone"}
+                }
+              ]
+            )
+          ]
+        }
+      }
+
+      Req.Test.json(conn, payload)
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+    assert {:ok, [issue]} = Client.fetch_issue_states_by_ids(["I99"])
+
+    [project_item] = issue.tracker_metadata["project_items"]
+    fields = project_item["field_values"]
+
+    assert Enum.any?(fields, fn field ->
+             field["type"] == "ProjectV2ItemFieldLabelValue" and
+               field["field"]["name"] == "Labels" and
+               field["labels"] == [%{"id" => "L1", "name" => "backend"}]
+           end)
+
+    assert Enum.any?(fields, fn field ->
+             field["type"] == "ProjectV2ItemFieldMilestoneValue" and
+               field["field"]["name"] == "Milestone" and
+               field["milestone"]["id"] == "M2"
+           end)
+  end
+
+  test "dependency helper is empty when no parent dependency is present" do
+    Req.Test.stub(__MODULE__, fn conn ->
+      Req.Test.json(conn, %{"data" => %{"nodes" => [issue_node("I100", 100, "OPEN")]}})
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+    assert {:ok, [issue]} = Client.fetch_issue_states_by_ids(["I100"])
+    assert issue.blocked_by == []
+    assert issue.tracker_metadata["parent"] == nil
+  end
+
   defp issue_node(id, number, state, opts \\ []) do
     status_name = Keyword.get(opts, :status_name)
+    assignees = Keyword.get(opts, :assignees, [])
+    labels = Keyword.get(opts, :labels, [])
+    milestone = Keyword.get(opts, :milestone, nil)
+    parent = Keyword.get(opts, :parent, nil)
+    project_item_field_values = Keyword.get(opts, :project_item_field_values, nil)
 
     %{
       "id" => id,
@@ -267,34 +384,44 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
       "state" => state,
       "stateReason" => nil,
       "url" => "https://github.com/acme/polyphony/issues/#{number}",
-      "assignees" => %{"nodes" => []},
-      "labels" => %{"nodes" => []},
-      "milestone" => nil,
-      "parent" => nil,
+      "assignees" => %{"nodes" => assignees},
+      "labels" => %{"nodes" => labels},
+      "milestone" => milestone,
+      "parent" => parent,
       "subIssues" => %{"nodes" => []},
-      "projectItems" => %{"nodes" => project_items(status_name)},
+      "projectItems" => %{"nodes" => project_items(status_name, project_item_field_values)},
       "createdAt" => "2026-01-01T00:00:00Z",
       "updatedAt" => "2026-01-01T00:00:00Z"
     }
   end
 
-  defp project_items(nil), do: []
+  defp project_items(nil, override_field_values) when is_list(override_field_values) do
+    [
+      %{
+        "id" => "ITEM-CUSTOM",
+        "isArchived" => false,
+        "project" => %{"id" => "P1", "number" => 1, "title" => "Roadmap", "url" => "https://github.com/orgs/acme/projects/1"},
+        "fieldValues" => %{"nodes" => override_field_values}
+      }
+    ]
+  end
 
-  defp project_items(status_name) do
+  defp project_items(nil, _override), do: []
+
+  defp project_items(status_name, override_field_values) do
+    field_nodes =
+      cond do
+        is_list(override_field_values) -> override_field_values
+        true -> status_field_nodes(status_name)
+      end
+
     [
       %{
         "id" => "ITEM-#{status_name}",
         "isArchived" => false,
         "project" => %{"id" => "P1", "number" => 1, "title" => "Roadmap", "url" => "https://github.com/orgs/acme/projects/1"},
         "fieldValues" => %{
-          "nodes" => [
-            %{
-              "__typename" => "ProjectV2ItemFieldSingleSelectValue",
-              "name" => status_name,
-              "optionId" => "OPT-#{status_name}",
-              "field" => %{"id" => "F1", "name" => "Status"}
-            }
-          ]
+          "nodes" => field_nodes
         }
       }
     ]

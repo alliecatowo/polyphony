@@ -422,6 +422,97 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
+  @spec reconcile_issue_milestone(String.t(), integer() | nil) :: :ok | {:error, term()}
+  def reconcile_issue_milestone(issue_id, desired_milestone_number)
+      when is_binary(issue_id) and (is_integer(desired_milestone_number) or is_nil(desired_milestone_number)) do
+    with {:ok, issue_number} <- parse_issue_number(issue_id),
+         {:ok, tracker} <- repo_tracker_config(),
+         {:ok, headers} <- rest_headers(),
+         {:ok, current} <- fetch_issue_details(tracker, headers, issue_number),
+         current_milestone_number <- get_in(current, ["milestone", "number"]),
+         true <- current_milestone_number != desired_milestone_number or :noop,
+         payload <- milestone_payload(desired_milestone_number),
+         {:ok, %{status: 200}} <- patch_issue(tracker, headers, issue_number, payload) do
+      :ok
+    else
+      :noop ->
+        :ok
+
+      {:ok, %{status: status, body: body}} ->
+        Logger.error("GitHub reconcile milestone failed status=#{status} body=#{summarize_error_body(body)}")
+        {:error, {:github_api_status, status}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @spec reconcile_issue_assignees(String.t(), [String.t()]) :: :ok | {:error, term()}
+  def reconcile_issue_assignees(issue_id, desired_assignees)
+      when is_binary(issue_id) and is_list(desired_assignees) do
+    normalized_desired = normalize_string_set(desired_assignees)
+
+    with {:ok, issue_number} <- parse_issue_number(issue_id),
+         {:ok, tracker} <- repo_tracker_config(),
+         {:ok, headers} <- rest_headers(),
+         {:ok, current} <- fetch_issue_details(tracker, headers, issue_number),
+         normalized_current <- normalize_string_set(current["assignees"] || [], & &1["login"]),
+         true <- normalized_current != normalized_desired or :noop,
+         {:ok, %{status: 200}} <- patch_issue(tracker, headers, issue_number, %{"assignees" => normalized_desired}) do
+      :ok
+    else
+      :noop ->
+        :ok
+
+      {:ok, %{status: status, body: body}} ->
+        Logger.error("GitHub reconcile assignees failed status=#{status} body=#{summarize_error_body(body)}")
+        {:error, {:github_api_status, status}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @spec reconcile_issue_labels(String.t(), [String.t()]) :: :ok | {:error, term()}
+  def reconcile_issue_labels(issue_id, desired_labels) when is_binary(issue_id) and is_list(desired_labels) do
+    normalized_desired = normalize_string_set(desired_labels)
+
+    with {:ok, issue_number} <- parse_issue_number(issue_id),
+         {:ok, tracker} <- repo_tracker_config(),
+         {:ok, headers} <- rest_headers(),
+         {:ok, current} <- fetch_issue_details(tracker, headers, issue_number),
+         normalized_current <- normalize_string_set(current["labels"] || [], & &1["name"]),
+         true <- normalized_current != normalized_desired or :noop,
+         {:ok, %{status: 200}} <- set_issue_labels(tracker, headers, issue_number, normalized_desired) do
+      :ok
+    else
+      :noop ->
+        :ok
+
+      {:ok, %{status: status, body: body}} ->
+        Logger.error("GitHub reconcile labels failed status=#{status} body=#{summarize_error_body(body)}")
+        {:error, {:github_api_status, status}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @spec reconcile_issue_blocked_by(String.t(), [String.t()]) :: :ok | {:error, term()}
+  def reconcile_issue_blocked_by(issue_id, desired_blocked_by_ids)
+      when is_binary(issue_id) and is_list(desired_blocked_by_ids) do
+    with {:ok, issue_number} <- parse_issue_number(issue_id),
+         {:ok, tracker} <- repo_tracker_config(),
+         {:ok, headers} <- rest_headers(),
+         {:ok, current_numbers} <- fetch_blocked_by_numbers(tracker, headers, issue_number),
+         {:ok, desired_numbers} <- parse_issue_numbers(desired_blocked_by_ids),
+         adds <- desired_numbers -- current_numbers,
+         removes <- current_numbers -- desired_numbers,
+         :ok <- apply_blocked_by_deltas(tracker, headers, issue_number, adds, removes) do
+      :ok
+    end
+  end
+
   @spec update_project_item_field_value(String.t(), String.t(), String.t(), map()) :: :ok | {:error, term()}
   def update_project_item_field_value(project_id, item_id, field_id, value)
       when is_binary(project_id) and is_binary(item_id) and is_binary(field_id) and is_map(value) do
@@ -1039,6 +1130,142 @@ defmodule SymphonyElixir.GitHub.Client do
         errors when is_list(errors) ->
           {:error, {:github_graphql_errors, errors}}
       end
+    end
+  end
+
+  defp fetch_issue_details(tracker, headers, issue_number) do
+    case Req.get("https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}",
+           headers: headers
+         ) do
+      {:ok, %{status: 200, body: body}} -> {:ok, body}
+      {:ok, %{status: status, body: body}} -> {:ok, %{status: status, body: body}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp patch_issue(tracker, headers, issue_number, payload) do
+    Req.patch("https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}",
+      headers: headers,
+      json: payload
+    )
+  end
+
+  defp set_issue_labels(tracker, headers, issue_number, labels) do
+    Req.put("https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}/labels",
+      headers: headers,
+      json: %{"labels" => labels}
+    )
+  end
+
+  defp milestone_payload(nil), do: %{"milestone" => nil}
+  defp milestone_payload(number), do: %{"milestone" => number}
+
+  defp normalize_string_set(items, extractor \\ & &1) do
+    items
+    |> Enum.map(extractor)
+    |> Enum.filter(&is_binary/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp fetch_blocked_by_numbers(tracker, headers, issue_number) do
+    endpoint =
+      "https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}/dependencies/blocked_by"
+
+    case Req.get(endpoint, headers: headers) do
+      {:ok, %{status: 200, body: %{"blocked_by" => blocked_by}}} when is_list(blocked_by) ->
+        blocked_numbers =
+          blocked_by
+          |> Enum.map(& &1["number"])
+          |> Enum.filter(&is_integer/1)
+          |> Enum.uniq()
+          |> Enum.sort()
+
+        {:ok, blocked_numbers}
+
+      {:ok, %{status: 200, body: body}} when is_map(body) ->
+        issues = Map.get(body, "issues", [])
+
+        blocked_numbers =
+          issues
+          |> Enum.map(& &1["number"])
+          |> Enum.filter(&is_integer/1)
+          |> Enum.uniq()
+          |> Enum.sort()
+
+        {:ok, blocked_numbers}
+
+      {:ok, %{status: status, body: body}} ->
+        Logger.error("GitHub fetch blocked_by failed status=#{status} body=#{summarize_error_body(body)}")
+        {:error, {:github_api_status, status}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp parse_issue_numbers(ids) do
+    ids
+    |> Enum.reduce_while({:ok, []}, fn id, {:ok, acc} ->
+      case parse_issue_number(id) do
+        {:ok, number} -> {:cont, {:ok, [number | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, numbers} ->
+        numbers
+        |> Enum.uniq()
+        |> Enum.sort()
+        |> then(&{:ok, &1})
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp apply_blocked_by_deltas(_tracker, _headers, _issue_number, [], []), do: :ok
+
+  defp apply_blocked_by_deltas(tracker, headers, issue_number, adds, removes) do
+    with :ok <- Enum.reduce_while(adds, :ok, &add_blocked_by(tracker, headers, issue_number, &1, &2)),
+         :ok <- Enum.reduce_while(removes, :ok, &remove_blocked_by(tracker, headers, issue_number, &1, &2)) do
+      :ok
+    end
+  end
+
+  defp add_blocked_by(tracker, headers, issue_number, blocked_by_number, :ok) do
+    endpoint =
+      "https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}/dependencies/blocked_by"
+
+    case Req.post(endpoint, headers: headers, json: %{"blocked_by_issue_number" => blocked_by_number}) do
+      {:ok, %{status: status}} when status in [200, 201] ->
+        {:cont, :ok}
+
+      {:ok, %{status: status, body: body}} ->
+        Logger.error("GitHub add blocked_by failed status=#{status} body=#{summarize_error_body(body)}")
+        {:halt, {:error, {:github_api_status, status}}}
+
+      {:error, reason} ->
+        {:halt, {:error, reason}}
+    end
+  end
+
+  defp remove_blocked_by(tracker, headers, issue_number, blocked_by_number, :ok) do
+    endpoint =
+      "https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}/dependencies/blocked_by/#{blocked_by_number}"
+
+    case Req.delete(endpoint, headers: headers) do
+      {:ok, %{status: status}} when status in [200, 204] ->
+        {:cont, :ok}
+
+      {:ok, %{status: status, body: body}} ->
+        Logger.error("GitHub remove blocked_by failed status=#{status} body=#{summarize_error_body(body)}")
+        {:halt, {:error, {:github_api_status, status}}}
+
+      {:error, reason} ->
+        {:halt, {:error, reason}}
     end
   end
 

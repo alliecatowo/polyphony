@@ -59,5 +59,29 @@ defmodule SymphonyElixir.GitHub.Adapter do
     client_module().reprioritize_sub_issue(issue_id, sub_issue_id, after_id)
   end
 
+  @spec reconcile_issue_milestone(String.t(), integer() | nil) :: :ok | {:error, term()}
+  def reconcile_issue_milestone(issue_id, milestone_number)
+      when is_binary(issue_id) and (is_integer(milestone_number) or is_nil(milestone_number)) do
+    client_module().reconcile_issue_milestone(issue_id, milestone_number)
+  end
+
+  @spec reconcile_issue_assignees(String.t(), [String.t()]) :: :ok | {:error, term()}
+  def reconcile_issue_assignees(issue_id, assignees)
+      when is_binary(issue_id) and is_list(assignees) do
+    client_module().reconcile_issue_assignees(issue_id, assignees)
+  end
+
+  @spec reconcile_issue_labels(String.t(), [String.t()]) :: :ok | {:error, term()}
+  def reconcile_issue_labels(issue_id, labels)
+      when is_binary(issue_id) and is_list(labels) do
+    client_module().reconcile_issue_labels(issue_id, labels)
+  end
+
+  @spec reconcile_issue_blocked_by(String.t(), [String.t()]) :: :ok | {:error, term()}
+  def reconcile_issue_blocked_by(issue_id, blocked_by_issue_ids)
+      when is_binary(issue_id) and is_list(blocked_by_issue_ids) do
+    client_module().reconcile_issue_blocked_by(issue_id, blocked_by_issue_ids)
+  end
+
   defp client_module, do: Application.get_env(:symphony_elixir, :github_client, Client)
 end
