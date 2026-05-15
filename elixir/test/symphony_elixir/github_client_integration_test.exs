@@ -1102,6 +1102,97 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
     assert "CLOSED" in option_names
   end
 
+  test "bootstrap enforces status option parity from tracker configuration idempotently" do
+    write_workflow_for_status_parity!(%{
+      "backlog" => %{"state" => "open"},
+      "in_progress" => %{"state" => "open"},
+      "done" => %{"state" => "closed", "state_reason" => "completed"}
+    })
+
+    test_pid = self()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      query = get_in(conn.body_params, ["query"]) || ""
+      vars = get_in(conn.body_params, ["variables"]) || %{}
+
+      cond do
+        String.contains?(query, "OwnerLookup") ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "organization" => %{
+                "id" => "ORG1",
+                "projectsV2" => %{"nodes" => [%{"id" => "PROJ1", "title" => "Polyphony", "url" => "u", "number" => 1}]}
+              }
+            }
+          })
+
+        String.contains?(query, "ProjectFields") ->
+          status_updated? = Process.get(:status_updated, false)
+
+          status_options =
+            if status_updated? do
+              [
+                %{"id" => "OPT_OPEN", "name" => "OPEN"},
+                %{"id" => "OPT_CLOSED", "name" => "CLOSED"},
+                %{"id" => "OPT_BACKLOG", "name" => "backlog"},
+                %{"id" => "OPT_DONE", "name" => "done"},
+                %{"id" => "OPT_IN_PROGRESS", "name" => "in_progress"}
+              ]
+            else
+              [
+                %{"id" => "OPT_LEGACY", "name" => "Legacy"},
+                %{"id" => "OPT_DONE", "name" => "Done"}
+              ]
+            end
+
+          Req.Test.json(conn, %{
+            "data" => %{
+              "node" => %{
+                "fields" => %{
+                  "nodes" => [
+                    %{
+                      "id" => "F_STATUS",
+                      "name" => "Status",
+                      "dataType" => "SINGLE_SELECT",
+                      "options" => status_options
+                    },
+                    %{"id" => "F_POINTS", "name" => "Points", "dataType" => "NUMBER"},
+                    %{"id" => "F_PROGRESS", "name" => "Progress", "dataType" => "NUMBER"}
+                  ]
+                }
+              }
+            }
+          })
+
+        String.contains?(query, "SymphonyGitHubUpdateSingleSelectField") ->
+          Process.put(:status_updated, true)
+          send(test_pid, {:status_update_options, vars["singleSelectOptions"]})
+          Req.Test.json(conn, %{"data" => %{"updateProjectV2Field" => %{"projectV2Field" => %{"id" => "F_STATUS"}}}})
+
+        String.contains?(query, "RepositoryIssues") ->
+          Req.Test.json(conn, %{"data" => %{"repository" => %{"issues" => %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}}}}})
+
+        String.contains?(query, "ProjectIssues") ->
+          Req.Test.json(conn, %{"data" => %{"node" => %{"items" => %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}}}}})
+
+        true ->
+          Req.Test.json(conn, %{"data" => %{}})
+      end
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+
+    assert {:ok, []} = Client.fetch_candidate_issues()
+    assert_receive {:status_update_options, options}
+
+    option_names = Enum.map(options, &(&1["name"] || &1[:name]))
+
+    assert option_names == ["OPEN", "CLOSED", "backlog", "done", "in_progress"]
+
+    assert {:ok, []} = Client.fetch_candidate_issues()
+    refute_receive {:status_update_options, _}
+  end
+
   defp issue_node(id, number, state, opts \\ []) do
     status_name = Keyword.get(opts, :status_name)
     assignees = Keyword.get(opts, :assignees, [])
@@ -1198,5 +1289,47 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
 
     File.write!(workflow_file, workflow)
     if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
+  end
+
+  defp write_workflow_for_status_parity!(status_map) do
+    workflow_file = Workflow.workflow_file_path()
+    status_map_yaml = status_map_to_yaml(status_map)
+
+    workflow = """
+    ---
+    tracker:
+      kind: "github"
+      endpoint: "https://example.test/graphql"
+      api_key: "ghs_test_token"
+      repo_owner: "acme"
+      repo_name: "polyphony"
+      project_owner_type: "organization"
+      project_owner_login: "acme"
+      project_title: "Polyphony"
+      active_states: ["OPEN"]
+      terminal_states: ["CLOSED"]
+      status_map:
+    #{status_map_yaml}
+    polling:
+      interval_ms: 30000
+    ---
+    You are an agent for this repository.
+    """
+
+    File.write!(workflow_file, workflow)
+    if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
+  end
+
+  defp status_map_to_yaml(status_map) when is_map(status_map) do
+    status_map
+    |> Enum.map(fn {status_name, mapping} ->
+      entries =
+        mapping
+        |> Enum.map(fn {k, v} -> "      #{k}: \"#{v}\"" end)
+        |> Enum.join("\n")
+
+      "    #{status_name}:\n#{entries}"
+    end)
+    |> Enum.join("\n")
   end
 end

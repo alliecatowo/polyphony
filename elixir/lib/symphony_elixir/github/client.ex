@@ -490,7 +490,8 @@ defmodule SymphonyElixir.GitHub.Client do
   @spec reconcile_issue_primitives_in_order(map(), map()) :: :ok | {:error, term()}
   def reconcile_issue_primitives_in_order(%{id: issue_id} = issue, desired)
       when is_binary(issue_id) and is_map(desired) do
-    with :ok <- reconcile_structure_dependencies(issue_id, desired),
+    with :ok <- reconcile_issue_hierarchy(issue, desired),
+         :ok <- reconcile_structure_dependencies(issue_id, desired),
          :ok <- reconcile_taxonomy(issue_id, desired),
          :ok <- reconcile_project_custom_fields(issue, desired),
          :ok <- reconcile_state_projection(issue) do
@@ -499,6 +500,37 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   def reconcile_issue_primitives_in_order(_issue, _desired), do: :ok
+
+  @spec reconcile_issue_hierarchy(map(), map()) :: :ok | {:error, term()}
+  def reconcile_issue_hierarchy(%{id: issue_id} = issue, desired_hierarchy)
+      when is_binary(issue_id) and is_map(desired_hierarchy) do
+    desired_parent_issue_id =
+      desired_hierarchy
+      |> Map.get(:parent_issue_id)
+      |> normalize_id()
+
+    current_parent_issue_id = current_parent_issue_id(issue)
+
+    desired_sub_issue_ids =
+      desired_hierarchy
+      |> Map.get(:sub_issue_ids, [])
+      |> normalize_id_set()
+
+    current_sub_issue_ids = current_sub_issue_ids(issue)
+
+    adds = desired_sub_issue_ids -- current_sub_issue_ids
+    removes = current_sub_issue_ids -- desired_sub_issue_ids
+    needs_reorder? = desired_sub_issue_ids != current_sub_issue_ids
+
+    with :ok <- maybe_reconcile_parent_link(issue_id, current_parent_issue_id, desired_parent_issue_id),
+         :ok <- apply_sub_issue_additions(issue_id, adds),
+         :ok <- apply_sub_issue_removals(issue_id, removes),
+         :ok <- maybe_reprioritize_sub_issues(issue_id, desired_sub_issue_ids, needs_reorder?) do
+      :ok
+    end
+  end
+
+  def reconcile_issue_hierarchy(_issue, _desired_hierarchy), do: :ok
 
   @spec reconcile_issue_project_custom_fields(map(), map()) :: :ok | {:error, term()}
   def reconcile_issue_project_custom_fields(issue, desired_fields)
@@ -706,7 +738,7 @@ defmodule SymphonyElixir.GitHub.Client do
          fields when is_list(fields) <- get_in(body, ["data", "node", "fields", "nodes"]) do
       existing_fields_by_name = existing_fields_index(fields)
 
-      required_specs = required_project_field_specs(required_project_fields, tracker)
+      required_specs = required_project_field_specs(required_project_fields, tracker) |> enforce_status_field_parity(tracker)
 
       Enum.reduce_while(required_specs, {:ok, :ensured}, fn {field_name, definition}, _acc ->
         case ensure_required_project_field(project_id, existing_fields_by_name, field_name, definition) do
@@ -744,6 +776,81 @@ defmodule SymphonyElixir.GitHub.Client do
   defp reconcile_structure_dependencies(issue_id, desired) do
     desired_blocked_by = Map.get(desired, :blocked_by_issue_ids, [])
     reconcile_issue_blocked_by(issue_id, desired_blocked_by)
+  end
+
+  defp current_sub_issue_ids(%{tracker_metadata: tracker_metadata}) when is_map(tracker_metadata) do
+    tracker_metadata
+    |> Map.get("sub_issues", [])
+    |> normalize_id_set(fn
+      %{"id" => id} -> id
+      %{id: id} -> id
+      %{"identifier" => identifier} -> identifier
+      %{identifier: identifier} -> identifier
+      id -> id
+    end)
+  end
+
+  defp current_sub_issue_ids(_issue), do: []
+
+  defp current_parent_issue_id(%{tracker_metadata: tracker_metadata}) when is_map(tracker_metadata) do
+    tracker_metadata
+    |> get_in(["parent", "id"])
+    |> normalize_id()
+  end
+
+  defp current_parent_issue_id(_issue), do: nil
+
+  defp maybe_reconcile_parent_link(_issue_id, _current_parent_issue_id, nil), do: :ok
+  defp maybe_reconcile_parent_link(_issue_id, desired_parent_issue_id, desired_parent_issue_id), do: :ok
+
+  defp maybe_reconcile_parent_link(issue_id, current_parent_issue_id, desired_parent_issue_id)
+       when is_binary(issue_id) and is_binary(desired_parent_issue_id) do
+    with :ok <- maybe_remove_from_current_parent(current_parent_issue_id, issue_id),
+         :ok <- add_sub_issue(desired_parent_issue_id, issue_id) do
+      :ok
+    end
+  end
+
+  defp maybe_remove_from_current_parent(nil, _issue_id), do: :ok
+  defp maybe_remove_from_current_parent(current_parent_issue_id, issue_id), do: remove_sub_issue(current_parent_issue_id, issue_id)
+
+  defp apply_sub_issue_additions(_issue_id, []), do: :ok
+
+  defp apply_sub_issue_additions(issue_id, sub_issue_ids) when is_list(sub_issue_ids) do
+    Enum.reduce_while(sub_issue_ids, :ok, fn sub_issue_id, _acc ->
+      case add_sub_issue(issue_id, sub_issue_id) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp apply_sub_issue_removals(_issue_id, []), do: :ok
+
+  defp apply_sub_issue_removals(issue_id, sub_issue_ids) when is_list(sub_issue_ids) do
+    Enum.reduce_while(sub_issue_ids, :ok, fn sub_issue_id, _acc ->
+      case remove_sub_issue(issue_id, sub_issue_id) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp maybe_reprioritize_sub_issues(_issue_id, _desired_sub_issue_ids, false), do: :ok
+  defp maybe_reprioritize_sub_issues(_issue_id, [], _needs_reorder), do: :ok
+
+  defp maybe_reprioritize_sub_issues(issue_id, desired_sub_issue_ids, _needs_reorder)
+       when is_list(desired_sub_issue_ids) do
+    desired_sub_issue_ids
+    |> Enum.with_index()
+    |> Enum.reduce_while(:ok, fn {sub_issue_id, index}, _acc ->
+      after_id = if index == 0, do: nil, else: Enum.at(desired_sub_issue_ids, index - 1)
+
+      case reprioritize_sub_issue(issue_id, sub_issue_id, after_id) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
   end
 
   defp reconcile_taxonomy(issue_id, desired) do
@@ -1844,6 +1951,21 @@ defmodule SymphonyElixir.GitHub.Client do
     |> Enum.sort()
   end
 
+  defp normalize_id_set(items, extractor \\ & &1) do
+    items
+    |> Enum.map(extractor)
+    |> Enum.map(&normalize_id/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
+  defp normalize_id(value) when is_binary(value) do
+    trimmed = String.trim(value)
+    if trimmed == "", do: nil, else: trimmed
+  end
+
+  defp normalize_id(_value), do: nil
+
   defp fetch_blocked_by_numbers(tracker, headers, issue_number) do
     endpoint =
       "https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}/dependencies/blocked_by"
@@ -2032,7 +2154,15 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp default_status_field_options(%{} = tracker) do
-    (List.wrap(Map.get(tracker, :active_states)) ++ List.wrap(Map.get(tracker, :terminal_states)))
+    status_map_keys =
+      tracker
+      |> Map.get(:status_map, %{})
+      |> Map.keys()
+      |> Enum.sort_by(&normalize_state_name/1)
+
+    (List.wrap(Map.get(tracker, :active_states)) ++
+       List.wrap(Map.get(tracker, :terminal_states)) ++
+       status_map_keys)
     |> Enum.map(&to_string/1)
     |> Enum.map(&String.trim/1)
     |> Enum.reject(&(&1 == ""))
@@ -2105,27 +2235,38 @@ defmodule SymphonyElixir.GitHub.Client do
       {:error, {:github_project_field_type_mismatch, field_name, desired_type, existing["data_type"]}}
     else
       case desired_type do
-        "single_select" -> ensure_single_select_options(project_id, field_name, definition["options"])
+        "single_select" -> ensure_single_select_options(project_id, field_name, definition["options"], definition)
         _ -> :ok
       end
     end
   end
 
   defp ensure_single_select_options(project_id, field_name, desired_options) do
+    ensure_single_select_options(project_id, field_name, desired_options, %{})
+  end
+
+  defp ensure_single_select_options(project_id, field_name, desired_options, definition) when is_map(definition) do
     with {:ok, body} <- graphql(@project_fields_query, %{projectId: project_id}),
          fields when is_list(fields) <- get_in(body, ["data", "node", "fields", "nodes"]),
          %{"id" => field_id} = existing <- find_field_by_name(fields, field_name) do
       existing_options = Map.get(existing, "options", []) |> normalize_single_select_option_names()
-      merged_options = merge_single_select_options(existing_options, desired_options)
+      desired = normalize_single_select_option_names(desired_options)
 
-      if merged_options == existing_options do
+      resolved_options =
+        if strict_single_select_parity?(field_name, definition) do
+          desired
+        else
+          merge_single_select_options(existing_options, desired)
+        end
+
+      if options_equal?(existing_options, resolved_options) do
         :ok
       else
         case graphql_mutation(@update_single_select_field_query, %{
                projectId: project_id,
                fieldId: field_id,
                name: field_name,
-               singleSelectOptions: Enum.map(merged_options, &%{name: &1})
+               singleSelectOptions: Enum.map(resolved_options, &%{name: &1})
              }) do
           {:ok, _} -> :ok
           {:error, reason} -> {:error, reason}
@@ -2170,6 +2311,36 @@ defmodule SymphonyElixir.GitHub.Client do
 
     existing ++ Enum.reject(desired, fn option -> option_name_exists?(existing, option) end)
   end
+
+  defp strict_single_select_parity?(field_name, definition) do
+    normalize_state_name(field_name) == "status" and Map.get(definition, "strict_parity", true) == true
+  end
+
+  defp options_equal?(left, right) do
+    normalize_single_select_option_names(left) == normalize_single_select_option_names(right)
+  end
+
+  defp enforce_status_field_parity(required_specs, tracker) when is_map(required_specs) and is_map(tracker) do
+    derived_options = default_status_field_options(tracker)
+
+    status_entry =
+      Map.get(required_specs, "status") ||
+        Map.get(required_specs, "Status") ||
+        %{"type" => "single_select", "options" => []}
+
+    existing_options = List.wrap(Map.get(status_entry, "options"))
+    merged_options = merge_single_select_options(existing_options, derived_options)
+
+    normalized_status_entry =
+      status_entry
+      |> Map.put("type", "single_select")
+      |> Map.put("options", merged_options)
+      |> Map.put("strict_parity", true)
+
+    Map.put(required_specs, "status", normalized_status_entry)
+  end
+
+  defp enforce_status_field_parity(required_specs, _tracker), do: required_specs
 
   defp option_name_exists?(options, candidate) do
     candidate_key = normalize_state_name(candidate)
