@@ -374,10 +374,6 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_issue_state(%{} = issue, state, active_states, terminal_states) do
     cond do
-      active_issue_state?(issue.state, active_states) and attached_pr_merged?(issue) ->
-        Logger.info("Issue has merged attached PR while active: #{issue_context(issue)} state=#{issue.state}; treating as terminal-ready and stopping active agent with cleanup")
-        terminate_running_issue(state, issue.id, true)
-
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
@@ -590,7 +586,6 @@ defmodule SymphonyElixir.Orchestrator do
          terminal_states
        ) do
     candidate_issue?(issue, active_states, terminal_states) and
-      !active_issue_ready_for_cleanup?(issue, active_states) and
       !active_issue_blocked_by_non_terminal?(issue, active_states, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
@@ -722,7 +717,6 @@ defmodule SymphonyElixir.Orchestrator do
       issue
       |> issue_with_desired_project_custom_fields()
       |> issue_with_desired_primitive_overrides()
-      |> issue_with_pr_redispatch_marker(attempt)
 
     with :ok <- apply_orchestrator_tracker_writes(issue),
          :ok <- reconcile_issue_primitives(issue) do
@@ -864,56 +858,6 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_put_progress_default(fields, _issue), do: fields
-
-  defp issue_with_pr_redispatch_marker(%{tracker_metadata: tracker_metadata} = issue, attempt)
-       when is_map(tracker_metadata) do
-    if active_or_rework_issue?(issue) and attached_pr_closed_without_merge?(issue) do
-      marker = %{
-        "trigger" => "attached_pr_closed",
-        "attempt" => normalize_retry_attempt(attempt),
-        "at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
-      }
-
-      updated_metadata = Map.put(tracker_metadata, "redispatch_attempt_marker", marker)
-      Map.put(issue, :tracker_metadata, updated_metadata)
-    else
-      issue
-    end
-  end
-
-  defp issue_with_pr_redispatch_marker(issue, _attempt), do: issue
-
-  defp active_issue_ready_for_cleanup?(%{} = issue, active_states) do
-    active_issue_state?(Map.get(issue, :state), active_states) and attached_pr_merged?(issue)
-  end
-
-  defp active_issue_ready_for_cleanup?(_issue, _active_states), do: false
-
-  defp active_or_rework_issue?(%{state: state_name}) when is_binary(state_name) do
-    normalized_state = normalize_issue_state(state_name)
-
-    active_issue_state?(state_name, active_state_set()) or String.contains?(normalized_state, "rework") or
-      String.contains?(normalized_state, "todo")
-  end
-
-  defp active_or_rework_issue?(_issue), do: false
-
-  defp attached_pr_merged?(%{tracker_metadata: tracker_metadata}) when is_map(tracker_metadata) do
-    tracker_metadata
-    |> Map.get("pull_request_lifecycle", %{})
-    |> Map.get("has_merged", false)
-    |> Kernel.==(true)
-  end
-
-  defp attached_pr_merged?(_issue), do: false
-
-  defp attached_pr_closed_without_merge?(%{tracker_metadata: tracker_metadata})
-       when is_map(tracker_metadata) do
-    lifecycle = Map.get(tracker_metadata, "pull_request_lifecycle", %{})
-    Map.get(lifecycle, "has_closed", false) == true and Map.get(lifecycle, "has_merged", false) != true
-  end
-
-  defp attached_pr_closed_without_merge?(_issue), do: false
 
   defp dispatch_on_selected_worker_host(%State{} = state, issue, attempt, recipient, preferred_worker_host) do
     case select_worker_host(state, preferred_worker_host) do

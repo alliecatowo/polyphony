@@ -709,4 +709,36 @@ defmodule SymphonyElixir.OrchestratorGitHubReconcileTest do
     assert :ok = Orchestrator.reconcile_issue_primitives_for_test(issue)
     refute_receive {:mark_closed_pr_rework_redispatch_ready, "ISSUE-REWORK-PR-1", _}, 50
   end
+
+  test "active running issue is not auto-terminated based only on merged PR metadata" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://api.github.com/graphql",
+      tracker_api_token: "ghs_test_token",
+      tracker_repo_owner: "acme",
+      tracker_repo_name: "polyphony",
+      tracker_project_title: "Polyphony",
+      tracker_project_owner_login: "acme",
+      tracker_project_owner_type: "organization",
+      tracker_active_states: ["OPEN"],
+      tracker_terminal_states: ["CLOSED"]
+    )
+
+    issue = %GitHubIssue{
+      id: "ISSUE-RUNNING-PR-1",
+      identifier: "#701",
+      title: "Merged metadata only",
+      description: "Should remain running until state changes",
+      state: "OPEN",
+      tracker_metadata: %{
+        "pull_request_lifecycle" => %{"has_merged" => true}
+      }
+    }
+
+    running_entry = %{issue: issue}
+    state = %OrchestratorState{running: %{issue.id => running_entry}, claimed: MapSet.new()}
+
+    updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
+    assert Map.has_key?(updated_state.running, issue.id)
+  end
 end
