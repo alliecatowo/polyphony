@@ -64,6 +64,11 @@ codex:
 
 You are working on a GitHub issue `{{ issue.identifier }}`
 
+Repository artifact convention:
+
+- Use `docs/issues/<issue-id>/` for all per-issue artifacts.
+- Keep `plan.md`, `run-log.md`, and `handoff.md` updated for each run.
+
 {% if attempt %}
 Continuation context:
 

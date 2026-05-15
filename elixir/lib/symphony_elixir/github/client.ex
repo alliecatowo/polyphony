@@ -23,6 +23,17 @@ defmodule SymphonyElixir.GitHub.Client do
   state
   stateReason
   url
+  closedByPullRequestsReferences(first: 20) {
+    nodes {
+      id
+      number
+      url
+      title
+      state
+      mergedAt
+      repository { nameWithOwner }
+    }
+  }
   assignees(first: 10) { nodes { login } }
   labels(first: 30) { nodes { name } }
   milestone { id number title dueOn state description }
@@ -721,7 +732,7 @@ defmodule SymphonyElixir.GitHub.Client do
       |> Enum.map(&normalize_issue/1)
       |> Enum.reject(&is_nil/1)
 
-    {:ok, issues, %{has_next_page: has_next_page == true, end_cursor: end_cursor}}
+    {:ok, enrich_issues_with_relationship_signals(issues), %{has_next_page: has_next_page == true, end_cursor: end_cursor}}
   end
 
   defp decode_repository_page_response(%{"errors" => errors}), do: {:error, {:github_graphql_errors, errors}}
@@ -768,7 +779,7 @@ defmodule SymphonyElixir.GitHub.Client do
         end
       end)
 
-    {:ok, issues, %{has_next_page: has_next_page == true, end_cursor: end_cursor}}
+    {:ok, enrich_issues_with_relationship_signals(issues), %{has_next_page: has_next_page == true, end_cursor: end_cursor}}
   end
 
   defp decode_project_page_response(%{"errors" => errors}, _repo_owner, _repo_name),
@@ -783,6 +794,7 @@ defmodule SymphonyElixir.GitHub.Client do
       _ -> nil
     end)
     |> Enum.reject(&is_nil/1)
+    |> enrich_issues_with_relationship_signals()
     |> then(&{:ok, &1})
   end
 
@@ -809,7 +821,8 @@ defmodule SymphonyElixir.GitHub.Client do
       "milestone" => normalize_milestone(issue["milestone"]),
       "parent" => normalize_linked_issue(issue["parent"]),
       "sub_issues" => normalize_linked_issues(get_in(issue, ["subIssues", "nodes"])),
-      "project_items" => normalize_project_items(get_in(issue, ["projectItems", "nodes"]))
+      "project_items" => normalize_project_items(get_in(issue, ["projectItems", "nodes"])),
+      "linked_pull_requests" => normalize_linked_pr_signals(issue)
     }
 
     %Issue{
@@ -822,7 +835,7 @@ defmodule SymphonyElixir.GitHub.Client do
       branch_name: nil,
       url: issue["url"],
       assignee_id: normalize_assignee(first_assignee),
-      blocked_by: normalize_blockers(issue["parent"]),
+      blocked_by: normalize_blockers([], issue["parent"]),
       labels: normalize_labels(issue),
       assigned_to_worker: true,
       created_at: parse_datetime(issue["createdAt"]),
@@ -842,7 +855,31 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp normalize_labels(_), do: []
 
-  defp normalize_blockers(%{} = parent) do
+  defp normalize_blockers(blocked_by_edges, %{} = parent) when is_list(blocked_by_edges) do
+    if blocked_by_edges == [] do
+      [
+        %{
+          id: parent["id"],
+          identifier: parent["identifier"] || linked_identifier(parent["number"]),
+          state: parent["state"]
+        }
+      ]
+    else
+      normalize_blockers(blocked_by_edges, nil)
+    end
+  end
+
+  defp normalize_blockers(blocked_by_edges, _parent) when is_list(blocked_by_edges) do
+    Enum.map(normalize_dependency_links(blocked_by_edges), fn edge ->
+      %{
+        id: edge["id"],
+        identifier: edge["identifier"],
+        state: edge["state"]
+      }
+    end)
+  end
+
+  defp normalize_blockers(_blocked_by_edges, %{} = parent) do
     [
       %{
         id: parent["id"],
@@ -852,7 +889,7 @@ defmodule SymphonyElixir.GitHub.Client do
     ]
   end
 
-  defp normalize_blockers(_), do: []
+  defp normalize_blockers(_, _), do: []
 
   defp normalize_linked_issue(nil), do: nil
 
@@ -868,6 +905,66 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp normalize_linked_issues(issues) when is_list(issues), do: Enum.map(issues, &normalize_linked_issue/1)
   defp normalize_linked_issues(_), do: []
+
+  defp normalize_linked_pr_signals(issue) when is_map(issue) do
+    graphql_prs =
+      issue
+      |> get_in(["closedByPullRequestsReferences", "nodes"])
+      |> normalize_linked_prs()
+
+    project_prs =
+      issue
+      |> get_in(["projectItems", "nodes"])
+      |> normalize_project_item_linked_prs()
+
+    dedupe_linked_prs(graphql_prs ++ project_prs)
+  end
+
+  defp normalize_linked_pr_signals(_), do: []
+
+  defp normalize_linked_prs(prs) when is_list(prs) do
+    Enum.map(prs, fn pr ->
+      %{
+        "id" => pr["id"],
+        "number" => pr["number"],
+        "identifier" => linked_identifier(pr["number"]),
+        "title" => pr["title"],
+        "state" => pr["state"],
+        "url" => pr["url"],
+        "merged_at" => pr["mergedAt"],
+        "repository" => get_in(pr, ["repository", "nameWithOwner"])
+      }
+    end)
+  end
+
+  defp normalize_linked_prs(_), do: []
+
+  defp normalize_project_item_linked_prs(items) when is_list(items) do
+    items
+    |> Enum.flat_map(fn item ->
+      item
+      |> get_in(["fieldValues", "nodes"])
+      |> List.wrap()
+      |> Enum.flat_map(fn value ->
+        if value["__typename"] == "ProjectV2ItemFieldPullRequestValue" do
+          normalize_linked_prs(get_in(value, ["pullRequests", "nodes"]))
+        else
+          []
+        end
+      end)
+    end)
+  end
+
+  defp normalize_project_item_linked_prs(_), do: []
+
+  defp dedupe_linked_prs(prs) when is_list(prs) do
+    prs
+    |> Enum.reduce(%{}, fn pr, acc ->
+      key = pr["id"] || pr["url"] || pr["identifier"] || inspect(pr)
+      Map.put_new(acc, key, pr)
+    end)
+    |> Map.values()
+  end
 
   defp normalize_milestone(nil), do: nil
 
@@ -980,6 +1077,105 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp linked_identifier(number) when is_integer(number), do: "##{number}"
   defp linked_identifier(_number), do: nil
+
+  defp enrich_issues_with_relationship_signals(issues) when is_list(issues) do
+    with {:ok, tracker} <- repo_tracker_config(),
+         {:ok, headers} <- rest_headers() do
+      Enum.map(issues, &enrich_issue_relationship_signals(&1, tracker, headers))
+    else
+      _ -> issues
+    end
+  end
+
+  defp enrich_issue_relationship_signals(%Issue{} = issue, tracker, headers) do
+    issue_number =
+      issue
+      |> Map.get(:tracker_metadata, %{})
+      |> Map.get("number")
+
+    case issue_number do
+      n when is_integer(n) ->
+        case fetch_issue_dependency_edges(tracker, headers, n) do
+          {:ok, dependencies} ->
+            metadata =
+              issue
+              |> Map.get(:tracker_metadata, %{})
+              |> Map.put("dependencies", dependencies)
+
+            blocked_by = normalize_blockers(dependencies["blocked_by"], metadata["parent"])
+            Map.merge(issue, %{tracker_metadata: metadata, blocked_by: blocked_by})
+
+          {:error, _reason} ->
+            issue
+        end
+
+      _ ->
+        issue
+    end
+  end
+
+  defp enrich_issue_relationship_signals(issue, _tracker, _headers), do: issue
+
+  defp fetch_issue_dependency_edges(tracker, headers, issue_number) do
+    blocked_by_endpoint =
+      "https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}/dependencies/blocked_by"
+
+    blocking_endpoint =
+      "https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}/dependencies/blocking"
+
+    with {:ok, blocked_by} <- fetch_dependency_endpoint(blocked_by_endpoint, "blocked_by", headers),
+         {:ok, blocking} <- fetch_dependency_endpoint(blocking_endpoint, "blocking", headers) do
+      {:ok,
+       %{
+         "blocked_by" => normalize_dependency_links(blocked_by),
+         "blocking" => normalize_dependency_links(blocking)
+       }}
+    end
+  end
+
+  defp fetch_dependency_endpoint(endpoint, key, headers) do
+    case Req.get(endpoint, headers: headers) do
+      {:ok, %{status: 200, body: body}} ->
+        {:ok, extract_dependency_nodes(body, key)}
+
+      {:ok, %{status: status}} when status in [403, 404] ->
+        {:ok, []}
+
+      {:ok, %{status: status}} ->
+        {:error, {:github_api_status, status}}
+
+      {:error, reason} ->
+        {:error, {:github_api_request, reason}}
+    end
+  end
+
+  defp extract_dependency_nodes(body, key) when is_map(body) do
+    case Map.get(body, key) do
+      nodes when is_list(nodes) ->
+        nodes
+
+      _ ->
+        case Map.get(body, "nodes") do
+          nodes when is_list(nodes) -> nodes
+          _ -> []
+        end
+    end
+  end
+
+  defp normalize_dependency_links(nodes) when is_list(nodes) do
+    Enum.map(nodes, fn issue ->
+      %{
+        "id" => issue["id"],
+        "number" => issue["number"],
+        "identifier" => linked_identifier(issue["number"]),
+        "title" => issue["title"],
+        "state" => issue["state"],
+        "url" => issue["url"]
+      }
+    end)
+  end
+
+  defp normalize_dependency_links(_), do: []
 
   defp issue_order_index(ids) when is_list(ids) do
     ids

@@ -207,6 +207,11 @@ Fields (logical):
 - `workspace_key` (sanitized issue identifier)
 - `created_now` (boolean, used to gate `after_create` hook)
 
+Repository artifacts:
+
+- Implementations SHOULD keep deterministic per-issue run artifacts in `docs/issues/<issue-id>/`
+  (for example `plan.md`, `run-log.md`, `decisions/`, `spikes/`, `evidence/`, `handoff.md`).
+
 #### 4.1.5 Run Attempt
 
 One execution attempt for one issue.

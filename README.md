@@ -45,6 +45,8 @@ Polyphony keeps Symphony spec semantics while mapping them onto GitHub primitive
 - Labels, milestones, and relationships
 - PR links, reviews, checks, and merge state
 
+Per-issue runtime artifacts are stored in `docs/issues/<issue-id>/` (plan, run log, decisions, evidence, handoff).
+
 ## License
 
 This project is licensed under the [Apache License 2.0](LICENSE).

@@ -40,6 +40,11 @@ defmodule SymphonyElixir.OrchestratorGitHubReconcileTest do
       :ok
     end
 
+    def reconcile_issue_state_from_project_status(%GitHubIssue{id: issue_id} = issue) do
+      send_message({:reconcile_issue_state_from_project_status, issue_id, issue.tracker_metadata})
+      :ok
+    end
+
     defp send_message(message) do
       if pid = Application.get_env(:symphony_elixir, :github_reconcile_test_recipient) do
         send(pid, message)

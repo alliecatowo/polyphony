@@ -1,5 +1,5 @@
 Polyphony workspace conventions
 
-- Per-issue artifacts are stored at `polyphony/issues/<issue-id>/`.
+- Per-issue artifacts are stored at `docs/issues/<issue-id>/`.
 - Each issue directory should include plan, run log, decisions, spikes, evidence, and handoff notes.
 - Keep entries deterministic and append-only where practical.

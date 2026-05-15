@@ -452,6 +452,84 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
            } = issue.tracker_metadata
   end
 
+  test "normalization includes dependency edges and linked pull request signals" do
+    Req.Test.stub(__MODULE__, fn conn ->
+      cond do
+        conn.method == "POST" ->
+          payload = %{
+            "data" => %{
+              "nodes" => [
+                issue_node("I55", 55, "OPEN",
+                  parent: %{
+                    "id" => "PARENT55",
+                    "number" => 9,
+                    "title" => "Legacy Parent",
+                    "state" => "OPEN",
+                    "url" => "https://github.com/acme/polyphony/issues/9"
+                  },
+                  linked_prs: [
+                    %{
+                      "id" => "PR1",
+                      "number" => 101,
+                      "url" => "https://github.com/acme/polyphony/pull/101",
+                      "title" => "Fix thing",
+                      "state" => "OPEN",
+                      "mergedAt" => nil,
+                      "repository" => %{"nameWithOwner" => "acme/polyphony"}
+                    }
+                  ]
+                )
+              ]
+            }
+          }
+
+          Req.Test.json(conn, payload)
+
+        conn.method == "GET" and String.contains?(conn.request_path, "/issues/55/dependencies/blocked_by") ->
+          Req.Test.json(conn, %{
+            "blocked_by" => [
+              %{
+                "id" => "DEP-1",
+                "number" => 12,
+                "title" => "Blocked issue",
+                "state" => "OPEN",
+                "url" => "https://github.com/acme/polyphony/issues/12"
+              }
+            ]
+          })
+
+        conn.method == "GET" and String.contains?(conn.request_path, "/issues/55/dependencies/blocking") ->
+          Req.Test.json(conn, %{
+            "blocking" => [
+              %{
+                "id" => "DEP-2",
+                "number" => 77,
+                "title" => "Downstream issue",
+                "state" => "OPEN",
+                "url" => "https://github.com/acme/polyphony/issues/77"
+              }
+            ]
+          })
+
+        true ->
+          Req.Test.json(conn, %{"data" => %{}})
+      end
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+    assert {:ok, [issue]} = Client.fetch_issue_states_by_ids(["I55"])
+
+    assert issue.blocked_by == [%{id: "DEP-1", identifier: "#12", state: "OPEN"}]
+
+    assert %{
+             "dependencies" => %{
+               "blocked_by" => [%{"id" => "DEP-1", "identifier" => "#12", "number" => 12}],
+               "blocking" => [%{"id" => "DEP-2", "identifier" => "#77", "number" => 77}]
+             },
+             "linked_pull_requests" => [%{"id" => "PR1", "identifier" => "#101", "number" => 101}]
+           } = issue.tracker_metadata
+  end
+
   test "project field helper captures labels and milestone field variants in tracker metadata" do
     Req.Test.stub(__MODULE__, fn conn ->
       payload = %{
@@ -524,6 +602,7 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
       "state" => state,
       "stateReason" => nil,
       "url" => "https://github.com/acme/polyphony/issues/#{number}",
+      "closedByPullRequestsReferences" => %{"nodes" => Keyword.get(opts, :linked_prs, [])},
       "assignees" => %{"nodes" => assignees},
       "labels" => %{"nodes" => labels},
       "milestone" => milestone,

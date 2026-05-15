@@ -20,6 +20,8 @@ This directory contains the Elixir/OTP reference implementation for Polyphony, a
 4. Applies workflow policy from `WORKFLOW.md`
 5. Stops/cleans up when items become terminal
 
+Per-issue run artifacts are written under `docs/issues/<issue-id>/`.
+
 ## Why GitHub-first
 
 Linear free-tier issue limits can block high-volume agentic workflows. A GitHub-native model keeps
