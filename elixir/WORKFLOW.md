@@ -18,6 +18,23 @@ tracker:
     - Canceled
     - Duplicate
     - Done
+  status_map:
+    Todo:
+      state: open
+    In Progress:
+      state: open
+    Human Review:
+      state: open
+    Rework:
+      state: open
+    Merging:
+      state: open
+    Done:
+      state: closed
+      state_reason: completed
+    Cancelled:
+      state: closed
+      state_reason: not_planned
 polling:
   interval_ms: 5000
 workspace:

@@ -239,6 +239,146 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
     assert_receive {:patch_issue_state, "/repos/acme/polyphony/issues/42", "open"}
   end
 
+  test "status map default mapping sends closed+completed for Done" do
+    test_pid = self()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      if conn.method == "PATCH" and String.contains?(conn.request_path, "/issues/") do
+        send(test_pid, {:patch_issue_payload, conn.request_path, conn.body_params})
+      end
+
+      Req.Test.json(conn, %{"ok" => true})
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+
+    assert :ok = Client.update_issue_state("#42", "Done")
+
+    assert_receive {:patch_issue_payload, "/repos/acme/polyphony/issues/42", payload}
+    assert payload["state"] == "closed"
+    assert payload["state_reason"] == "completed"
+  end
+
+  test "status map override from workflow config controls dispatch eligibility" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://example.test/graphql",
+      tracker_api_token: "ghs_test_token",
+      tracker_repo_owner: "acme",
+      tracker_repo_name: "polyphony",
+      tracker_active_states: ["queued"],
+      tracker_terminal_states: ["closed", "done"]
+    )
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      query = get_in(conn.body_params, ["query"]) || ""
+
+      cond do
+        String.contains?(query, "OwnerLookup") ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "organization" => %{
+                "id" => "ORG1",
+                "projectsV2" => %{"nodes" => [%{"id" => "PROJ1", "title" => "Polyphony", "url" => "u", "number" => 1}]}
+              }
+            }
+          })
+
+        String.contains?(query, "ProjectFields") ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "node" => %{
+                "fields" => %{"nodes" => [%{"id" => "F1", "name" => "Status", "dataType" => "SINGLE_SELECT"}]}
+              }
+            }
+          })
+
+        String.contains?(query, "RepositoryIssues") ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "repository" => %{
+                "issues" => %{
+                  "nodes" => [
+                    issue_node("I20", 20, "OPEN", status_name: "Queued")
+                  ],
+                  "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+                }
+              }
+            }
+          })
+
+        String.contains?(query, "ProjectIssues") ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "node" => %{
+                "items" => %{
+                  "nodes" => [
+                    %{
+                      "id" => "ITEM-20",
+                      "isArchived" => false,
+                      "content" => Map.put(issue_node("I20", 20, "OPEN", status_name: "Queued"), "repository", %{"nameWithOwner" => "acme/polyphony"}),
+                      "fieldValues" => %{"nodes" => status_field_nodes("Queued")}
+                    }
+                  ],
+                  "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+                }
+              }
+            }
+          })
+
+        String.contains?(query, "AddProjectItem") ->
+          Req.Test.json(conn, %{"data" => %{"addProjectV2ItemById" => %{"item" => %{"id" => "ITEMNEW"}}}})
+
+        true ->
+          Req.Test.json(conn, %{"data" => %{}})
+      end
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+    assert {:ok, issues} = Client.fetch_candidate_issues()
+    assert Enum.map(issues, & &1.id) == ["I20"]
+  end
+
+  test "status map terminal mapping sends closed+not_planned for cancelled states" do
+    test_pid = self()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      if conn.method == "PATCH" and String.contains?(conn.request_path, "/issues/") do
+        send(test_pid, {:patch_issue_payload, conn.request_path, conn.body_params})
+      end
+
+      Req.Test.json(conn, %{"ok" => true})
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+
+    assert :ok = Client.update_issue_state("#42", "Canceled")
+
+    assert_receive {:patch_issue_payload, "/repos/acme/polyphony/issues/42", payload}
+    assert payload["state"] == "closed"
+    assert payload["state_reason"] == "not_planned"
+  end
+
+  test "status map unknown status falls back to open without state_reason" do
+    test_pid = self()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      if conn.method == "PATCH" and String.contains?(conn.request_path, "/issues/") do
+        send(test_pid, {:patch_issue_payload, conn.request_path, conn.body_params})
+      end
+
+      Req.Test.json(conn, %{"ok" => true})
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+
+    assert :ok = Client.update_issue_state("#42", "Totally Unknown")
+
+    assert_receive {:patch_issue_payload, "/repos/acme/polyphony/issues/42", payload}
+    assert payload["state"] == "open"
+    refute Map.has_key?(payload, "state_reason")
+  end
+
   test "create_comment returns ok on success and github_api_status on failure" do
     Req.Test.stub(__MODULE__, fn conn ->
       status = if conn.body_params["body"] == "ship it", do: 201, else: 422

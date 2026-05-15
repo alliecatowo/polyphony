@@ -401,10 +401,12 @@ defmodule SymphonyElixir.GitHub.Client do
   @spec update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
   def update_issue_state(issue_id, state_name)
       when is_binary(issue_id) and is_binary(state_name) do
+    tracker = Config.settings!().tracker
+
     with {:ok, issue_number} <- parse_issue_number(issue_id),
-         {:ok, tracker} <- repo_tracker_config(),
+         {:ok, tracker} <- repo_tracker_config(tracker),
          {:ok, headers} <- rest_headers(),
-         {state, state_reason} <- normalize_rest_issue_state(state_name),
+         {state, state_reason} <- normalize_rest_issue_state(state_name, tracker.status_map),
          payload <- issue_state_payload(state, state_reason),
          {:ok, %{status: status}} when status in [200] <-
            Req.patch("https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}",
@@ -421,6 +423,22 @@ defmodule SymphonyElixir.GitHub.Client do
         {:error, reason}
     end
   end
+
+  @spec reconcile_issue_state_from_project_status(map()) :: :ok | {:error, term()}
+  def reconcile_issue_state_from_project_status(%{id: issue_id} = issue) when is_binary(issue_id) do
+    project_status =
+      issue
+      |> project_state_values()
+      |> List.first()
+
+    if is_binary(project_status) and project_status != "" do
+      update_issue_state(issue_id, project_status)
+    else
+      :ok
+    end
+  end
+
+  def reconcile_issue_state_from_project_status(_issue), do: :ok
 
   @spec reconcile_issue_milestone(String.t(), integer() | nil) :: :ok | {:error, term()}
   def reconcile_issue_milestone(issue_id, desired_milestone_number)
@@ -1048,8 +1066,10 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp repo_tracker_config do
-    tracker = Config.settings!().tracker
+    repo_tracker_config(Config.settings!().tracker)
+  end
 
+  defp repo_tracker_config(tracker) do
     if is_binary(tracker.repo_owner) and String.trim(tracker.repo_owner) != "" and is_binary(tracker.repo_name) and
          String.trim(tracker.repo_name) != "" do
       {:ok, tracker}
@@ -1100,8 +1120,36 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp normalize_rest_issue_state(state_name) do
-    case state_name |> normalize_state_name() do
+  defp normalize_rest_issue_state(state_name, status_map) do
+    normalized_state_name = normalize_state_name(state_name)
+
+    case configured_status_mapping(status_map, normalized_state_name) do
+      {:ok, state, state_reason} ->
+        {state, state_reason}
+
+      :error ->
+        legacy_normalize_rest_issue_state(normalized_state_name)
+    end
+  end
+
+  defp configured_status_mapping(status_map, normalized_state_name)
+       when is_map(status_map) and is_binary(normalized_state_name) do
+    case Map.get(status_map, normalized_state_name) do
+      %{"state" => "open"} ->
+        {:ok, "open", nil}
+
+      %{"state" => "closed"} = mapping ->
+        {:ok, "closed", Map.get(mapping, "state_reason")}
+
+      _ ->
+        :error
+    end
+  end
+
+  defp configured_status_mapping(_status_map, _normalized_state_name), do: :error
+
+  defp legacy_normalize_rest_issue_state(normalized_state_name) do
+    case normalized_state_name do
       "done" -> {"closed", "completed"}
       "closed" -> {"closed", nil}
       "completed" -> {"closed", "completed"}

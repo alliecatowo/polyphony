@@ -83,5 +83,10 @@ defmodule SymphonyElixir.GitHub.Adapter do
     client_module().reconcile_issue_blocked_by(issue_id, blocked_by_issue_ids)
   end
 
+  @spec reconcile_issue_state_from_project_status(map()) :: :ok | {:error, term()}
+  def reconcile_issue_state_from_project_status(issue) when is_map(issue) do
+    client_module().reconcile_issue_state_from_project_status(issue)
+  end
+
   defp client_module, do: Application.get_env(:symphony_elixir, :github_client, Client)
 end

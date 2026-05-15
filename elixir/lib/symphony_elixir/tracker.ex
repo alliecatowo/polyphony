@@ -54,6 +54,12 @@ defmodule SymphonyElixir.Tracker do
     with :ok <-
            maybe_call_reconcile(
              tracker_adapter,
+             :reconcile_issue_state_from_project_status,
+             [issue]
+           ),
+         :ok <-
+           maybe_call_reconcile(
+             tracker_adapter,
              :reconcile_issue_milestone,
              [issue_id, milestone_number]
            ),

@@ -131,6 +131,9 @@ defmodule SymphonyElixir.Config do
       settings.tracker.kind == "github" and not present_string?(settings.tracker.repo_name) ->
         {:error, :missing_github_repo_name}
 
+      settings.tracker.kind == "github" and not valid_status_map?(settings.tracker.status_map) ->
+        {:error, :invalid_github_status_map}
+
       settings.tracker.kind == "linear" and not present_string?(settings.tracker.api_key) ->
         {:error, :missing_linear_api_token}
 
@@ -163,4 +166,22 @@ defmodule SymphonyElixir.Config do
 
   defp present_string?(value) when is_binary(value), do: String.trim(value) != ""
   defp present_string?(_value), do: false
+
+  defp valid_status_map?(status_map) when is_map(status_map) do
+    Enum.all?(status_map, fn {status_name, mapping} ->
+      present_string?(to_string(status_name)) and valid_status_mapping?(mapping)
+    end)
+  end
+
+  defp valid_status_map?(_), do: false
+
+  defp valid_status_mapping?(%{"state" => state} = mapping) when state in ["open", "closed"] do
+    case Map.get(mapping, "state_reason") do
+      nil -> true
+      reason when state == "closed" and reason in ["completed", "not_planned"] -> true
+      _ -> false
+    end
+  end
+
+  defp valid_status_mapping?(_), do: false
 end

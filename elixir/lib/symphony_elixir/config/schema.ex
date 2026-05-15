@@ -41,8 +41,20 @@ defmodule SymphonyElixir.Config.Schema do
     @moduledoc false
     use Ecto.Schema
     import Ecto.Changeset
+    alias SymphonyElixir.Config.Schema
 
     @primary_key false
+    @default_status_map %{
+      "done" => %{"state" => "closed", "state_reason" => "completed"},
+      "completed" => %{"state" => "closed", "state_reason" => "completed"},
+      "closed" => %{"state" => "closed"},
+      "cancelled" => %{"state" => "closed", "state_reason" => "not_planned"},
+      "canceled" => %{"state" => "closed", "state_reason" => "not_planned"},
+      "not_planned" => %{"state" => "closed", "state_reason" => "not_planned"},
+      "open" => %{"state" => "open"},
+      "reopen" => %{"state" => "open"},
+      "reopened" => %{"state" => "open"}
+    }
 
     embedded_schema do
       field(:kind, :string, default: "github")
@@ -57,6 +69,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:assignee, :string)
       field(:active_states, {:array, :string}, default: ["OPEN"])
       field(:terminal_states, {:array, :string}, default: ["CLOSED", "DONE", "COMPLETED", "CANCELLED", "CANCELED"])
+      field(:status_map, :map, default: @default_status_map)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -76,10 +89,13 @@ defmodule SymphonyElixir.Config.Schema do
           :project_owner_type,
           :assignee,
           :active_states,
-          :terminal_states
+          :terminal_states,
+          :status_map
         ],
         empty_values: []
       )
+      |> update_change(:status_map, &Schema.normalize_status_map/1)
+      |> Schema.validate_status_map(:status_map)
     end
   end
 
@@ -351,6 +367,73 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   @doc false
+  @spec normalize_status_map(nil | map()) :: map()
+  def normalize_status_map(nil), do: %{}
+
+  def normalize_status_map(status_map) when is_map(status_map) do
+    Enum.reduce(status_map, %{}, fn {status_name, mapping}, acc ->
+      normalized_status = normalize_issue_state(to_string(status_name))
+      normalized_mapping = normalize_status_mapping_entry(mapping)
+
+      if normalized_status == "" or normalized_mapping == %{} do
+        acc
+      else
+        Map.put(acc, normalized_status, normalized_mapping)
+      end
+    end)
+  end
+
+  @doc false
+  @spec validate_status_map(Ecto.Changeset.t(), atom()) :: Ecto.Changeset.t()
+  def validate_status_map(changeset, field) do
+    validate_change(changeset, field, fn ^field, status_map ->
+      cond do
+        not is_map(status_map) ->
+          [{field, "must be a map of status => %{state, state_reason?}"}]
+
+        true ->
+          Enum.flat_map(status_map, fn {status_name, mapping} ->
+            cond do
+              to_string(status_name) == "" ->
+                [{field, "status names must not be blank"}]
+
+              not is_map(mapping) ->
+                [{field, "each status mapping must be a map"}]
+
+              true ->
+                state = mapping["state"]
+                state_reason = Map.get(mapping, "state_reason")
+
+                state_errors =
+                  if state in ["open", "closed"] do
+                    []
+                  else
+                    [{field, "mapping state must be \"open\" or \"closed\""}]
+                  end
+
+                state_reason_errors =
+                  cond do
+                    is_nil(state_reason) ->
+                      []
+
+                    state != "closed" ->
+                      [{field, "state_reason is only valid when state is \"closed\""}]
+
+                    state_reason in ["completed", "not_planned"] ->
+                      []
+
+                    true ->
+                      [{field, "state_reason must be \"completed\" or \"not_planned\""}]
+                  end
+
+                state_errors ++ state_reason_errors
+            end
+          end)
+      end
+    end)
+  end
+
+  @doc false
   @spec validate_state_limits(Ecto.Changeset.t(), atom()) :: Ecto.Changeset.t()
   def validate_state_limits(changeset, field) do
     validate_change(changeset, field, fn ^field, limits ->
@@ -505,6 +588,50 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp normalize_secret_value(_value), do: nil
+
+  defp normalize_status_mapping_entry(mapping) when is_map(mapping) do
+    normalized = normalize_keys(mapping)
+
+    state =
+      normalized
+      |> Map.get("state")
+      |> normalize_optional_token()
+
+    state_reason = normalize_optional_state_reason(normalized["state_reason"])
+
+    case state do
+      "open" -> %{"state" => "open"}
+      "closed" -> if(is_binary(state_reason), do: %{"state" => "closed", "state_reason" => state_reason}, else: %{"state" => "closed"})
+      _ -> %{}
+    end
+  end
+
+  defp normalize_status_mapping_entry(_mapping), do: %{}
+
+  defp normalize_optional_state_reason(value) when is_binary(value) do
+    normalized =
+      value
+      |> String.trim()
+      |> String.downcase()
+
+    if normalized in ["completed", "not_planned"], do: normalized, else: nil
+  end
+
+  defp normalize_optional_state_reason(_value), do: nil
+
+  defp normalize_optional_token(value) when is_binary(value) do
+    value
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp normalize_optional_token(value) when is_atom(value) do
+    value
+    |> Atom.to_string()
+    |> normalize_optional_token()
+  end
+
+  defp normalize_optional_token(_value), do: ""
 
   defp normalize_tracker_endpoint(kind, endpoint) do
     normalized_kind = if is_binary(kind), do: String.downcase(kind), else: kind
