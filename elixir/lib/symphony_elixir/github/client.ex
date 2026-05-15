@@ -855,7 +855,9 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp normalize_labels(_), do: []
 
-  defp normalize_blockers(blocked_by_edges, %{} = parent) when is_list(blocked_by_edges) do
+  defp normalize_blockers(blocked_by_edges, parent, blocker_states \\ %{})
+
+  defp normalize_blockers(blocked_by_edges, %{} = parent, blocker_states) when is_list(blocked_by_edges) do
     if blocked_by_edges == [] do
       [
         %{
@@ -865,21 +867,23 @@ defmodule SymphonyElixir.GitHub.Client do
         }
       ]
     else
-      normalize_blockers(blocked_by_edges, nil)
+      normalize_blockers(blocked_by_edges, nil, blocker_states)
     end
   end
 
-  defp normalize_blockers(blocked_by_edges, _parent) when is_list(blocked_by_edges) do
+  defp normalize_blockers(blocked_by_edges, _parent, blocker_states) when is_list(blocked_by_edges) do
     Enum.map(normalize_dependency_links(blocked_by_edges), fn edge ->
+      blocker_id = edge["id"]
+
       %{
-        id: edge["id"],
+        id: blocker_id,
         identifier: edge["identifier"],
-        state: edge["state"]
+        state: Map.get(blocker_states, blocker_id) || edge["state"]
       }
     end)
   end
 
-  defp normalize_blockers(_blocked_by_edges, %{} = parent) do
+  defp normalize_blockers(_blocked_by_edges, %{} = parent, _blocker_states) do
     [
       %{
         id: parent["id"],
@@ -889,7 +893,7 @@ defmodule SymphonyElixir.GitHub.Client do
     ]
   end
 
-  defp normalize_blockers(_, _), do: []
+  defp normalize_blockers(_, _, _), do: []
 
   defp normalize_linked_issue(nil), do: nil
 
@@ -1081,11 +1085,54 @@ defmodule SymphonyElixir.GitHub.Client do
   defp enrich_issues_with_relationship_signals(issues) when is_list(issues) do
     with {:ok, tracker} <- repo_tracker_config(),
          {:ok, headers} <- rest_headers() do
-      Enum.map(issues, &enrich_issue_relationship_signals(&1, tracker, headers))
+      issues
+      |> Enum.map(&enrich_issue_relationship_signals(&1, tracker, headers))
+      |> hydrate_blocker_states()
     else
       _ -> issues
     end
   end
+
+  defp hydrate_blocker_states(issues) when is_list(issues) do
+    blocker_ids =
+      issues
+      |> Enum.flat_map(&blocked_by_ids/1)
+      |> Enum.uniq()
+
+    case fetch_issue_workflow_states_by_ids(blocker_ids) do
+      {:ok, blocker_states} ->
+        Enum.map(issues, &apply_blocker_states(&1, blocker_states))
+
+      {:error, _reason} ->
+        issues
+    end
+  end
+
+  defp hydrate_blocker_states(issues), do: issues
+
+  defp blocked_by_ids(%Issue{} = issue) do
+    issue
+    |> Map.get(:tracker_metadata, %{})
+    |> Map.get("dependencies", %{})
+    |> Map.get("blocked_by", [])
+    |> Enum.flat_map(fn
+      %{"id" => id} when is_binary(id) -> [id]
+      _ -> []
+    end)
+  end
+
+  defp blocked_by_ids(_issue), do: []
+
+  defp apply_blocker_states(%Issue{} = issue, blocker_states) when is_map(blocker_states) do
+    metadata = Map.get(issue, :tracker_metadata, %{})
+    dependencies = Map.get(metadata, "dependencies", %{})
+
+    blocked_by = normalize_blockers(Map.get(dependencies, "blocked_by", []), metadata["parent"], blocker_states)
+
+    %{issue | blocked_by: blocked_by}
+  end
+
+  defp apply_blocker_states(issue, _blocker_states), do: issue
 
   defp enrich_issue_relationship_signals(%Issue{} = issue, tracker, headers) do
     issue_number =
@@ -1102,7 +1149,7 @@ defmodule SymphonyElixir.GitHub.Client do
               |> Map.get(:tracker_metadata, %{})
               |> Map.put("dependencies", dependencies)
 
-            blocked_by = normalize_blockers(dependencies["blocked_by"], metadata["parent"])
+            blocked_by = normalize_blockers(dependencies["blocked_by"], metadata["parent"], %{})
             Map.merge(issue, %{tracker_metadata: metadata, blocked_by: blocked_by})
 
           {:error, _reason} ->
@@ -1176,6 +1223,42 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp normalize_dependency_links(_), do: []
+
+  defp fetch_issue_workflow_states_by_ids([]), do: {:ok, %{}}
+
+  defp fetch_issue_workflow_states_by_ids(ids) when is_list(ids) do
+    with {:ok, body} <- graphql(@query_by_ids, %{ids: Enum.uniq(ids)}),
+         %{"data" => %{"nodes" => nodes}} when is_list(nodes) <- body do
+      states =
+        nodes
+        |> Enum.reduce(%{}, fn
+          %{} = issue_node, acc ->
+            case normalize_issue(issue_node) do
+              %Issue{id: id} = issue when is_binary(id) -> Map.put(acc, id, effective_issue_state(issue))
+              _ -> acc
+            end
+
+          _, acc ->
+            acc
+        end)
+
+      {:ok, states}
+    else
+      %{"errors" => errors} when is_list(errors) -> {:error, {:github_graphql_errors, errors}}
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :github_unknown_payload}
+    end
+  end
+
+  defp effective_issue_state(%Issue{} = issue) do
+    issue
+    |> project_state_values()
+    |> List.first()
+    |> case do
+      state when is_binary(state) and state != "" -> state
+      _ -> normalize_state_name(issue.state || "")
+    end
+  end
 
   defp issue_order_index(ids) when is_list(ids) do
     ids

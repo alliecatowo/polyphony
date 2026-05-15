@@ -530,6 +530,55 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
            } = issue.tracker_metadata
   end
 
+  test "dependency hydration preserves blocker terminal state from github dependency edges" do
+    Req.Test.stub(__MODULE__, fn conn ->
+      cond do
+        conn.method == "POST" ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "nodes" => [
+                issue_node("I56", 56, "OPEN")
+              ]
+            }
+          })
+
+        conn.method == "GET" and String.contains?(conn.request_path, "/issues/56/dependencies/blocked_by") ->
+          Req.Test.json(conn, %{
+            "blocked_by" => [
+              %{
+                "id" => "DEP-CLOSED",
+                "number" => 13,
+                "title" => "Closed blocker",
+                "state" => "CLOSED",
+                "url" => "https://github.com/acme/polyphony/issues/13"
+              }
+            ]
+          })
+
+        conn.method == "GET" and String.contains?(conn.request_path, "/issues/56/dependencies/blocking") ->
+          Req.Test.json(conn, %{"blocking" => []})
+
+        true ->
+          Req.Test.json(conn, %{"data" => %{}})
+      end
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+    assert {:ok, [issue]} = Client.fetch_issue_states_by_ids(["I56"])
+
+    assert issue.blocked_by == [%{id: "DEP-CLOSED", identifier: "#13", state: "CLOSED"}]
+
+    assert [
+             %{
+               "id" => "DEP-CLOSED",
+               "identifier" => "#13",
+               "number" => 13,
+               "state" => "CLOSED"
+             }
+             | _
+           ] = issue.tracker_metadata["dependencies"]["blocked_by"]
+  end
+
   test "project field helper captures labels and milestone field variants in tracker metadata" do
     Req.Test.stub(__MODULE__, fn conn ->
       payload = %{

@@ -2,6 +2,7 @@ defmodule SymphonyElixir.OrchestratorGitHubReconcileTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.GitHub.Issue, as: GitHubIssue
+  alias SymphonyElixir.Orchestrator.State, as: OrchestratorState
 
   defmodule FakeGitHubClient do
     alias SymphonyElixir.GitHub.Issue, as: GitHubIssue
@@ -185,5 +186,62 @@ defmodule SymphonyElixir.OrchestratorGitHubReconcileTest do
     snapshot = Orchestrator.snapshot(orchestrator_name, 500)
     assert is_map(snapshot)
     assert snapshot.running == []
+  end
+
+  test "dispatch gating skips todo issue when a blocker is non-terminal" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://api.github.com/graphql",
+      tracker_api_token: "ghs_test_token",
+      tracker_repo_owner: "acme",
+      tracker_repo_name: "polyphony",
+      tracker_project_title: "Polyphony",
+      tracker_project_owner_login: "acme",
+      tracker_project_owner_type: "organization",
+      tracker_active_states: ["Todo", "In Progress"],
+      tracker_terminal_states: ["Done", "Closed"]
+    )
+
+    issue = %GitHubIssue{
+      id: "ISSUE-BLOCKED",
+      identifier: "#101",
+      title: "Blocked Todo",
+      description: "Should be skipped",
+      state: "Todo",
+      blocked_by: [%{id: "ISSUE-B1", identifier: "#90", state: "In Progress"}]
+    }
+
+    state = %OrchestratorState{running: %{}, claimed: MapSet.new(), max_concurrent_agents: 5}
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "dispatch gating allows todo issue when all blockers are terminal" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://api.github.com/graphql",
+      tracker_api_token: "ghs_test_token",
+      tracker_repo_owner: "acme",
+      tracker_repo_name: "polyphony",
+      tracker_project_title: "Polyphony",
+      tracker_project_owner_login: "acme",
+      tracker_project_owner_type: "organization",
+      tracker_active_states: ["Todo", "In Progress"],
+      tracker_terminal_states: ["Done", "Closed"]
+    )
+
+    issue = %GitHubIssue{
+      id: "ISSUE-UNBLOCKED",
+      identifier: "#102",
+      title: "Unblocked Todo",
+      description: "Should dispatch",
+      state: "Todo",
+      blocked_by: [
+        %{id: "ISSUE-B2", identifier: "#91", state: "Done"},
+        %{id: "ISSUE-B3", identifier: "#92", state: "Closed"}
+      ]
+    }
+
+    state = %OrchestratorState{running: %{}, claimed: MapSet.new(), max_concurrent_agents: 5}
+    assert Orchestrator.should_dispatch_issue_for_test(issue, state)
   end
 end
