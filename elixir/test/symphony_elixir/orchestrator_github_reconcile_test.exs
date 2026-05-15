@@ -149,6 +149,63 @@ defmodule SymphonyElixir.OrchestratorGitHubReconcileTest do
     assert_receive {:reconcile_issue_blocked_by, "ISSUE1", ["ISSUE0"]}
   end
 
+  test "milestone and assignee overrides are passed to reconcile hooks" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://api.github.com/graphql",
+      tracker_api_token: "ghs_test_token",
+      tracker_repo_owner: "acme",
+      tracker_repo_name: "polyphony",
+      tracker_project_title: "Polyphony",
+      tracker_project_owner_login: "acme",
+      tracker_project_owner_type: "organization",
+      tracker_active_states: ["OPEN"],
+      tracker_terminal_states: ["CLOSED"]
+    )
+
+    issue = %GitHubIssue{
+      id: "ISSUE-OVERRIDE-1",
+      identifier: "#201",
+      title: "Override primitives",
+      description: "Use issue-provided milestone/assignee values",
+      state: "OPEN",
+      assignee_id: "octocat",
+      tracker_metadata: %{"milestone" => %{"number" => 99}}
+    }
+
+    assert :ok = Orchestrator.reconcile_issue_primitives_for_test(issue)
+    assert_receive {:reconcile_issue_milestone, "ISSUE-OVERRIDE-1", 99}
+    assert_receive {:reconcile_issue_assignees, "ISSUE-OVERRIDE-1", ["octocat"]}
+  end
+
+  test "milestone and assignee fallback values are used when overrides are absent" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://api.github.com/graphql",
+      tracker_api_token: "ghs_test_token",
+      tracker_repo_owner: "acme",
+      tracker_repo_name: "polyphony",
+      tracker_project_title: "Polyphony",
+      tracker_project_owner_login: "acme",
+      tracker_project_owner_type: "organization",
+      tracker_active_states: ["OPEN"],
+      tracker_terminal_states: ["CLOSED"]
+    )
+
+    issue = %GitHubIssue{
+      id: "ISSUE-FALLBACK-1",
+      identifier: "#202",
+      title: "Fallback primitives",
+      description: "No milestone or assignee provided",
+      state: "OPEN",
+      tracker_metadata: %{}
+    }
+
+    assert :ok = Orchestrator.reconcile_issue_primitives_for_test(issue)
+    assert_receive {:reconcile_issue_milestone, "ISSUE-FALLBACK-1", nil}
+    assert_receive {:reconcile_issue_assignees, "ISSUE-FALLBACK-1", []}
+  end
+
   test "reconciliation is a no-op for memory and linear trackers" do
     issue = %GitHubIssue{
       id: "ISSUE1",

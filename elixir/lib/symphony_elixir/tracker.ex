@@ -44,8 +44,7 @@ defmodule SymphonyElixir.Tracker do
   """
   @spec reconcile_issue_primitives(map()) :: :ok | {:error, term()}
   def reconcile_issue_primitives(%{id: issue_id} = issue) when is_binary(issue_id) do
-    tracker_metadata = Map.get(issue, :tracker_metadata, %{})
-    milestone_number = get_in(tracker_metadata, ["milestone", "number"])
+    milestone_number = desired_milestone_number(issue)
     assignees = desired_assignees(issue)
     labels = desired_labels(issue)
     blocked_by_issue_ids = desired_blocked_by_issue_ids(issue)
@@ -109,8 +108,80 @@ defmodule SymphonyElixir.Tracker do
     end
   end
 
-  defp desired_assignees(%{assignee_id: assignee_id}) when is_binary(assignee_id), do: [assignee_id]
+  defp desired_milestone_number(%{tracker_metadata: tracker_metadata}) when is_map(tracker_metadata) do
+    override =
+      Map.get(tracker_metadata, "project_desired_milestone") ||
+        Map.get(tracker_metadata, :project_desired_milestone)
+
+    case override do
+      milestone_number when is_integer(milestone_number) and milestone_number > 0 -> milestone_number
+      milestone_number when is_binary(milestone_number) -> parse_positive_integer(milestone_number)
+      %{"number" => milestone_number} -> parse_positive_integer(milestone_number)
+      %{number: milestone_number} -> parse_positive_integer(milestone_number)
+      _ -> fallback_milestone_number(tracker_metadata)
+    end
+  end
+
+  defp desired_milestone_number(_issue), do: nil
+
+  defp fallback_milestone_number(tracker_metadata) when is_map(tracker_metadata) do
+    get_in(tracker_metadata, ["milestone", "number"]) ||
+      get_in(tracker_metadata, [:milestone, :number])
+  end
+
+  defp fallback_milestone_number(_tracker_metadata), do: nil
+
+  defp desired_assignees(%{tracker_metadata: tracker_metadata} = issue) when is_map(tracker_metadata) do
+    override =
+      Map.get(tracker_metadata, "project_desired_assignees") ||
+        Map.get(tracker_metadata, :project_desired_assignees)
+
+    case normalize_assignees_override(override) do
+      {:ok, assignees} -> assignees
+      :none -> fallback_assignees(issue)
+    end
+  end
+
   defp desired_assignees(_issue), do: []
+
+  defp fallback_assignees(%{assignee_id: assignee_id}) when is_binary(assignee_id), do: [assignee_id]
+  defp fallback_assignees(_issue), do: []
+
+  defp normalize_assignees_override(nil), do: :none
+
+  defp normalize_assignees_override(assignees) when is_binary(assignees) do
+    trimmed = String.trim(assignees)
+
+    if trimmed == "" do
+      {:ok, []}
+    else
+      {:ok, [trimmed]}
+    end
+  end
+
+  defp normalize_assignees_override(assignees) when is_list(assignees) do
+    normalized =
+      assignees
+      |> Enum.filter(&is_binary/1)
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.uniq()
+
+    {:ok, normalized}
+  end
+
+  defp normalize_assignees_override(_assignees), do: :none
+
+  defp parse_positive_integer(value) when is_integer(value) and value > 0, do: value
+
+  defp parse_positive_integer(value) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {parsed, ""} when parsed > 0 -> parsed
+      _ -> nil
+    end
+  end
+
+  defp parse_positive_integer(_value), do: nil
 
   defp desired_labels(%{labels: labels}) when is_list(labels) do
     labels

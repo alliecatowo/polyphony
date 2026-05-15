@@ -705,7 +705,10 @@ defmodule SymphonyElixir.Orchestrator do
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
     recipient = self()
 
-    issue = issue_with_desired_project_custom_fields(issue)
+    issue =
+      issue
+      |> issue_with_desired_project_custom_fields()
+      |> issue_with_desired_primitive_overrides()
 
     case reconcile_issue_primitives(issue) do
       :ok ->
@@ -738,6 +741,54 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp issue_with_desired_project_custom_fields(issue), do: issue
+
+  defp issue_with_desired_primitive_overrides(%{tracker_metadata: tracker_metadata} = issue)
+       when is_map(tracker_metadata) do
+    tracker_metadata
+    |> put_default_desired_milestone_override()
+    |> put_default_desired_assignees_override(issue)
+    |> then(&Map.put(issue, :tracker_metadata, &1))
+  end
+
+  defp issue_with_desired_primitive_overrides(issue), do: issue
+
+  defp put_default_desired_milestone_override(tracker_metadata) when is_map(tracker_metadata) do
+    has_override? =
+      not is_nil(Map.get(tracker_metadata, "project_desired_milestone")) or
+        not is_nil(Map.get(tracker_metadata, :project_desired_milestone))
+
+    milestone_number =
+      get_in(tracker_metadata, ["milestone", "number"]) ||
+        get_in(tracker_metadata, [:milestone, :number])
+
+    cond do
+      has_override? ->
+        tracker_metadata
+
+      is_integer(milestone_number) and milestone_number > 0 ->
+        Map.put(tracker_metadata, "project_desired_milestone", milestone_number)
+
+      true ->
+        tracker_metadata
+    end
+  end
+
+  defp put_default_desired_assignees_override(tracker_metadata, issue)
+       when is_map(tracker_metadata) and is_map(issue) do
+    has_override? =
+      is_list(Map.get(tracker_metadata, "project_desired_assignees")) or
+        is_list(Map.get(tracker_metadata, :project_desired_assignees)) or
+        is_binary(Map.get(tracker_metadata, "project_desired_assignees")) or
+        is_binary(Map.get(tracker_metadata, :project_desired_assignees))
+
+    case Map.get(issue, :assignee_id) do
+      assignee_id when is_binary(assignee_id) and assignee_id != "" and not has_override? ->
+        Map.put(tracker_metadata, "project_desired_assignees", [assignee_id])
+
+      _ ->
+        tracker_metadata
+    end
+  end
 
   # Conservative policy: derive only low-risk defaults from current issue/metadata,
   # and only when a GitHub project item context exists.
