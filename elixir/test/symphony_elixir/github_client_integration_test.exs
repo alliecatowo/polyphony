@@ -724,6 +724,124 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
     assert issue.tracker_metadata["parent"] == nil
   end
 
+  test "required_project_fields config is parsed and normalized" do
+    write_workflow_with_required_project_fields!(%{
+      "Status" => %{
+        "type" => "single_select",
+        "options" => ["Backlog", "In Progress", "Done"]
+      },
+      "Points" => %{"type" => "number"}
+    })
+
+    assert {:ok, settings} = Config.settings()
+
+    assert settings.tracker.required_project_fields == %{
+             "status" => %{"type" => "single_select", "options" => ["Backlog", "In Progress", "Done"]},
+             "points" => %{"type" => "number"}
+           }
+  end
+
+  test "required_project_fields config rejects invalid entries" do
+    write_workflow_with_required_project_fields!(%{
+      "Status" => %{"type" => "single_select", "options" => [1, "Done"]},
+      "Points" => %{"type" => "wat"}
+    })
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.settings()
+    assert message =~ "required_project_fields"
+  end
+
+  test "bootstrap emits create field mutations when required project fields are missing and no-ops when present" do
+    write_workflow_with_required_project_fields!(%{
+      "Status" => %{
+        "type" => "single_select",
+        "options" => ["Backlog", "In Progress", "Done"]
+      },
+      "Points" => %{"type" => "number"},
+      "Progress" => %{"type" => "number"}
+    })
+
+    test_pid = self()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      query = get_in(conn.body_params, ["query"]) || ""
+      vars = get_in(conn.body_params, ["variables"]) || %{}
+
+      cond do
+        String.contains?(query, "OwnerLookup") ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "organization" => %{
+                "id" => "ORG1",
+                "projectsV2" => %{"nodes" => [%{"id" => "PROJ1", "title" => "Polyphony", "url" => "u", "number" => 1}]}
+              }
+            }
+          })
+
+        String.contains?(query, "ProjectFields") ->
+          send(test_pid, :project_fields_read)
+
+          Req.Test.json(conn, %{
+            "data" => %{
+              "node" => %{
+                "fields" => %{
+                  "nodes" => [
+                    %{
+                      "id" => "F_STATUS",
+                      "name" => "Status",
+                      "dataType" => "SINGLE_SELECT",
+                      "options" => [
+                        %{"id" => "OPT_BACKLOG", "name" => "Backlog"},
+                        %{"id" => "OPT_DONE", "name" => "Done"}
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          })
+
+        String.contains?(query, "CreateProjectField") ->
+          send(test_pid, {:create_project_field, vars["name"], vars["dataType"]})
+          Req.Test.json(conn, %{"data" => %{"createProjectV2Field" => %{"projectV2Field" => %{"id" => "FN"}}}})
+
+        String.contains?(query, "CreateProjectFieldOption") ->
+          send(test_pid, {:create_project_field_option, vars["fieldId"], vars["name"]})
+          Req.Test.json(conn, %{"data" => %{"createProjectV2FieldOption" => %{"projectV2SingleSelectFieldOption" => %{"id" => "OPT_NEW"}}}})
+
+        String.contains?(query, "RepositoryIssues") ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "repository" => %{
+                "issues" => %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}}
+              }
+            }
+          })
+
+        String.contains?(query, "ProjectIssues") ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "node" => %{
+                "items" => %{"nodes" => [], "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}}
+              }
+            }
+          })
+
+        true ->
+          Req.Test.json(conn, %{"data" => %{}})
+      end
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+    assert {:ok, []} = Client.fetch_candidate_issues()
+    assert_receive :project_fields_read
+    assert_receive {:create_project_field, "Points", "NUMBER"}
+    assert_receive {:create_project_field, "Progress", "NUMBER"}
+
+    refute_receive {:create_project_field, "Status", _}
+    refute_receive {:create_project_field_option, _, _}
+  end
+
   defp issue_node(id, number, state, opts \\ []) do
     status_name = Keyword.get(opts, :status_name)
     assignees = Keyword.get(opts, :assignees, [])
@@ -793,5 +911,32 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
         "field" => %{"id" => "F1", "name" => "Status"}
       }
     ]
+  end
+
+  defp write_workflow_with_required_project_fields!(required_fields) do
+    workflow_file = Workflow.workflow_file_path()
+
+    workflow = """
+    ---
+    tracker:
+      kind: "github"
+      endpoint: "https://example.test/graphql"
+      api_key: "ghs_test_token"
+      repo_owner: "acme"
+      repo_name: "polyphony"
+      project_owner_type: "organization"
+      project_owner_login: "acme"
+      project_title: "Polyphony"
+      active_states: ["OPEN"]
+      terminal_states: ["CLOSED", "DONE"]
+      required_project_fields: #{inspect(required_fields)}
+    polling:
+      interval_ms: 30000
+    ---
+    You are an agent for this repository.
+    """
+
+    File.write!(workflow_file, workflow)
+    if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
   end
 end

@@ -35,6 +35,27 @@ tracker:
     Cancelled:
       state: closed
       state_reason: not_planned
+  required_project_fields:
+    Status:
+      type: single_select
+      options:
+        - Todo
+        - In Progress
+        - Human Review
+        - Rework
+        - Merging
+        - Done
+        - Cancelled
+    Points:
+      type: number
+    Progress:
+      type: number
+    Target Date:
+      type: date
+    Iteration:
+      type: iteration
+    Notes:
+      type: text
 polling:
   interval_ms: 5000
 workspace:

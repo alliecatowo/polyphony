@@ -313,6 +313,31 @@ defmodule SymphonyElixir.GitHub.Client do
   }
   """
 
+  @update_single_select_field_query """
+  mutation SymphonyGitHubUpdateSingleSelectField(
+    $projectId: ID!,
+    $fieldId: ID!,
+    $name: String!,
+    $singleSelectOptions: [ProjectV2SingleSelectFieldOptionInput!]!
+  ) {
+    updateProjectV2Field(
+      input: {
+        projectId: $projectId,
+        fieldId: $fieldId,
+        name: $name,
+        singleSelectOptions: $singleSelectOptions
+      }
+    ) {
+      projectV2Field {
+        ... on ProjectV2SingleSelectField {
+          id
+          name
+        }
+      }
+    }
+  }
+  """
+
   @add_project_item_query """
   mutation SymphonyGitHubAddProjectItem($projectId: ID!, $contentId: ID!) {
     addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
@@ -327,7 +352,7 @@ defmodule SymphonyElixir.GitHub.Client do
 
     with :ok <- validate_tracker!(tracker),
          {:ok, project_ctx} <- ensure_project_context(tracker),
-         {:ok, _} <- ensure_project_fields(project_ctx.project_id),
+         {:ok, _} <- ensure_project_fields(project_ctx.project_id, tracker.required_project_fields),
          {:ok, _} <- ensure_repository_issues_in_project(tracker, project_ctx.project_id),
          {:ok, issues} <- fetch_project_issues(project_ctx.project_id, tracker.repo_owner, tracker.repo_name) do
       {:ok, Enum.filter(issues, &candidate_issue?(&1, tracker.active_states))}
@@ -654,18 +679,19 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp ensure_project_fields(project_id) do
+  defp ensure_project_fields(project_id, required_project_fields) do
     with {:ok, body} <- graphql(@project_fields_query, %{projectId: project_id}),
          fields when is_list(fields) <- get_in(body, ["data", "node", "fields", "nodes"]) do
-      field_names =
-        fields
-        |> Enum.map(fn field -> normalize_state_name(field["name"] || "") end)
-        |> MapSet.new()
+      existing_fields_by_name = existing_fields_index(fields)
 
-      with :ok <- maybe_create_number_field(project_id, field_names, "Points"),
-           :ok <- maybe_create_number_field(project_id, field_names, "Progress") do
-        {:ok, :ensured}
-      end
+      required_specs = required_project_field_specs(required_project_fields)
+
+      Enum.reduce_while(required_specs, {:ok, :ensured}, fn {field_name, definition}, _acc ->
+        case ensure_required_project_field(project_id, existing_fields_by_name, field_name, definition) do
+          :ok -> {:cont, {:ok, :ensured}}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+      end)
     else
       {:error, reason} -> {:error, reason}
       _ -> {:error, :github_unknown_payload}
@@ -1832,16 +1858,197 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp maybe_create_number_field(project_id, existing_names, field_name) do
-    if MapSet.member?(existing_names, normalize_state_name(field_name)) do
+  defp required_project_field_specs(required_project_fields) when map_size(required_project_fields) == 0 do
+    %{
+      "Points" => %{"type" => "number"},
+      "Progress" => %{"type" => "number"}
+    }
+  end
+
+  defp required_project_field_specs(required_project_fields) when is_map(required_project_fields),
+    do: required_project_fields
+
+  defp required_project_field_specs(_required_project_fields) do
+    %{
+      "Points" => %{"type" => "number"},
+      "Progress" => %{"type" => "number"}
+    }
+  end
+
+  defp existing_fields_index(fields) do
+    Enum.reduce(fields, %{}, fn field, acc ->
+      name =
+        field
+        |> Map.get("name", "")
+        |> normalize_state_name()
+
+      if name == "" do
+        acc
+      else
+        Map.put(acc, name, %{
+          "id" => field["id"],
+          "name" => field["name"],
+          "data_type" => normalize_project_data_type(field["dataType"]),
+          "options" => normalize_single_select_option_names(field["options"])
+        })
+      end
+    end)
+  end
+
+  defp ensure_required_project_field(project_id, existing_fields_by_name, field_name, definition) do
+    display_name = required_field_display_name(field_name, definition)
+    normalized_name = normalize_state_name(display_name)
+    desired_type = normalize_required_project_field_type(definition["type"])
+
+    case Map.get(existing_fields_by_name, normalized_name) do
+      nil ->
+        create_project_field(project_id, display_name, desired_type, definition)
+
+      existing ->
+        ensure_existing_field_shape(project_id, existing, display_name, desired_type, definition)
+    end
+  end
+
+  defp create_project_field(project_id, field_name, "single_select", definition) do
+    with {:ok, _} <-
+           graphql_mutation(@create_project_field_query, %{
+             projectId: project_id,
+             name: field_name,
+             dataType: "SINGLE_SELECT"
+           }),
+         :ok <- ensure_single_select_options(project_id, field_name, definition["options"]) do
       :ok
+    end
+  end
+
+  defp create_project_field(project_id, field_name, desired_type, _definition) do
+    case graphql_mutation(@create_project_field_query, %{
+           projectId: project_id,
+           name: field_name,
+           dataType: project_data_type_token(desired_type)
+         }) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp ensure_existing_field_shape(project_id, existing, field_name, desired_type, definition) do
+    if existing["data_type"] != desired_type do
+      {:error, {:github_project_field_type_mismatch, field_name, desired_type, existing["data_type"]}}
     else
-      case graphql_mutation(@create_project_field_query, %{projectId: project_id, name: field_name, dataType: "NUMBER"}) do
-        {:ok, _} -> :ok
-        {:error, reason} -> {:error, reason}
+      case desired_type do
+        "single_select" -> ensure_single_select_options(project_id, field_name, definition["options"])
+        _ -> :ok
       end
     end
   end
+
+  defp ensure_single_select_options(project_id, field_name, desired_options) do
+    with {:ok, body} <- graphql(@project_fields_query, %{projectId: project_id}),
+         fields when is_list(fields) <- get_in(body, ["data", "node", "fields", "nodes"]),
+         %{"id" => field_id} = existing <- find_field_by_name(fields, field_name) do
+      existing_options = Map.get(existing, "options", []) |> normalize_single_select_option_names()
+      merged_options = merge_single_select_options(existing_options, desired_options)
+
+      if merged_options == existing_options do
+        :ok
+      else
+        case graphql_mutation(@update_single_select_field_query, %{
+               projectId: project_id,
+               fieldId: field_id,
+               name: field_name,
+               singleSelectOptions: Enum.map(merged_options, &%{name: &1})
+             }) do
+          {:ok, _} -> :ok
+          {:error, reason} -> {:error, reason}
+        end
+      end
+    else
+      {:error, reason} ->
+        {:error, reason}
+
+      _ ->
+        {:error, {:github_required_single_select_field_not_found, field_name}}
+    end
+  end
+
+  defp find_field_by_name(fields, field_name) do
+    normalized_name = normalize_state_name(field_name)
+
+    Enum.find(fields, fn field ->
+      normalize_state_name(field["name"] || "") == normalized_name
+    end)
+  end
+
+  defp required_field_display_name(field_name, definition) when is_map(definition) do
+    _ = definition
+
+    field_name
+    |> to_string()
+    |> String.trim()
+    |> String.split(~r/[\s_\-]+/, trim: true)
+    |> Enum.map_join(" ", fn token ->
+      token
+      |> String.downcase()
+      |> String.capitalize()
+    end)
+  end
+
+  defp required_field_display_name(field_name, _definition), do: field_name
+
+  defp merge_single_select_options(existing_options, desired_options) do
+    desired = normalize_single_select_option_names(desired_options)
+    existing = normalize_single_select_option_names(existing_options)
+
+    existing ++ Enum.reject(desired, fn option -> option_name_exists?(existing, option) end)
+  end
+
+  defp option_name_exists?(options, candidate) do
+    candidate_key = normalize_state_name(candidate)
+    Enum.any?(options, fn option -> normalize_state_name(option) == candidate_key end)
+  end
+
+  defp normalize_single_select_option_names(options) when is_list(options) do
+    options
+    |> Enum.map(fn
+      %{"name" => name} -> name
+      name -> name
+    end)
+    |> Enum.map(&to_string/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+  end
+
+  defp normalize_single_select_option_names(_options), do: []
+
+  defp normalize_required_project_field_type(type) when is_binary(type) do
+    type
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp normalize_required_project_field_type(type) when is_atom(type) do
+    type
+    |> Atom.to_string()
+    |> normalize_required_project_field_type()
+  end
+
+  defp normalize_required_project_field_type(_type), do: "number"
+
+  defp normalize_project_data_type(data_type) when is_binary(data_type) do
+    data_type
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp normalize_project_data_type(_data_type), do: ""
+
+  defp project_data_type_token("number"), do: "NUMBER"
+  defp project_data_type_token("date"), do: "DATE"
+  defp project_data_type_token("iteration"), do: "ITERATION"
+  defp project_data_type_token("text"), do: "TEXT"
+  defp project_data_type_token("single_select"), do: "SINGLE_SELECT"
+  defp project_data_type_token(_), do: "NUMBER"
 
   defp has_project_item_for_project?(%Issue{} = issue, project_id) when is_binary(project_id) do
     issue

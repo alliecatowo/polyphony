@@ -70,6 +70,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:active_states, {:array, :string}, default: ["OPEN"])
       field(:terminal_states, {:array, :string}, default: ["CLOSED", "DONE", "COMPLETED", "CANCELLED", "CANCELED"])
       field(:status_map, :map, default: @default_status_map)
+      field(:required_project_fields, StringOrMap, default: %{})
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -90,12 +91,15 @@ defmodule SymphonyElixir.Config.Schema do
           :assignee,
           :active_states,
           :terminal_states,
-          :status_map
+          :status_map,
+          :required_project_fields
         ],
         empty_values: []
       )
       |> update_change(:status_map, &Schema.normalize_status_map/1)
       |> Schema.validate_status_map(:status_map)
+      |> update_change(:required_project_fields, &Schema.normalize_required_project_fields/1)
+      |> Schema.validate_required_project_fields(:required_project_fields)
     end
   end
 
@@ -452,6 +456,65 @@ defmodule SymphonyElixir.Config.Schema do
     end)
   end
 
+  @doc false
+  @spec normalize_required_project_fields(nil | map() | binary()) :: map()
+  def normalize_required_project_fields(nil), do: %{}
+
+  def normalize_required_project_fields(required_fields) when is_binary(required_fields) do
+    with {:ok, quoted} <- Code.string_to_quoted(required_fields),
+         {decoded, _binding} <- Code.eval_quoted(quoted, [], __ENV__),
+         true <- is_map(decoded) do
+      normalize_required_project_fields(decoded)
+    else
+      _ -> %{}
+    end
+  end
+
+  def normalize_required_project_fields(required_fields) when is_map(required_fields) do
+    Enum.reduce(required_fields, %{}, fn {field_name, definition}, acc ->
+      original_name =
+        field_name
+        |> to_string()
+        |> String.trim()
+      normalized_name = String.downcase(original_name)
+
+      normalized_definition = normalize_required_project_field_definition(definition)
+
+      if normalized_name == "" do
+        acc
+      else
+        Map.put(acc, normalized_name, normalized_definition)
+      end
+    end)
+  end
+
+  def normalize_required_project_fields(_required_fields), do: %{}
+
+  @doc false
+  @spec validate_required_project_fields(Ecto.Changeset.t(), atom()) :: Ecto.Changeset.t()
+  def validate_required_project_fields(changeset, field) do
+    validate_change(changeset, field, fn ^field, required_fields ->
+      cond do
+        not is_map(required_fields) ->
+          [{field, "must be a map of field_name => %{type, options?}"}]
+
+        true ->
+          Enum.flat_map(required_fields, fn {field_name, definition} ->
+            cond do
+              to_string(field_name) == "" ->
+                [{field, "field names must not be blank"}]
+
+              not is_map(definition) ->
+                [{field, "each required project field definition must be a map"}]
+
+              true ->
+                validate_required_project_field_definition(field, definition)
+            end
+          end)
+      end
+    end)
+  end
+
   defp changeset(attrs) do
     %__MODULE__{}
     |> cast(attrs, [])
@@ -607,6 +670,100 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp normalize_status_mapping_entry(_mapping), do: %{}
+
+  defp normalize_required_project_field_definition(definition) when is_map(definition) do
+    normalized = normalize_keys(definition)
+    type = normalize_project_field_type(normalized["type"])
+
+    case type do
+      "number" ->
+        %{"type" => "number"}
+
+      "date" ->
+        %{"type" => "date"}
+
+      "iteration" ->
+        %{"type" => "iteration"}
+
+      "text" ->
+        %{"type" => "text"}
+
+      "single_select" ->
+        options = normalize_single_select_options(normalized["options"])
+        %{"type" => "single_select", "options" => options}
+
+      _ ->
+        %{"type" => type}
+    end
+  end
+
+  defp normalize_required_project_field_definition(_definition), do: %{"type" => ""}
+
+  defp validate_required_project_field_definition(field, definition) do
+    type = definition["type"]
+
+    cond do
+      type not in ["number", "date", "iteration", "text", "single_select"] ->
+        [{field, "project field type must be one of number/date/iteration/text/single_select"}]
+
+      type == "single_select" ->
+        validate_single_select_options(field, definition["options"])
+
+      true ->
+        []
+    end
+  end
+
+  defp validate_single_select_options(field, options) do
+    cond do
+      not is_list(options) ->
+        [{field, "single_select fields require a non-empty options list"}]
+
+      options == [] ->
+        [{field, "single_select fields require a non-empty options list"}]
+
+      true ->
+        normalized =
+          options
+          |> Enum.map(&to_string/1)
+          |> Enum.map(&String.trim/1)
+
+        cond do
+          Enum.any?(normalized, &(&1 == "")) ->
+            [{field, "single_select options must not be blank"}]
+
+          Enum.uniq_by(normalized, &String.downcase/1) |> length() != length(normalized) ->
+            [{field, "single_select options must be unique"}]
+
+          true ->
+            []
+        end
+    end
+  end
+
+  defp normalize_project_field_type(value) when is_binary(value) do
+    value
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp normalize_project_field_type(value) when is_atom(value) do
+    value
+    |> Atom.to_string()
+    |> normalize_project_field_type()
+  end
+
+  defp normalize_project_field_type(_value), do: ""
+
+  defp normalize_single_select_options(options) when is_list(options) do
+    options
+    |> Enum.map(&to_string/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq_by(&String.downcase/1)
+  end
+
+  defp normalize_single_select_options(_options), do: []
 
   defp normalize_optional_state_reason(value) when is_binary(value) do
     normalized =
