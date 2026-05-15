@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.Orchestrator do
   @moduledoc """
-  Polls Linear and dispatches repository copies to Codex-backed workers.
+  Polls tracker issues and dispatches repository copies to Codex-backed workers.
   """
 
   use GenServer
@@ -235,6 +235,18 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, :missing_linear_project_slug} ->
         Logger.error("Linear project slug missing in WORKFLOW.md")
+        state
+
+      {:error, :missing_github_api_token} ->
+        Logger.error("GitHub API token missing in WORKFLOW.md")
+        state
+
+      {:error, :missing_github_repo_owner} ->
+        Logger.error("GitHub repo owner missing in WORKFLOW.md")
+        state
+
+      {:error, :missing_github_repo_name} ->
+        Logger.error("GitHub repo name missing in WORKFLOW.md")
         state
 
       {:error, :missing_tracker_kind} ->
