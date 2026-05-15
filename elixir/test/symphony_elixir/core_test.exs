@@ -106,7 +106,8 @@ defmodule SymphonyElixir.CoreTest do
 
     hooks = Map.get(config, "hooks", %{})
     assert is_map(hooks)
-    assert Map.get(hooks, "after_create") =~ "git clone --depth 1 https://github.com/your-org/polyphony ."
+    assert Map.get(hooks, "after_create") =~
+             "git clone --depth 1 https://github.com/$GITHUB_REPO_OWNER/$GITHUB_REPO_NAME ."
     assert Map.get(hooks, "after_create") =~ "cd elixir && mise trust"
     assert Map.get(hooks, "after_create") =~ "mise exec -- mix deps.get"
     assert Map.get(hooks, "before_remove") =~ "cd elixir && mise exec -- mix workspace.before_remove"

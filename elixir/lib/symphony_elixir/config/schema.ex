@@ -537,7 +537,13 @@ defmodule SymphonyElixir.Config.Schema do
             settings.tracker.api_key,
             System.get_env("GITHUB_TOKEN") || System.get_env("LINEAR_API_KEY")
           ),
+        kind: resolve_tracker_string_setting(settings.tracker.kind),
         endpoint: normalize_tracker_endpoint(settings.tracker.kind, settings.tracker.endpoint),
+        repo_owner: resolve_tracker_string_setting(settings.tracker.repo_owner),
+        repo_name: resolve_tracker_string_setting(settings.tracker.repo_name),
+        project_title: resolve_tracker_string_setting(settings.tracker.project_title),
+        project_owner_login: resolve_tracker_string_setting(settings.tracker.project_owner_login),
+        project_owner_type: resolve_tracker_string_setting(settings.tracker.project_owner_type),
         assignee:
           resolve_secret_setting(
             settings.tracker.assignee,
@@ -651,6 +657,15 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp normalize_secret_value(_value), do: nil
+
+  defp resolve_tracker_string_setting(value) when is_binary(value) do
+    case resolve_env_value(value, value) do
+      resolved when is_binary(resolved) -> resolved
+      _ -> value
+    end
+  end
+
+  defp resolve_tracker_string_setting(value), do: value
 
   defp normalize_status_mapping_entry(mapping) when is_map(mapping) do
     normalized = normalize_keys(mapping)
