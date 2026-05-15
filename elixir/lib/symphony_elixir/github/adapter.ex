@@ -88,5 +88,11 @@ defmodule SymphonyElixir.GitHub.Adapter do
     client_module().reconcile_issue_state_from_project_status(issue)
   end
 
+  @spec reconcile_issue_project_custom_fields(map(), map()) :: :ok | {:error, term()}
+  def reconcile_issue_project_custom_fields(issue, desired_fields)
+      when is_map(issue) and is_map(desired_fields) do
+    client_module().reconcile_issue_project_custom_fields(issue, desired_fields)
+  end
+
   defp client_module, do: Application.get_env(:symphony_elixir, :github_client, Client)
 end

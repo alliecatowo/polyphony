@@ -2,6 +2,7 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.GitHub.Client
+  alias SymphonyElixir.GitHub.Issue, as: GitHubIssue
 
   setup do
     write_workflow_file!(Workflow.workflow_file_path(),
@@ -622,6 +623,94 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
                field["field"]["name"] == "Milestone" and
                field["milestone"]["id"] == "M2"
            end)
+  end
+
+  test "project custom field reconciliation supports number/date/iteration/text values" do
+    test_pid = self()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      if conn.method == "POST" and is_map(conn.body_params) and is_map(conn.body_params["variables"]) do
+        send(test_pid, {:update_project_field_value, get_in(conn.body_params, ["variables"])})
+      end
+
+      Req.Test.json(conn, %{"data" => %{}})
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+
+    assert :ok = Client.update_project_item_field_value("P1", "ITEM1", "F_NUM", %{"number" => 5.0})
+    assert :ok = Client.update_project_item_field_value("P1", "ITEM1", "F_DATE", %{"date" => "2026-05-15"})
+    assert :ok = Client.update_project_item_field_value("P1", "ITEM1", "F_ITER", %{"iterationId" => "ITER1"})
+    assert :ok = Client.update_project_item_field_value("P1", "ITEM1", "F_TEXT", %{"text" => "agent note"})
+
+    assert_receive {:update_project_field_value, %{"fieldId" => "F_NUM", "value" => %{"number" => 5.0}}}
+    assert_receive {:update_project_field_value, %{"fieldId" => "F_DATE", "value" => %{"date" => "2026-05-15"}}}
+    assert_receive {:update_project_field_value, %{"fieldId" => "F_ITER", "value" => %{"iterationId" => "ITER1"}}}
+    assert_receive {:update_project_field_value, %{"fieldId" => "F_TEXT", "value" => %{"text" => "agent note"}}}
+  end
+
+  test "linked pull request metadata is signal-only for state projection safety" do
+    test_pid = self()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      query = get_in(conn.body_params, ["query"]) || ""
+
+      cond do
+        conn.method == "PATCH" and String.contains?(conn.request_path, "/issues/") ->
+          send(test_pid, {:patch_issue_payload, conn.request_path, conn.body_params})
+          Req.Test.json(conn, %{"ok" => true})
+
+        conn.method == "POST" and String.contains?(query, "UpdateProjectFieldValue") ->
+          send(test_pid, :unexpected_project_field_mutation)
+          Req.Test.json(conn, %{"data" => %{}})
+
+        true ->
+          Req.Test.json(conn, %{"data" => %{}})
+      end
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+
+    issue_without_status = %GitHubIssue{
+      id: "I-PR-ONLY",
+      tracker_metadata: %{
+        "linked_pull_requests" => [
+          %{"id" => "PR1", "number" => 101, "identifier" => "#101"}
+        ],
+        "project_items" => [
+          %{
+            "field_values" => [
+              %{"type" => "ProjectV2ItemFieldTextValue", "text" => "notes only"}
+            ]
+          }
+        ]
+      }
+    }
+
+    assert :ok = Client.reconcile_issue_state_from_project_status(issue_without_status)
+    refute_receive {:patch_issue_payload, _, _}
+    refute_receive :unexpected_project_field_mutation
+
+    issue_with_status_and_linked_pr = %GitHubIssue{
+      id: "#42",
+      tracker_metadata: %{
+        "linked_pull_requests" => [
+          %{"id" => "PR2", "number" => 102, "identifier" => "#102"}
+        ],
+        "project_items" => [
+          %{
+            "field_values" => [
+              %{"type" => "ProjectV2ItemFieldSingleSelectValue", "field" => %{"name" => "Status"}, "name" => "Done"}
+            ]
+          }
+        ]
+      }
+    }
+
+    assert :ok = Client.reconcile_issue_state_from_project_status(issue_with_status_and_linked_pr)
+    assert_receive {:patch_issue_payload, "/repos/acme/polyphony/issues/42", payload}
+    assert payload["state"] == "closed"
+    refute_receive :unexpected_project_field_mutation
   end
 
   test "dependency helper is empty when no parent dependency is present" do

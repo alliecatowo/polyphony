@@ -52,6 +52,7 @@ defmodule SymphonyElixir.GitHub.Client do
             field { ... on ProjectV2FieldCommon { id name } }
           }
           ... on ProjectV2ItemFieldIterationValue {
+            iterationId
             title
             startDate
             duration
@@ -147,6 +148,7 @@ defmodule SymphonyElixir.GitHub.Client do
                   field { ... on ProjectV2FieldCommon { id name } }
                 }
                 ... on ProjectV2ItemFieldIterationValue {
+                  iterationId
                   title
                   startDate
                   duration
@@ -450,6 +452,22 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   def reconcile_issue_state_from_project_status(_issue), do: :ok
+
+  @spec reconcile_issue_project_custom_fields(map(), map()) :: :ok | {:error, term()}
+  def reconcile_issue_project_custom_fields(issue, desired_fields)
+      when is_map(issue) and is_map(desired_fields) do
+    with {:ok, tracker} <- repo_tracker_config(),
+         {:ok, project_id} <- resolve_issue_project_id(issue, tracker),
+         {:ok, project_item} <- resolve_issue_project_item(issue),
+         item_id when is_binary(item_id) <- project_item["id"] do
+      project_item
+      |> project_field_values_by_name()
+      |> reconcile_project_field_values(project_id, item_id, desired_fields)
+    else
+      {:error, _reason} -> :ok
+      _ -> :ok
+    end
+  end
 
   @spec reconcile_issue_milestone(String.t(), integer() | nil) :: :ok | {:error, term()}
   def reconcile_issue_milestone(issue_id, desired_milestone_number)
@@ -1030,7 +1048,12 @@ defmodule SymphonyElixir.GitHub.Client do
     do: %{"date" => value["date"]}
 
   defp extract_field_value_payload(%{"__typename" => "ProjectV2ItemFieldIterationValue"} = value),
-    do: %{"title" => value["title"], "start_date" => value["startDate"], "duration" => value["duration"]}
+    do: %{
+      "iteration_id" => value["iterationId"],
+      "title" => value["title"],
+      "start_date" => value["startDate"],
+      "duration" => value["duration"]
+    }
 
   defp extract_field_value_payload(%{"__typename" => "ProjectV2ItemFieldLabelValue"} = value),
     do: %{"labels" => normalize_label_nodes(get_in(value, ["labels", "nodes"]))}
@@ -1447,6 +1470,143 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp issue_state_payload(state, _state_reason), do: %{"state" => state}
+
+  defp resolve_issue_project_item(issue) when is_map(issue) do
+    project_item =
+      issue
+      |> Map.get(:tracker_metadata, %{})
+      |> Map.get("project_items", [])
+      |> List.first()
+
+    if is_map(project_item), do: {:ok, project_item}, else: {:error, :missing_project_item}
+  end
+
+  defp resolve_issue_project_id(issue, tracker) when is_map(issue) do
+    project_id =
+      issue
+      |> Map.get(:tracker_metadata, %{})
+      |> Map.get("project_items", [])
+      |> List.first()
+      |> then(&get_in(&1 || %{}, ["project", "id"]))
+
+    cond do
+      is_binary(project_id) and project_id != "" ->
+        {:ok, project_id}
+
+      true ->
+        with {:ok, project_ctx} <- ensure_project_context(tracker) do
+          {:ok, project_ctx.project_id}
+        end
+    end
+  end
+
+  defp project_field_values_by_name(project_item) when is_map(project_item) do
+    project_item
+    |> Map.get("field_values", [])
+    |> Enum.reduce(%{}, fn value, acc ->
+      field_name =
+        value
+        |> Map.get("field", %{})
+        |> Map.get("name")
+        |> normalize_state_name()
+
+      if field_name == "" do
+        acc
+      else
+        Map.put(acc, field_name, value)
+      end
+    end)
+  end
+
+  defp reconcile_project_field_values(current_by_name, project_id, item_id, desired_fields)
+       when is_map(current_by_name) and is_binary(project_id) and is_binary(item_id) and is_map(desired_fields) do
+    desired_fields
+    |> Enum.reduce_while(:ok, fn {field_name, desired_value}, :ok ->
+      case reconcile_single_project_field(current_by_name, project_id, item_id, field_name, desired_value) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp reconcile_single_project_field(current_by_name, project_id, item_id, field_name, desired_value) do
+    normalized_field_name = normalize_state_name(field_name)
+    current = Map.get(current_by_name, normalized_field_name)
+    field_id = get_in(current || %{}, ["field", "id"])
+
+    cond do
+      normalized_field_name == "" ->
+        :ok
+
+      not is_binary(field_id) or field_id == "" ->
+        :ok
+
+      true ->
+        apply_project_field_delta(project_id, item_id, field_id, current, desired_value)
+    end
+  end
+
+  defp apply_project_field_delta(project_id, item_id, field_id, current, desired_value) do
+    current_value = normalized_project_field_comparable(current)
+    desired_value = normalize_desired_project_field_value(desired_value)
+
+    cond do
+      is_nil(desired_value) and is_nil(current_value) ->
+        :ok
+
+      is_nil(desired_value) ->
+        clear_project_item_field_value(project_id, item_id, field_id)
+
+      desired_value == current_value ->
+        :ok
+
+      true ->
+        update_project_item_field_value(project_id, item_id, field_id, desired_value)
+    end
+  end
+
+  defp normalize_desired_project_field_value(nil), do: nil
+  defp normalize_desired_project_field_value(value) when is_number(value), do: %{"number" => value}
+  defp normalize_desired_project_field_value(value) when is_binary(value), do: %{"text" => value}
+
+  defp normalize_desired_project_field_value(%{} = value) do
+    cond do
+      is_binary(value["singleSelectOptionId"]) -> %{"singleSelectOptionId" => value["singleSelectOptionId"]}
+      is_binary(value["date"]) -> %{"date" => value["date"]}
+      is_binary(value["iterationId"]) -> %{"iterationId" => value["iterationId"]}
+      is_number(value["number"]) -> %{"number" => value["number"]}
+      is_binary(value["text"]) -> %{"text" => value["text"]}
+      true -> nil
+    end
+  end
+
+  defp normalize_desired_project_field_value(_), do: nil
+
+  defp normalized_project_field_comparable(nil), do: nil
+
+  defp normalized_project_field_comparable(%{} = current) do
+    type = current["type"]
+
+    cond do
+      type == "ProjectV2ItemFieldSingleSelectValue" and is_binary(current["option_id"]) ->
+        %{"singleSelectOptionId" => current["option_id"]}
+
+      type == "ProjectV2ItemFieldDateValue" and is_binary(current["date"]) ->
+        %{"date" => current["date"]}
+
+      type == "ProjectV2ItemFieldIterationValue" and is_binary(current["iteration_id"]) ->
+        %{"iterationId" => current["iteration_id"]}
+
+      type == "ProjectV2ItemFieldNumberValue" and is_number(current["number"]) ->
+        %{"number" => current["number"]}
+
+      type == "ProjectV2ItemFieldTextValue" and is_binary(current["text"]) ->
+        %{"text" => current["text"]}
+
+      true ->
+        nil
+    end
+  end
 
   defp graphql_mutation(mutation, variables) when is_binary(mutation) and is_map(variables) do
     with {:ok, body} <- graphql(mutation, variables) do
