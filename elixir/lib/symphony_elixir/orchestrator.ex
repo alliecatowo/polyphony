@@ -278,7 +278,7 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       {:error, reason} ->
-        Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
+        Logger.error("Failed to fetch tracker candidates: #{inspect(reason)}")
         state
 
       false ->

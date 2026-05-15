@@ -38,7 +38,7 @@ Linear free-tier issue limits can constrain agentic development at scale. A GitH
 model keeps planning, execution history, issue context, and PR evidence in the repository system
 teams already use.
 
-Polyphony keeps Symphony spec semantics while mapping them onto GitHub primitives such as:
+Polyphony implements the Symphony orchestration spec while mapping it onto GitHub primitives such as:
 
 - Issues and issue forms
 - Projects fields/views

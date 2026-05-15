@@ -8,7 +8,7 @@ This directory contains the Elixir/OTP reference implementation for Polyphony, a
 
 ## Scope
 
-- Orchestrator semantics follow the Symphony spec.
+- Orchestrator semantics follow the Polyphony spec contract (`SPEC.md`).
 - Tracker semantics are documented as GitHub Issues/Projects primitives.
 - Existing runtime module names and binaries remain unchanged for compatibility.
 
@@ -24,8 +24,8 @@ Per-issue run artifacts are written under `docs/issues/<issue-id>/`.
 
 ## Why GitHub-first
 
-Linear free-tier issue limits can block high-volume agentic workflows. A GitHub-native model keeps
-issues, project metadata, PRs, checks, and history in one durable system tied to repository history.
+GitHub-native planning avoids external tracker limits and keeps issues, project metadata, PRs,
+checks, and history in one durable system tied to repository history.
 
 ## Run
 
@@ -62,7 +62,7 @@ You are working on a GitHub issue {{ issue.identifier }}.
 ## Testing
 
 ```bash
-make all
+mise exec -- mix test
 ```
 
 ## License
