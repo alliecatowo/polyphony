@@ -10,6 +10,8 @@ defmodule SymphonyElixir.Tracker do
   @callback fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
   @callback create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   @callback update_issue_state(String.t(), String.t()) :: :ok | {:error, term()}
+  @callback apply_orchestrator_tracker_writes(map(), map()) :: :ok | {:error, term()}
+  @optional_callbacks apply_orchestrator_tracker_writes: 2
 
   @spec fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
   def fetch_candidate_issues do
@@ -35,6 +37,30 @@ defmodule SymphonyElixir.Tracker do
   def update_issue_state(issue_id, state_name) do
     adapter().update_issue_state(issue_id, state_name)
   end
+
+  @doc """
+  Applies first-class orchestrator tracker writes in a deterministic order.
+
+  This API is additive and feature-gated: only the GitHub adapter executes writes.
+  Other tracker kinds safely no-op to preserve existing agent-tool pathways.
+  """
+  @spec apply_orchestrator_tracker_writes(map(), map()) :: :ok | {:error, term()}
+  def apply_orchestrator_tracker_writes(issue, writes) when is_map(issue) and is_map(writes) do
+    tracker_adapter = adapter()
+
+    cond do
+      tracker_adapter != SymphonyElixir.GitHub.Adapter ->
+        :ok
+
+      function_exported?(tracker_adapter, :apply_orchestrator_tracker_writes, 2) ->
+        apply(tracker_adapter, :apply_orchestrator_tracker_writes, [issue, writes])
+
+      true ->
+        :ok
+    end
+  end
+
+  def apply_orchestrator_tracker_writes(_issue, _writes), do: :ok
 
   @doc """
   Reconcile tracker-native primitives for an issue.

@@ -26,6 +26,16 @@ defmodule SymphonyElixir.OrchestratorGitHubReconcileTest do
       end
     end
 
+    def reconcile_issue_primitives_in_order(%GitHubIssue{id: issue_id}, desired) do
+      send_message({:reconcile_issue_primitives_in_order, issue_id, desired})
+
+      if fail_step() == :reconcile_issue_primitives_in_order do
+        {:error, :boom}
+      else
+        :ok
+      end
+    end
+
     def reconcile_issue_assignees(issue_id, assignees) do
       send_message({:reconcile_issue_assignees, issue_id, assignees})
       :ok
@@ -159,6 +169,41 @@ defmodule SymphonyElixir.OrchestratorGitHubReconcileTest do
     assert_receive {:reconcile_issue_blocked_by, "ISSUE1", ["ISSUE0"]}
   end
 
+  test "orchestrator invokes tracker write API boundary for github" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://api.github.com/graphql",
+      tracker_api_token: "ghs_test_token",
+      tracker_repo_owner: "acme",
+      tracker_repo_name: "polyphony",
+      tracker_project_title: "Polyphony",
+      tracker_project_owner_login: "acme",
+      tracker_project_owner_type: "organization",
+      tracker_active_states: ["OPEN"],
+      tracker_terminal_states: ["CLOSED"]
+    )
+
+    issue = %GitHubIssue{
+      id: "ISSUE-BOUNDARY-1",
+      identifier: "#601",
+      title: "Boundary invocation",
+      description: "Use first-class tracker write API",
+      state: "OPEN",
+      assignee_id: "allie",
+      labels: ["Bug"],
+      blocked_by: [%{id: "ISSUE0", identifier: "#0", state: "OPEN"}],
+      tracker_metadata: %{"milestone" => %{"number" => 10}}
+    }
+
+    assert :ok = Orchestrator.reconcile_issue_primitives_for_test(issue)
+
+    assert_receive {:reconcile_issue_blocked_by, "ISSUE-BOUNDARY-1", ["ISSUE0"]}
+    assert_receive {:reconcile_issue_labels, "ISSUE-BOUNDARY-1", ["bug"]}
+    assert_receive {:reconcile_issue_milestone, "ISSUE-BOUNDARY-1", 10}
+    assert_receive {:reconcile_issue_assignees, "ISSUE-BOUNDARY-1", ["allie"]}
+    assert_receive {:reconcile_issue_state_from_project_status, "ISSUE-BOUNDARY-1", _}
+  end
+
   test "reconciliation ordering contract is deterministic" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "github",
@@ -287,6 +332,40 @@ defmodule SymphonyElixir.OrchestratorGitHubReconcileTest do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "linear")
     assert :ok = Orchestrator.reconcile_issue_primitives_for_test(issue)
     refute_receive {:reconcile_issue_milestone, _, _}, 50
+  end
+
+  test "first-class tracker write API boundary failure does not crash orchestrator poll loop" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://api.github.com/graphql",
+      tracker_api_token: "ghs_test_token",
+      tracker_repo_owner: "acme",
+      tracker_repo_name: "polyphony",
+      tracker_project_title: "Polyphony",
+      tracker_project_owner_login: "acme",
+      tracker_project_owner_type: "organization",
+      tracker_active_states: ["OPEN"],
+      tracker_terminal_states: ["CLOSED"]
+    )
+
+    Application.put_env(:symphony_elixir, :github_reconcile_test_fail_step, :reconcile_issue_primitives_in_order)
+
+    orchestrator_name = Module.concat(__MODULE__, :BoundaryFailureOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    send(pid, :run_poll_cycle)
+    Process.sleep(60)
+
+    assert Process.alive?(pid)
+    snapshot = Orchestrator.snapshot(orchestrator_name, 500)
+    assert is_map(snapshot)
+    assert snapshot.running == []
   end
 
   test "reconciliation failures do not crash orchestrator poll loop" do

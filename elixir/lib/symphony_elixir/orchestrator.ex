@@ -353,6 +353,14 @@ defmodule SymphonyElixir.Orchestrator do
     reconcile_issue_primitives(issue)
   end
 
+  @doc false
+  @spec apply_orchestrator_tracker_writes_for_test(map(), map()) :: :ok | {:error, term()}
+  def apply_orchestrator_tracker_writes_for_test(%{} = issue, %{} = writes) do
+    issue
+    |> put_in([:tracker_metadata, "orchestrator_tracker_writes"], writes)
+    |> apply_orchestrator_tracker_writes()
+  end
+
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
 
   defp reconcile_running_issue_states([issue | rest], state, active_states, terminal_states) do
@@ -716,12 +724,12 @@ defmodule SymphonyElixir.Orchestrator do
       |> issue_with_desired_primitive_overrides()
       |> issue_with_pr_redispatch_marker(attempt)
 
-    case reconcile_issue_primitives(issue) do
-      :ok ->
-        dispatch_on_selected_worker_host(state, issue, attempt, recipient, preferred_worker_host)
-
+    with :ok <- apply_orchestrator_tracker_writes(issue),
+         :ok <- reconcile_issue_primitives(issue) do
+      dispatch_on_selected_worker_host(state, issue, attempt, recipient, preferred_worker_host)
+    else
       {:error, reason} ->
-        Logger.warning("Primitive reconciliation failed for #{issue_context(issue)}: #{inspect(reason)}; continuing dispatch")
+        Logger.warning("Tracker write/reconciliation failed for #{issue_context(issue)}: #{inspect(reason)}; continuing dispatch")
         dispatch_on_selected_worker_host(state, issue, attempt, recipient, preferred_worker_host)
     end
   end
@@ -1211,6 +1219,21 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_issue_primitives(_issue), do: :ok
+
+  defp apply_orchestrator_tracker_writes(%{tracker_metadata: tracker_metadata} = issue)
+       when is_map(tracker_metadata) do
+    writes =
+      Map.get(tracker_metadata, "orchestrator_tracker_writes") ||
+        Map.get(tracker_metadata, :orchestrator_tracker_writes)
+
+    if is_map(writes) and writes != %{} do
+      Tracker.apply_orchestrator_tracker_writes(issue, writes)
+    else
+      :ok
+    end
+  end
+
+  defp apply_orchestrator_tracker_writes(_issue), do: :ok
 
   defp maybe_put_runtime_value(running_entry, _key, nil), do: running_entry
 

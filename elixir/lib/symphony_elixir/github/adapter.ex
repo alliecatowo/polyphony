@@ -94,5 +94,117 @@ defmodule SymphonyElixir.GitHub.Adapter do
     client_module().reconcile_issue_project_custom_fields(issue, desired_fields)
   end
 
+  @spec apply_orchestrator_tracker_writes(map(), map()) :: :ok | {:error, term()}
+  def apply_orchestrator_tracker_writes(issue, writes) when is_map(issue) and is_map(writes) do
+    with :ok <- maybe_apply_project_custom_field_reconcile(issue, writes),
+         :ok <- maybe_apply_project_item_field_updates(writes),
+         :ok <- maybe_apply_state_transition(issue, writes),
+         :ok <- maybe_apply_comments(issue, writes) do
+      :ok
+    end
+  end
+
+  defp maybe_apply_project_custom_field_reconcile(issue, writes) when is_map(issue) and is_map(writes) do
+    desired_fields =
+      Map.get(writes, :project_custom_fields) ||
+        Map.get(writes, "project_custom_fields") ||
+        Map.get(writes, :project_fields) ||
+        Map.get(writes, "project_fields")
+
+    if is_map(desired_fields) and desired_fields != %{} do
+      reconcile_issue_project_custom_fields(issue, desired_fields)
+    else
+      :ok
+    end
+  end
+
+  defp maybe_apply_project_item_field_updates(writes) when is_map(writes) do
+    updates = Map.get(writes, :project_field_updates) || Map.get(writes, "project_field_updates")
+
+    updates
+    |> List.wrap()
+    |> Enum.reduce_while(:ok, fn update, _acc ->
+      case normalize_project_field_update(update) do
+        {:ok, {:update, project_id, item_id, field_id, value}} ->
+          case update_project_item_field_value(project_id, item_id, field_id, value) do
+            :ok -> {:cont, :ok}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
+
+        {:ok, {:clear, project_id, item_id, field_id}} ->
+          case clear_project_item_field_value(project_id, item_id, field_id) do
+            :ok -> {:cont, :ok}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
+
+        :skip ->
+          {:cont, :ok}
+      end
+    end)
+  end
+
+  defp maybe_apply_state_transition(issue, writes) when is_map(issue) and is_map(writes) do
+    desired_state =
+      Map.get(writes, :state_transition) ||
+        Map.get(writes, "state_transition") ||
+        Map.get(writes, :state) ||
+        Map.get(writes, "state")
+
+    issue_id = Map.get(issue, :id) || Map.get(issue, "id")
+
+    if is_binary(issue_id) and is_binary(desired_state) and String.trim(desired_state) != "" do
+      update_issue_state(issue_id, desired_state)
+    else
+      :ok
+    end
+  end
+
+  defp maybe_apply_comments(issue, writes) when is_map(issue) and is_map(writes) do
+    issue_id = Map.get(issue, :id) || Map.get(issue, "id")
+
+    comments =
+      [Map.get(writes, :comment), Map.get(writes, "comment")]
+      |> Enum.concat(List.wrap(Map.get(writes, :comments)))
+      |> Enum.concat(List.wrap(Map.get(writes, "comments")))
+      |> Enum.filter(&is_binary/1)
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+
+    if is_binary(issue_id) and issue_id != "" do
+      Enum.reduce_while(comments, :ok, fn comment, _acc ->
+        case create_comment(issue_id, comment) do
+          :ok -> {:cont, :ok}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+      end)
+    else
+      :ok
+    end
+  end
+
+  defp normalize_project_field_update(update) when is_map(update) do
+    project_id = Map.get(update, :project_id) || Map.get(update, "project_id")
+    item_id = Map.get(update, :item_id) || Map.get(update, "item_id")
+    field_id = Map.get(update, :field_id) || Map.get(update, "field_id")
+    clear? = Map.get(update, :clear) || Map.get(update, "clear")
+    value = Map.get(update, :value) || Map.get(update, "value")
+
+    cond do
+      not (is_binary(project_id) and is_binary(item_id) and is_binary(field_id)) ->
+        :skip
+
+      clear? == true ->
+        {:ok, {:clear, project_id, item_id, field_id}}
+
+      is_map(value) ->
+        {:ok, {:update, project_id, item_id, field_id, value}}
+
+      true ->
+        :skip
+    end
+  end
+
+  defp normalize_project_field_update(_update), do: :skip
+
   defp client_module, do: Application.get_env(:symphony_elixir, :github_client, Client)
 end
