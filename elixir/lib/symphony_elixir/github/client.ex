@@ -359,7 +359,7 @@ defmodule SymphonyElixir.GitHub.Client do
          {:ok, _} <- ensure_project_fields(project_ctx.project_id, tracker.required_project_fields),
          {:ok, _} <- ensure_repository_issues_in_project(tracker, project_ctx.project_id),
          {:ok, issues} <- fetch_project_issues(project_ctx.project_id, tracker.repo_owner, tracker.repo_name) do
-      {:ok, Enum.filter(issues, &candidate_issue?(&1, tracker.active_states))}
+      {:ok, Enum.filter(issues, &active_candidate_issue?(&1, tracker.active_states, tracker.terminal_states))}
     end
   end
 
@@ -371,7 +371,8 @@ defmodule SymphonyElixir.GitHub.Client do
     with :ok <- validate_tracker!(tracker),
          {:ok, project_ctx} <- ensure_project_context(tracker),
          {:ok, issues} <- fetch_project_issues(project_ctx.project_id, tracker.repo_owner, tracker.repo_name) do
-      {:ok, Enum.filter(issues, &candidate_issue?(&1, normalized_states))}
+      filter_mode = state_filter_mode(normalized_states, tracker.terminal_states)
+      {:ok, Enum.filter(issues, &issue_matches_state_filter?(&1, normalized_states, tracker.terminal_states, filter_mode))}
     end
   end
 
@@ -1423,22 +1424,74 @@ defmodule SymphonyElixir.GitHub.Client do
     |> String.downcase()
   end
 
-  defp candidate_issue?(%Issue{} = issue, active_states) when is_list(active_states) do
-    normalized_active_states = Enum.map(active_states, &normalize_state_name/1)
+  defp active_candidate_issue?(%Issue{} = issue, active_states, terminal_states)
+       when is_list(active_states) and is_list(terminal_states) do
+    active_set = normalized_state_set(active_states)
+    terminal_set = normalized_state_set(terminal_states)
+    effective_state = effective_issue_state(issue)
 
-    issue_state = normalize_state_name(issue.state || "")
-    project_state_values = project_state_values(issue)
+    MapSet.member?(active_set, effective_state) and not MapSet.member?(terminal_set, effective_state)
+  end
+
+  defp active_candidate_issue?(_issue, _active_states, _terminal_states), do: false
+
+  defp issue_matches_state_filter?(
+         %Issue{} = issue,
+         requested_states,
+         terminal_states,
+         :terminal
+       )
+       when is_list(requested_states) and is_list(terminal_states) do
+    requested_set = normalized_state_set(requested_states)
+    terminal_set = normalized_state_set(terminal_states)
+    effective_state = effective_issue_state(issue)
+
+    MapSet.member?(terminal_set, effective_state) and MapSet.member?(requested_set, effective_state)
+  end
+
+  defp issue_matches_state_filter?(
+         %Issue{} = issue,
+         requested_states,
+         terminal_states,
+         :active
+       )
+       when is_list(requested_states) and is_list(terminal_states) do
+    active_candidate_issue?(issue, requested_states, terminal_states)
+  end
+
+  defp issue_matches_state_filter?(%Issue{} = issue, requested_states, _terminal_states, :explicit)
+       when is_list(requested_states) do
+    requested_set = normalized_state_set(requested_states)
+    MapSet.member?(requested_set, effective_issue_state(issue))
+  end
+
+  defp issue_matches_state_filter?(_issue, _requested_states, _terminal_states, _mode), do: false
+
+  defp state_filter_mode(requested_states, terminal_states)
+       when is_list(requested_states) and is_list(terminal_states) do
+    requested_set = normalized_state_set(requested_states)
+    terminal_set = normalized_state_set(terminal_states)
 
     cond do
-      project_state_values != [] ->
-        Enum.any?(project_state_values, &Enum.member?(normalized_active_states, &1))
+      MapSet.size(requested_set) > 0 and MapSet.equal?(requested_set, terminal_set) ->
+        :terminal
+
+      MapSet.intersection(requested_set, terminal_set) |> MapSet.size() == 0 ->
+        :active
 
       true ->
-        Enum.member?(normalized_active_states, issue_state)
+        :explicit
     end
   end
 
-  defp candidate_issue?(_issue, _active_states), do: false
+  defp state_filter_mode(_requested_states, _terminal_states), do: :explicit
+
+  defp normalized_state_set(states) when is_list(states) do
+    states
+    |> Enum.map(&normalize_state_name/1)
+    |> Enum.reject(&(&1 == ""))
+    |> MapSet.new()
+  end
 
   defp project_state_values(%Issue{} = issue) do
     issue

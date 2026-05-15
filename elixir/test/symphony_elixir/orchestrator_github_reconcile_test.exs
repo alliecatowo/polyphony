@@ -11,7 +11,16 @@ defmodule SymphonyElixir.OrchestratorGitHubReconcileTest do
       {:ok, [issue_fixture()]}
     end
 
-    def fetch_issues_by_states(_states), do: {:ok, []}
+    def fetch_issues_by_states(states) do
+      send_message({:fetch_issues_by_states, states})
+
+      if fail_step() == :fetch_issues_by_states do
+        {:error, :boom}
+      else
+        {:ok, []}
+      end
+    end
+
     def fetch_issue_states_by_ids(_ids), do: {:ok, [issue_fixture()]}
     def create_comment(_issue_id, _body), do: :ok
     def update_issue_state(_issue_id, _state_name), do: :ok
@@ -400,6 +409,38 @@ defmodule SymphonyElixir.OrchestratorGitHubReconcileTest do
     snapshot = Orchestrator.snapshot(orchestrator_name, 500)
     assert is_map(snapshot)
     assert snapshot.running == []
+  end
+
+  test "startup terminal cleanup query failure is tolerated and orchestrator still starts" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://api.github.com/graphql",
+      tracker_api_token: "ghs_test_token",
+      tracker_repo_owner: "acme",
+      tracker_repo_name: "polyphony",
+      tracker_project_title: "Polyphony",
+      tracker_project_owner_login: "acme",
+      tracker_project_owner_type: "organization",
+      tracker_active_states: ["OPEN"],
+      tracker_terminal_states: ["CLOSED"]
+    )
+
+    Application.put_env(:symphony_elixir, :github_reconcile_test_fail_step, :fetch_issues_by_states)
+
+    orchestrator_name = Module.concat(__MODULE__, :StartupCleanupFailureOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    assert_receive {:fetch_issues_by_states, ["closed"]}, 500
+    assert Process.alive?(pid)
+
+    snapshot = Orchestrator.snapshot(orchestrator_name, 500)
+    assert is_map(snapshot)
   end
 
   test "custom fields are passed through when present" do

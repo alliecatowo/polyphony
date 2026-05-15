@@ -220,6 +220,66 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
     assert Enum.map(issues, & &1.id) == ["I1", "I2", "I3"]
   end
 
+  test "fetch_issues_by_states applies project-status precedence with issue-state fallback under mixed states" do
+    Req.Test.stub(__MODULE__, fn conn ->
+      query = get_in(conn.body_params, ["query"]) || ""
+
+      cond do
+        String.contains?(query, "OwnerLookup") ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "organization" => %{
+                "id" => "ORG1",
+                "projectsV2" => %{"nodes" => [%{"id" => "PROJ1", "title" => "Polyphony", "url" => "u", "number" => 1}]}
+              }
+            }
+          })
+
+        String.contains?(query, "ProjectIssues") ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "node" => %{
+                "items" => %{
+                  "nodes" => [
+                    %{
+                      "id" => "ITEM-MIX-1",
+                      "isArchived" => false,
+                      "content" => Map.put(issue_node("I31", 31, "OPEN", status_name: "Done"), "repository", %{"nameWithOwner" => "acme/polyphony"}),
+                      "fieldValues" => %{"nodes" => status_field_nodes("Done")}
+                    },
+                    %{
+                      "id" => "ITEM-MIX-2",
+                      "isArchived" => false,
+                      "content" => Map.put(issue_node("I32", 32, "CLOSED", status_name: "Backlog"), "repository", %{"nameWithOwner" => "acme/polyphony"}),
+                      "fieldValues" => %{"nodes" => status_field_nodes("Backlog")}
+                    },
+                    %{
+                      "id" => "ITEM-MIX-3",
+                      "isArchived" => false,
+                      "content" => Map.put(issue_node("I33", 33, "CLOSED"), "repository", %{"nameWithOwner" => "acme/polyphony"}),
+                      "fieldValues" => %{"nodes" => []}
+                    }
+                  ],
+                  "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+                }
+              }
+            }
+          })
+
+        true ->
+          Req.Test.json(conn, %{"data" => %{}})
+      end
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+
+    assert {:ok, terminal_issues} = Client.fetch_issues_by_states(["done", "closed"])
+    assert Enum.map(terminal_issues, & &1.id) == ["I31", "I33"]
+
+    assert {:ok, active_issues} = Client.fetch_issues_by_states(["open", "backlog"])
+    assert Enum.map(active_issues, & &1.id) == ["I32"]
+  end
+
   test "update_issue_state maps terminal states to closed and other states to open" do
     test_pid = self()
 
