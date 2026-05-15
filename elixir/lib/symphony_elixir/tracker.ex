@@ -44,44 +44,21 @@ defmodule SymphonyElixir.Tracker do
   """
   @spec reconcile_issue_primitives(map()) :: :ok | {:error, term()}
   def reconcile_issue_primitives(%{id: issue_id} = issue) when is_binary(issue_id) do
-    milestone_number = desired_milestone_number(issue)
-    assignees = desired_assignees(issue)
-    labels = desired_labels(issue)
-    blocked_by_issue_ids = desired_blocked_by_issue_ids(issue)
-    project_custom_fields = desired_project_custom_fields(issue)
+    desired = %{
+      milestone_number: desired_milestone_number(issue),
+      assignees: desired_assignees(issue),
+      labels: desired_labels(issue),
+      blocked_by_issue_ids: desired_blocked_by_issue_ids(issue),
+      project_custom_fields: desired_project_custom_fields(issue)
+    }
+
     tracker_adapter = adapter()
 
-    with :ok <-
-           maybe_call_reconcile(
-             tracker_adapter,
-             :reconcile_issue_state_from_project_status,
-             [issue]
-           ),
-         :ok <-
-           maybe_call_reconcile(
-             tracker_adapter,
-             :reconcile_issue_milestone,
-             [issue_id, milestone_number]
-           ),
-         :ok <-
-           maybe_call_reconcile(
-             tracker_adapter,
-             :reconcile_issue_assignees,
-             [issue_id, assignees]
-           ),
-         :ok <-
-           maybe_call_reconcile(
-             tracker_adapter,
-             :reconcile_issue_labels,
-             [issue_id, labels]
-           ),
-         :ok <-
-           maybe_call_reconcile(
-             tracker_adapter,
-             :reconcile_issue_blocked_by,
-             [issue_id, blocked_by_issue_ids]
-           ),
-         :ok <- maybe_reconcile_project_custom_fields(tracker_adapter, issue, project_custom_fields) do
+    with :ok <- maybe_reconcile_issue_primitives_in_order(tracker_adapter, issue, desired),
+         :ok <- maybe_reconcile_structure_dependencies(tracker_adapter, issue_id, desired),
+         :ok <- maybe_reconcile_taxonomy(tracker_adapter, issue_id, desired),
+         :ok <- maybe_reconcile_project_custom_fields(tracker_adapter, issue, desired.project_custom_fields),
+         :ok <- maybe_reconcile_issue_state_projection(tracker_adapter, issue) do
       :ok
     end
   end
@@ -106,6 +83,40 @@ defmodule SymphonyElixir.Tracker do
     else
       :ok
     end
+  end
+
+  defp maybe_reconcile_issue_primitives_in_order(adapter_module, issue, desired)
+       when is_atom(adapter_module) and is_map(issue) and is_map(desired) do
+    maybe_call_reconcile(adapter_module, :reconcile_issue_primitives_in_order, [issue, desired])
+  end
+
+  defp maybe_reconcile_structure_dependencies(adapter_module, issue_id, desired)
+       when is_atom(adapter_module) and is_binary(issue_id) and is_map(desired) do
+    maybe_call_reconcile(adapter_module, :reconcile_issue_blocked_by, [issue_id, desired.blocked_by_issue_ids])
+  end
+
+  defp maybe_reconcile_taxonomy(adapter_module, issue_id, desired)
+       when is_atom(adapter_module) and is_binary(issue_id) and is_map(desired) do
+    with :ok <- maybe_call_reconcile(adapter_module, :reconcile_issue_labels, [issue_id, desired.labels]),
+         :ok <-
+           maybe_call_reconcile(
+             adapter_module,
+             :reconcile_issue_milestone,
+             [issue_id, desired.milestone_number]
+           ),
+         :ok <-
+           maybe_call_reconcile(
+             adapter_module,
+             :reconcile_issue_assignees,
+             [issue_id, desired.assignees]
+           ) do
+      :ok
+    end
+  end
+
+  defp maybe_reconcile_issue_state_projection(adapter_module, issue)
+       when is_atom(adapter_module) and is_map(issue) do
+    maybe_call_reconcile(adapter_module, :reconcile_issue_state_from_project_status, [issue])
   end
 
   defp desired_milestone_number(%{tracker_metadata: tracker_metadata}) when is_map(tracker_metadata) do

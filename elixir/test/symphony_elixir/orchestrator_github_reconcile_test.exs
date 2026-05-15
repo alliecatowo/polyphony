@@ -149,6 +149,61 @@ defmodule SymphonyElixir.OrchestratorGitHubReconcileTest do
     assert_receive {:reconcile_issue_blocked_by, "ISSUE1", ["ISSUE0"]}
   end
 
+  test "reconciliation ordering contract is deterministic" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://api.github.com/graphql",
+      tracker_api_token: "ghs_test_token",
+      tracker_repo_owner: "acme",
+      tracker_repo_name: "polyphony",
+      tracker_project_title: "Polyphony",
+      tracker_project_owner_login: "acme",
+      tracker_project_owner_type: "organization",
+      tracker_active_states: ["OPEN"],
+      tracker_terminal_states: ["CLOSED"]
+    )
+
+    issue = %GitHubIssue{
+      id: "ISSUE-ORDER-1",
+      identifier: "#111",
+      title: "Ordering",
+      description: "Deterministic reconciliation order",
+      state: "OPEN",
+      assignee_id: "allie",
+      labels: ["Bug"],
+      blocked_by: [%{id: "ISSUE-B", identifier: "#9", state: "OPEN"}],
+      tracker_metadata: %{
+        "milestone" => %{"number" => 7},
+        "project_custom_fields" => %{"Progress" => %{"number" => 25}},
+        "project_items" => [
+          %{
+            "id" => "ITEM-ORDER-1",
+            "project" => %{"id" => "PROJ-ORDER-1"},
+            "field_values" => [
+              %{
+                "type" => "ProjectV2ItemFieldSingleSelectValue",
+                "field" => %{"name" => "Status"},
+                "name" => "In Progress"
+              }
+            ]
+          }
+        ]
+      }
+    }
+
+    assert :ok = Orchestrator.reconcile_issue_primitives_for_test(issue)
+
+    assert_receive {:reconcile_issue_state_from_project_status, "ISSUE-ORDER-1", _}
+    assert_receive {:reconcile_issue_milestone, "ISSUE-ORDER-1", 7}
+    assert_receive {:reconcile_issue_assignees, "ISSUE-ORDER-1", ["allie"]}
+    assert_receive {:reconcile_issue_labels, "ISSUE-ORDER-1", ["bug"]}
+    assert_receive {:reconcile_issue_blocked_by, "ISSUE-ORDER-1", ["ISSUE-B"]}
+
+    assert_receive {:reconcile_issue_project_custom_fields, "ISSUE-ORDER-1", desired_fields}
+    assert desired_fields["Progress"] == %{"number" => 25}
+    refute_receive _, 50
+  end
+
   test "milestone and assignee overrides are passed to reconcile hooks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "github",

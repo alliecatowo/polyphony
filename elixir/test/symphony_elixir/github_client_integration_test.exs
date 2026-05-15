@@ -724,6 +724,42 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
     assert issue.tracker_metadata["parent"] == nil
   end
 
+  test "reconcile primitives are idempotent no-ops when issue state is unchanged" do
+    test_pid = self()
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      cond do
+        conn.method == "PATCH" and String.contains?(conn.request_path, "/issues/") ->
+          send(test_pid, {:unexpected_issue_patch, conn.request_path, conn.body_params})
+          Req.Test.json(conn, %{"ok" => true})
+
+        conn.method == "PUT" and String.contains?(conn.request_path, "/labels") ->
+          send(test_pid, {:unexpected_set_labels, conn.request_path, conn.body_params})
+          Req.Test.json(conn, %{"ok" => true})
+
+        conn.method == "GET" and String.contains?(conn.request_path, "/issues/42") ->
+          Req.Test.json(conn, %{
+            "number" => 42,
+            "assignees" => [%{"login" => "allie"}],
+            "labels" => [%{"name" => "bug"}, %{"name" => "urgent"}],
+            "milestone" => %{"number" => 3}
+          })
+
+        true ->
+          Req.Test.json(conn, %{"ok" => true})
+      end
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+
+    assert :ok = Client.reconcile_issue_milestone("#42", 3)
+    assert :ok = Client.reconcile_issue_assignees("#42", ["allie"])
+    assert :ok = Client.reconcile_issue_labels("#42", ["bug", "urgent"])
+
+    refute_receive {:unexpected_issue_patch, _, _}
+    refute_receive {:unexpected_set_labels, _, _}
+  end
+
   test "required_project_fields config is parsed and normalized" do
     write_workflow_with_required_project_fields!(%{
       "Status" => %{

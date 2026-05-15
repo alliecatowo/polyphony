@@ -478,6 +478,23 @@ defmodule SymphonyElixir.GitHub.Client do
 
   def reconcile_issue_state_from_project_status(_issue), do: :ok
 
+  @doc """
+  Reconcile GitHub primitives in explicit order:
+  structure/dependencies -> taxonomy -> project custom fields -> state projection.
+  """
+  @spec reconcile_issue_primitives_in_order(map(), map()) :: :ok | {:error, term()}
+  def reconcile_issue_primitives_in_order(%{id: issue_id} = issue, desired)
+      when is_binary(issue_id) and is_map(desired) do
+    with :ok <- reconcile_structure_dependencies(issue_id, desired),
+         :ok <- reconcile_taxonomy(issue_id, desired),
+         :ok <- reconcile_project_custom_fields(issue, desired),
+         :ok <- reconcile_state_projection(issue) do
+      :ok
+    end
+  end
+
+  def reconcile_issue_primitives_in_order(_issue, _desired), do: :ok
+
   @spec reconcile_issue_project_custom_fields(map(), map()) :: :ok | {:error, term()}
   def reconcile_issue_project_custom_fields(issue, desired_fields)
       when is_map(issue) and is_map(desired_fields) do
@@ -717,6 +734,32 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp fetch_repository_issues(owner, repo, active_states) do
     fetch_repository_issues_page(owner, repo, active_states, nil, [])
+  end
+
+  defp reconcile_structure_dependencies(issue_id, desired) do
+    desired_blocked_by = Map.get(desired, :blocked_by_issue_ids, [])
+    reconcile_issue_blocked_by(issue_id, desired_blocked_by)
+  end
+
+  defp reconcile_taxonomy(issue_id, desired) do
+    desired_labels = Map.get(desired, :labels, [])
+    desired_milestone = Map.get(desired, :milestone_number)
+    desired_assignees = Map.get(desired, :assignees, [])
+
+    with :ok <- reconcile_issue_labels(issue_id, desired_labels),
+         :ok <- reconcile_issue_milestone(issue_id, desired_milestone),
+         :ok <- reconcile_issue_assignees(issue_id, desired_assignees) do
+      :ok
+    end
+  end
+
+  defp reconcile_project_custom_fields(issue, desired) do
+    desired_fields = Map.get(desired, :project_custom_fields, %{})
+    reconcile_issue_project_custom_fields(issue, desired_fields)
+  end
+
+  defp reconcile_state_projection(issue) do
+    reconcile_issue_state_from_project_status(issue)
   end
 
   defp fetch_project_issues(project_id, repo_owner, repo_name) do
