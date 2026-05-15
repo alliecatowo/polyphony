@@ -8,8 +8,9 @@ This directory contains the Elixir/OTP reference implementation for Polyphony, a
 
 ## Scope
 
+- This is the Elixir reference implementation of the Symphony spec on GitHub.
 - Orchestrator semantics follow the Polyphony spec contract (`SPEC.md`).
-- Tracker semantics are documented as GitHub Issues/Projects primitives.
+- Tracker semantics are implemented with GitHub Issues/Projects primitives.
 - Existing runtime module names and binaries remain unchanged for compatibility.
 
 ## How it works
@@ -26,6 +27,15 @@ Per-issue run artifacts are written under `docs/issues/<issue-id>/`.
 
 GitHub-native planning avoids external tracker limits and keeps issues, project metadata, PRs,
 checks, and history in one durable system tied to repository history.
+
+This keeps orchestration behavior and delivery evidence in one system:
+
+- issues and project fields for planning/state
+- pull requests, reviews, and checks for execution/quality
+- repository history for long-term traceability
+
+The result is a practical, no-extra-SaaS path for teams that want Symphony-style agent orchestration
+without leaving GitHub.
 
 ## Run
 

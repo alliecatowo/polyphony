@@ -12,10 +12,10 @@ defmodule Mix.Tasks.Workspace.BeforeRemove do
 
       mix workspace.before_remove
       mix workspace.before_remove --branch feature/my-branch
-      mix workspace.before_remove --repo openai/symphony
+      mix workspace.before_remove --repo your-org/polyphony
   """
 
-  @default_repo "openai/symphony"
+  @default_repo "your-org/polyphony"
 
   @impl Mix.Task
   def run(args) do
@@ -106,7 +106,7 @@ defmodule Mix.Tasks.Workspace.BeforeRemove do
   end
 
   defp closing_comment(branch) do
-    "Closing because the Linear issue for branch #{branch} entered a terminal state without merge."
+    "Closing because the tracker issue for branch #{branch} entered a terminal state without merge."
   end
 
   defp format_output(""), do: ""

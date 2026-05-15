@@ -34,9 +34,17 @@ reference service.
 
 ## Why GitHub-first
 
-Linear free-tier issue limits can constrain agentic development at scale. A GitHub-native tracker
-model keeps planning, execution history, issue context, and PR evidence in the repository system
-teams already use.
+Polyphony is a GitHub implementation of the Symphony orchestration spec.
+
+The spec defines the orchestrator contract; Polyphony maps that contract onto GitHub's native work
+surface so orchestration state and engineering state live in the same place.
+
+Why this matters:
+
+- Linear free-tier limits can block high-volume agentic workflows.
+- GitHub is already where code, PRs, reviews, checks, and merge history live.
+- Keeping planning/execution in-repo makes work auditable and durable over time.
+- Teams avoid splitting source-of-truth between tracker and repository history.
 
 Polyphony implements the Symphony orchestration spec while mapping it onto GitHub primitives such as:
 
