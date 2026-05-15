@@ -60,6 +60,16 @@ defmodule SymphonyElixir.OrchestratorGitHubReconcileTest do
       :ok
     end
 
+    def reconcile_issue_hierarchy(%GitHubIssue{id: issue_id}, desired_hierarchy) do
+      send_message({:reconcile_issue_hierarchy, issue_id, desired_hierarchy})
+
+      if fail_step() == :hierarchy do
+        {:error, :boom}
+      else
+        :ok
+      end
+    end
+
     def reconcile_issue_project_custom_fields(%GitHubIssue{id: issue_id}, desired_fields) do
       send_message({:reconcile_issue_project_custom_fields, issue_id, desired_fields})
 
@@ -507,6 +517,72 @@ defmodule SymphonyElixir.OrchestratorGitHubReconcileTest do
 
     assert :ok = Orchestrator.reconcile_issue_primitives_for_test(issue)
     refute_receive {:reconcile_issue_project_custom_fields, _, _}, 50
+  end
+
+  test "hierarchy reconciliation receives desired parent/sub-issues when present" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://api.github.com/graphql",
+      tracker_api_token: "ghs_test_token",
+      tracker_repo_owner: "acme",
+      tracker_repo_name: "polyphony",
+      tracker_project_title: "Polyphony",
+      tracker_project_owner_login: "acme",
+      tracker_project_owner_type: "organization",
+      tracker_active_states: ["OPEN"],
+      tracker_terminal_states: ["CLOSED"]
+    )
+
+    issue = %GitHubIssue{
+      id: "ISSUE-HIER-1",
+      identifier: "#411",
+      title: "Hierarchy desired state",
+      description: "Reconcile parent/sub relation",
+      state: "OPEN",
+      tracker_metadata: %{
+        "project_desired_parent_issue_id" => "ISSUE-PARENT-1",
+        "project_desired_sub_issue_ids" => ["ISSUE-SUB-1", "ISSUE-SUB-2"]
+      }
+    }
+
+    assert :ok = Orchestrator.reconcile_issue_primitives_for_test(issue)
+    assert_receive {:reconcile_issue_hierarchy, "ISSUE-HIER-1", hierarchy}
+    assert hierarchy.parent_issue_id == "ISSUE-PARENT-1"
+    assert hierarchy.sub_issue_ids == ["ISSUE-SUB-1", "ISSUE-SUB-2"]
+  end
+
+  test "hierarchy reconcile failure does not crash orchestrator poll loop" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://api.github.com/graphql",
+      tracker_api_token: "ghs_test_token",
+      tracker_repo_owner: "acme",
+      tracker_repo_name: "polyphony",
+      tracker_project_title: "Polyphony",
+      tracker_project_owner_login: "acme",
+      tracker_project_owner_type: "organization",
+      tracker_active_states: ["OPEN"],
+      tracker_terminal_states: ["CLOSED"]
+    )
+
+    Application.put_env(:symphony_elixir, :github_reconcile_test_fail_step, :hierarchy)
+
+    orchestrator_name = Module.concat(__MODULE__, :HierarchyFailureOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    send(pid, :run_poll_cycle)
+    Process.sleep(60)
+
+    assert Process.alive?(pid)
+    snapshot = Orchestrator.snapshot(orchestrator_name, 500)
+    assert is_map(snapshot)
+    assert snapshot.running == []
   end
 
   test "custom field reconcile failure does not crash orchestrator poll loop" do

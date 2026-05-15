@@ -83,6 +83,12 @@ defmodule SymphonyElixir.GitHub.Adapter do
     client_module().reconcile_issue_blocked_by(issue_id, blocked_by_issue_ids)
   end
 
+  @spec reconcile_issue_hierarchy(map(), map()) :: :ok | {:error, term()}
+  def reconcile_issue_hierarchy(issue, desired_hierarchy)
+      when is_map(issue) and is_map(desired_hierarchy) do
+    client_module().reconcile_issue_hierarchy(issue, desired_hierarchy)
+  end
+
   @spec reconcile_issue_state_from_project_status(map()) :: :ok | {:error, term()}
   def reconcile_issue_state_from_project_status(issue) when is_map(issue) do
     client_module().reconcile_issue_state_from_project_status(issue)

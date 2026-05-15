@@ -75,6 +75,7 @@ defmodule SymphonyElixir.Tracker do
       assignees: desired_assignees(issue),
       labels: desired_labels(issue),
       blocked_by_issue_ids: desired_blocked_by_issue_ids(issue),
+      hierarchy: desired_hierarchy(issue),
       project_custom_fields: desired_project_custom_fields(issue)
     }
 
@@ -82,6 +83,7 @@ defmodule SymphonyElixir.Tracker do
 
     with :ok <- maybe_reconcile_issue_primitives_in_order(tracker_adapter, issue, desired),
          :ok <- maybe_reconcile_pr_lifecycle_hooks(tracker_adapter, issue),
+         :ok <- maybe_reconcile_hierarchy(tracker_adapter, issue, desired.hierarchy),
          :ok <- maybe_reconcile_structure_dependencies(tracker_adapter, issue_id, desired),
          :ok <- maybe_reconcile_taxonomy(tracker_adapter, issue_id, desired),
          :ok <- maybe_reconcile_project_custom_fields(tracker_adapter, issue, desired.project_custom_fields),
@@ -120,6 +122,15 @@ defmodule SymphonyElixir.Tracker do
   defp maybe_reconcile_structure_dependencies(adapter_module, issue_id, desired)
        when is_atom(adapter_module) and is_binary(issue_id) and is_map(desired) do
     maybe_call_reconcile(adapter_module, :reconcile_issue_blocked_by, [issue_id, desired.blocked_by_issue_ids])
+  end
+
+  defp maybe_reconcile_hierarchy(_adapter_module, _issue, hierarchy)
+       when hierarchy in [%{}, nil],
+       do: :ok
+
+  defp maybe_reconcile_hierarchy(adapter_module, issue, hierarchy)
+       when is_atom(adapter_module) and is_map(issue) and is_map(hierarchy) do
+    maybe_call_reconcile(adapter_module, :reconcile_issue_hierarchy, [issue, hierarchy])
   end
 
   defp maybe_reconcile_pr_lifecycle_hooks(adapter_module, issue)
@@ -330,6 +341,99 @@ defmodule SymphonyElixir.Tracker do
   end
 
   defp desired_project_custom_fields(_issue), do: %{}
+
+  defp desired_hierarchy(%{tracker_metadata: tracker_metadata}) when is_map(tracker_metadata) do
+    parent_issue_id =
+      tracker_metadata
+      |> hierarchy_parent_override()
+      |> normalize_issue_ref()
+
+    sub_issue_ids =
+      tracker_metadata
+      |> hierarchy_sub_issues_override()
+      |> normalize_issue_ref_list()
+
+    fallback_sub_issue_ids =
+      tracker_metadata
+      |> fallback_sub_issues()
+      |> normalize_issue_ref_list()
+
+    final_sub_issue_ids =
+      if sub_issue_ids == [] do
+        fallback_sub_issue_ids
+      else
+        sub_issue_ids
+      end
+
+    %{}
+    |> maybe_put_hierarchy_parent(parent_issue_id)
+    |> maybe_put_hierarchy_sub_issues(final_sub_issue_ids)
+  end
+
+  defp desired_hierarchy(_issue), do: %{}
+
+  defp hierarchy_parent_override(tracker_metadata) when is_map(tracker_metadata) do
+    Map.get(tracker_metadata, "project_desired_parent_issue_id") ||
+      Map.get(tracker_metadata, :project_desired_parent_issue_id) ||
+      Map.get(tracker_metadata, "parent_issue_id") ||
+      Map.get(tracker_metadata, :parent_issue_id) ||
+      get_in(tracker_metadata, ["parent", "id"]) ||
+      get_in(tracker_metadata, [:parent, :id])
+  end
+
+  defp hierarchy_parent_override(_tracker_metadata), do: nil
+
+  defp hierarchy_sub_issues_override(tracker_metadata) when is_map(tracker_metadata) do
+    Map.get(tracker_metadata, "project_desired_sub_issue_ids") ||
+      Map.get(tracker_metadata, :project_desired_sub_issue_ids) ||
+      Map.get(tracker_metadata, "project_desired_sub_issues") ||
+      Map.get(tracker_metadata, :project_desired_sub_issues) ||
+      []
+  end
+
+  defp hierarchy_sub_issues_override(_tracker_metadata), do: []
+
+  defp fallback_sub_issues(tracker_metadata) when is_map(tracker_metadata) do
+    Map.get(tracker_metadata, "sub_issues") ||
+      Map.get(tracker_metadata, :sub_issues) ||
+      []
+  end
+
+  defp fallback_sub_issues(_tracker_metadata), do: []
+
+  defp normalize_issue_ref_list(refs) when is_list(refs) do
+    refs
+    |> Enum.map(&normalize_issue_ref/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
+  defp normalize_issue_ref_list(_refs), do: []
+
+  defp normalize_issue_ref(ref) when is_binary(ref) do
+    trimmed = String.trim(ref)
+    if trimmed == "", do: nil, else: trimmed
+  end
+
+  defp normalize_issue_ref(%{"id" => id}), do: normalize_issue_ref(id)
+  defp normalize_issue_ref(%{id: id}), do: normalize_issue_ref(id)
+  defp normalize_issue_ref(%{"identifier" => identifier}), do: normalize_issue_ref(identifier)
+  defp normalize_issue_ref(%{identifier: identifier}), do: normalize_issue_ref(identifier)
+  defp normalize_issue_ref(_ref), do: nil
+
+  defp maybe_put_hierarchy_parent(hierarchy, nil), do: hierarchy
+
+  defp maybe_put_hierarchy_parent(hierarchy, parent_issue_id)
+       when is_map(hierarchy) and is_binary(parent_issue_id) do
+    Map.put(hierarchy, :parent_issue_id, parent_issue_id)
+  end
+
+  defp maybe_put_hierarchy_sub_issues(hierarchy, []), do: hierarchy
+
+  defp maybe_put_hierarchy_sub_issues(hierarchy, sub_issue_ids)
+       when is_map(hierarchy) and is_list(sub_issue_ids) do
+    Map.put(hierarchy, :sub_issue_ids, sub_issue_ids)
+  end
 
   defp explicit_project_custom_fields(tracker_metadata) when is_map(tracker_metadata) do
     cond do
