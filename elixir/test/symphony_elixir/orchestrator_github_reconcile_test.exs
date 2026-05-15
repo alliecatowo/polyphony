@@ -76,7 +76,10 @@ defmodule SymphonyElixir.OrchestratorGitHubReconcileTest do
         assignee_id: "allie",
         labels: ["bug", "Urgent"],
         blocked_by: [%{id: "ISSUE0", identifier: "#0", state: "OPEN"}],
-        tracker_metadata: %{"milestone" => %{"number" => 42}}
+        tracker_metadata: %{
+          "milestone" => %{"number" => 42},
+          "project_desired_fields" => %{"Progress" => %{"number" => 10}}
+        }
       }
     end
   end
@@ -296,6 +299,43 @@ defmodule SymphonyElixir.OrchestratorGitHubReconcileTest do
     snapshot = Orchestrator.snapshot(orchestrator_name, 500)
     assert is_map(snapshot)
     assert snapshot.running == []
+  end
+
+  test "policy-derived custom fields are passed through to reconciliation" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://api.github.com/graphql",
+      tracker_api_token: "ghs_test_token",
+      tracker_repo_owner: "acme",
+      tracker_repo_name: "polyphony",
+      tracker_project_title: "Polyphony",
+      tracker_project_owner_login: "acme",
+      tracker_project_owner_type: "organization",
+      tracker_active_states: ["OPEN"],
+      tracker_terminal_states: ["CLOSED"]
+    )
+
+    issue = %GitHubIssue{
+      id: "ISSUE-POLICY-1",
+      identifier: "#401",
+      title: "Policy custom fields",
+      description: "Pass through policy-derived values",
+      state: "OPEN",
+      tracker_metadata: %{
+        "project_desired_fields" => %{
+          "Points" => %{"number" => 8},
+          "Progress" => %{"number" => 65},
+          "Target Date" => %{"date" => "2026-06-10"}
+        }
+      }
+    }
+
+    assert :ok = Orchestrator.reconcile_issue_primitives_for_test(issue)
+
+    assert_receive {:reconcile_issue_project_custom_fields, "ISSUE-POLICY-1", desired_fields}
+    assert desired_fields["Points"] == %{"number" => 8}
+    assert desired_fields["Progress"] == %{"number" => 65}
+    assert desired_fields["Target Date"] == %{"date" => "2026-06-10"}
   end
 
   test "dispatch gating skips todo issue when a blocker is non-terminal" do

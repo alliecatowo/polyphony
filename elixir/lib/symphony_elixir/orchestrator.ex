@@ -705,6 +705,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
     recipient = self()
 
+    issue = issue_with_desired_project_custom_fields(issue)
+
     case reconcile_issue_primitives(issue) do
       :ok ->
         dispatch_on_selected_worker_host(state, issue, attempt, recipient, preferred_worker_host)
@@ -714,6 +716,89 @@ defmodule SymphonyElixir.Orchestrator do
         dispatch_on_selected_worker_host(state, issue, attempt, recipient, preferred_worker_host)
     end
   end
+
+  defp issue_with_desired_project_custom_fields(%{tracker_metadata: tracker_metadata} = issue)
+       when is_map(tracker_metadata) do
+    has_explicit_desired_fields? =
+      is_map(Map.get(tracker_metadata, "project_desired_fields")) or
+        is_map(Map.get(tracker_metadata, :project_desired_fields))
+
+    if has_explicit_desired_fields? do
+      issue
+    else
+      desired_fields = build_policy_desired_project_custom_fields(issue)
+
+      if desired_fields == %{} do
+        issue
+      else
+        updated_metadata = Map.put(tracker_metadata, "project_desired_fields", desired_fields)
+        Map.put(issue, :tracker_metadata, updated_metadata)
+      end
+    end
+  end
+
+  defp issue_with_desired_project_custom_fields(issue), do: issue
+
+  # Conservative policy: derive only low-risk defaults from current issue/metadata,
+  # and only when a GitHub project item context exists.
+  defp build_policy_desired_project_custom_fields(%{tracker_metadata: tracker_metadata} = issue)
+       when is_map(tracker_metadata) do
+    project_items = Map.get(tracker_metadata, "project_items", [])
+
+    if is_list(project_items) and project_items != [] do
+      %{}
+      |> maybe_put_points_default(issue)
+      |> maybe_put_progress_default(issue)
+    else
+      %{}
+    end
+  end
+
+  defp build_policy_desired_project_custom_fields(_issue), do: %{}
+
+  defp maybe_put_points_default(fields, %{priority: priority}) when is_integer(priority) do
+    points =
+      case priority do
+        1 -> 8
+        2 -> 5
+        3 -> 3
+        4 -> 1
+        _ -> nil
+      end
+
+    if is_integer(points), do: Map.put(fields, "Points", %{"number" => points}), else: fields
+  end
+
+  defp maybe_put_points_default(fields, _issue), do: fields
+
+  defp maybe_put_progress_default(fields, %{state: state_name}) when is_binary(state_name) do
+    normalized = String.downcase(String.trim(state_name))
+
+    terminal_states =
+      Config.settings!().tracker.terminal_states
+      |> Enum.map(&String.downcase(String.trim(&1)))
+      |> MapSet.new()
+
+    active_states =
+      Config.settings!().tracker.active_states
+      |> Enum.map(&String.downcase(String.trim(&1)))
+      |> MapSet.new()
+
+    progress =
+      cond do
+        MapSet.member?(terminal_states, normalized) -> 100
+        MapSet.member?(active_states, normalized) -> 0
+        true -> nil
+      end
+
+    if is_integer(progress) do
+      Map.put(fields, "Progress", %{"number" => progress})
+    else
+      fields
+    end
+  end
+
+  defp maybe_put_progress_default(fields, _issue), do: fields
 
   defp dispatch_on_selected_worker_host(%State{} = state, issue, attempt, recipient, preferred_worker_host) do
     case select_worker_host(state, preferred_worker_host) do
