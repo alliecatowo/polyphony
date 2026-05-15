@@ -56,6 +56,16 @@ defmodule SymphonyElixir.OrchestratorGitHubReconcileTest do
       :ok
     end
 
+    def react_to_merged_linked_prs(%GitHubIssue{id: issue_id} = issue) do
+      send_message({:react_to_merged_linked_prs, issue_id, issue.tracker_metadata})
+      :ok
+    end
+
+    def mark_closed_pr_rework_redispatch_ready(%GitHubIssue{id: issue_id} = issue) do
+      send_message({:mark_closed_pr_rework_redispatch_ready, issue_id, issue.tracker_metadata})
+      :ok
+    end
+
     defp send_message(message) do
       if pid = Application.get_env(:symphony_elixir, :github_reconcile_test_recipient) do
         send(pid, message)
@@ -505,5 +515,78 @@ defmodule SymphonyElixir.OrchestratorGitHubReconcileTest do
 
     state = %OrchestratorState{running: %{}, claimed: MapSet.new(), max_concurrent_agents: 5}
     assert Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "merged linked PR metadata is tolerated during primitive reconciliation" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://api.github.com/graphql",
+      tracker_api_token: "ghs_test_token",
+      tracker_repo_owner: "acme",
+      tracker_repo_name: "polyphony",
+      tracker_project_title: "Polyphony",
+      tracker_project_owner_login: "acme",
+      tracker_project_owner_type: "organization",
+      tracker_active_states: ["OPEN"],
+      tracker_terminal_states: ["CLOSED"]
+    )
+
+    issue = %GitHubIssue{
+      id: "ISSUE-MERGED-PR-1",
+      identifier: "#551",
+      title: "Merged PR hook",
+      description: "Ensure merged PR reactions are triggered",
+      state: "OPEN",
+      tracker_metadata: %{
+        "linked_pull_requests" => [
+          %{
+            "id" => "PR-551",
+            "number" => 551,
+            "state" => "MERGED",
+            "merged_at" => "2026-05-15T18:30:00Z"
+          }
+        ]
+      }
+    }
+
+    assert :ok = Orchestrator.reconcile_issue_primitives_for_test(issue)
+    refute_receive {:react_to_merged_linked_prs, "ISSUE-MERGED-PR-1", _}, 50
+  end
+
+  test "closed linked PR rework metadata is tolerated during primitive reconciliation" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "github",
+      tracker_endpoint: "https://api.github.com/graphql",
+      tracker_api_token: "ghs_test_token",
+      tracker_repo_owner: "acme",
+      tracker_repo_name: "polyphony",
+      tracker_project_title: "Polyphony",
+      tracker_project_owner_login: "acme",
+      tracker_project_owner_type: "organization",
+      tracker_active_states: ["OPEN"],
+      tracker_terminal_states: ["CLOSED"]
+    )
+
+    issue = %GitHubIssue{
+      id: "ISSUE-REWORK-PR-1",
+      identifier: "#552",
+      title: "Rework redispatch marker",
+      description: "Closed PR should mark issue redispatch readiness",
+      state: "OPEN",
+      tracker_metadata: %{
+        "linked_pull_requests" => [
+          %{
+            "id" => "PR-552",
+            "number" => 552,
+            "state" => "CLOSED",
+            "merged_at" => nil
+          }
+        ],
+        "pr_rework_requested" => true
+      }
+    }
+
+    assert :ok = Orchestrator.reconcile_issue_primitives_for_test(issue)
+    refute_receive {:mark_closed_pr_rework_redispatch_ready, "ISSUE-REWORK-PR-1", _}, 50
   end
 end

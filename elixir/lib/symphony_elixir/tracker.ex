@@ -55,6 +55,7 @@ defmodule SymphonyElixir.Tracker do
     tracker_adapter = adapter()
 
     with :ok <- maybe_reconcile_issue_primitives_in_order(tracker_adapter, issue, desired),
+         :ok <- maybe_reconcile_pr_lifecycle_hooks(tracker_adapter, issue),
          :ok <- maybe_reconcile_structure_dependencies(tracker_adapter, issue_id, desired),
          :ok <- maybe_reconcile_taxonomy(tracker_adapter, issue_id, desired),
          :ok <- maybe_reconcile_project_custom_fields(tracker_adapter, issue, desired.project_custom_fields),
@@ -95,6 +96,30 @@ defmodule SymphonyElixir.Tracker do
     maybe_call_reconcile(adapter_module, :reconcile_issue_blocked_by, [issue_id, desired.blocked_by_issue_ids])
   end
 
+  defp maybe_reconcile_pr_lifecycle_hooks(adapter_module, issue)
+       when is_atom(adapter_module) and is_map(issue) do
+    with :ok <- maybe_call_reconcile_for_merged_pr(adapter_module, issue),
+         :ok <- maybe_call_reconcile_for_closed_pr_rework(adapter_module, issue) do
+      :ok
+    end
+  end
+
+  defp maybe_call_reconcile_for_merged_pr(adapter_module, issue) do
+    if attached_pr_merged?(issue) do
+      maybe_call_reconcile(adapter_module, :react_to_merged_linked_prs, [issue])
+    else
+      :ok
+    end
+  end
+
+  defp maybe_call_reconcile_for_closed_pr_rework(adapter_module, issue) do
+    if attached_pr_closed_without_merge?(issue) do
+      maybe_call_reconcile(adapter_module, :mark_closed_pr_rework_redispatch_ready, [issue])
+    else
+      :ok
+    end
+  end
+
   defp maybe_reconcile_taxonomy(adapter_module, issue_id, desired)
        when is_atom(adapter_module) and is_binary(issue_id) and is_map(desired) do
     with :ok <- maybe_call_reconcile(adapter_module, :reconcile_issue_labels, [issue_id, desired.labels]),
@@ -118,6 +143,58 @@ defmodule SymphonyElixir.Tracker do
        when is_atom(adapter_module) and is_map(issue) do
     maybe_call_reconcile(adapter_module, :reconcile_issue_state_from_project_status, [issue])
   end
+
+  defp attached_pr_merged?(%{tracker_metadata: tracker_metadata}) when is_map(tracker_metadata) do
+    lifecycle = Map.get(tracker_metadata, "pull_request_lifecycle", %{})
+
+    Map.get(lifecycle, "has_merged", false) == true or
+      linked_pr_merged?(Map.get(tracker_metadata, "linked_pull_requests", []))
+  end
+
+  defp attached_pr_merged?(_issue), do: false
+
+  defp attached_pr_closed_without_merge?(%{tracker_metadata: tracker_metadata})
+       when is_map(tracker_metadata) do
+    lifecycle = Map.get(tracker_metadata, "pull_request_lifecycle", %{})
+    has_closed = Map.get(lifecycle, "has_closed", false)
+    has_merged = Map.get(lifecycle, "has_merged", false)
+
+    cond do
+      has_closed == true and has_merged != true ->
+        true
+
+      lifecycle == %{} ->
+        linked_pr_closed_without_merge?(Map.get(tracker_metadata, "linked_pull_requests", []))
+
+      true ->
+        false
+    end
+  end
+
+  defp attached_pr_closed_without_merge?(_issue), do: false
+
+  defp linked_pr_merged?(linked_prs) when is_list(linked_prs) do
+    Enum.any?(linked_prs, fn
+      %{"merged" => true} -> true
+      %{"merged_at" => merged_at} when is_binary(merged_at) and merged_at != "" -> true
+      %{"state" => state} when is_binary(state) -> String.upcase(String.trim(state)) == "MERGED"
+      _ -> false
+    end)
+  end
+
+  defp linked_pr_merged?(_linked_prs), do: false
+
+  defp linked_pr_closed_without_merge?(linked_prs) when is_list(linked_prs) do
+    has_closed =
+      Enum.any?(linked_prs, fn
+        %{"state" => state} when is_binary(state) -> String.upcase(String.trim(state)) == "CLOSED"
+        _ -> false
+      end)
+
+    has_closed and not linked_pr_merged?(linked_prs)
+  end
+
+  defp linked_pr_closed_without_merge?(_linked_prs), do: false
 
   defp desired_milestone_number(%{tracker_metadata: tracker_metadata}) when is_map(tracker_metadata) do
     override =

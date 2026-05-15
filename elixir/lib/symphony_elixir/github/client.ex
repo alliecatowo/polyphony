@@ -30,7 +30,11 @@ defmodule SymphonyElixir.GitHub.Client do
       url
       title
       state
+      isDraft
+      merged
+      mergeStateStatus
       mergedAt
+      closedAt
       repository { nameWithOwner }
     }
   }
@@ -71,7 +75,7 @@ defmodule SymphonyElixir.GitHub.Client do
             field { ... on ProjectV2FieldCommon { id name } }
           }
           ... on ProjectV2ItemFieldPullRequestValue {
-            pullRequests(first: 20) { nodes { id number url title state } }
+            pullRequests(first: 20) { nodes { id number url title state isDraft merged mergeStateStatus mergedAt closedAt } }
             field { ... on ProjectV2FieldCommon { id name } }
           }
           ... on ProjectV2ItemFieldRepositoryValue {
@@ -909,7 +913,8 @@ defmodule SymphonyElixir.GitHub.Client do
       "parent" => normalize_linked_issue(issue["parent"]),
       "sub_issues" => normalize_linked_issues(get_in(issue, ["subIssues", "nodes"])),
       "project_items" => normalize_project_items(get_in(issue, ["projectItems", "nodes"])),
-      "linked_pull_requests" => normalize_linked_pr_signals(issue)
+      "linked_pull_requests" => normalize_linked_pr_signals(issue),
+      "pull_request_lifecycle" => normalize_pr_lifecycle(issue)
     }
 
     %Issue{
@@ -1021,8 +1026,12 @@ defmodule SymphonyElixir.GitHub.Client do
         "identifier" => linked_identifier(pr["number"]),
         "title" => pr["title"],
         "state" => pr["state"],
+        "is_draft" => pr["isDraft"] == true,
+        "merged" => pr["merged"] == true,
+        "merge_state_status" => pr["mergeStateStatus"],
         "url" => pr["url"],
         "merged_at" => pr["mergedAt"],
+        "closed_at" => pr["closedAt"],
         "repository" => get_in(pr, ["repository", "nameWithOwner"])
       }
     end)
@@ -1056,6 +1065,44 @@ defmodule SymphonyElixir.GitHub.Client do
     end)
     |> Map.values()
   end
+
+  defp normalize_pr_lifecycle(issue) when is_map(issue) do
+    prs = normalize_linked_pr_signals(issue)
+
+    open_count =
+      Enum.count(prs, fn pr ->
+        normalize_state_name(pr["state"]) == "open" and pr["merged"] != true
+      end)
+
+    draft_count =
+      Enum.count(prs, fn pr ->
+        normalize_state_name(pr["state"]) == "open" and pr["is_draft"] == true
+      end)
+
+    merged_count = Enum.count(prs, &(&1["merged"] == true))
+    closed_count = Enum.count(prs, &(normalize_state_name(&1["state"]) == "closed" and &1["merged"] != true))
+
+    has_conflict_signal? =
+      Enum.any?(prs, fn pr ->
+        merge_state_status = normalize_state_name(pr["merge_state_status"])
+        merge_state_status in ["dirty", "behind", "blocked"]
+      end)
+
+    %{
+      "count" => length(prs),
+      "open" => open_count,
+      "draft" => draft_count,
+      "merged" => merged_count,
+      "closed" => closed_count,
+      "has_open" => open_count > 0,
+      "has_draft" => draft_count > 0,
+      "has_merged" => merged_count > 0,
+      "has_closed" => closed_count > 0,
+      "has_conflict_signal" => has_conflict_signal?
+    }
+  end
+
+  defp normalize_pr_lifecycle(_issue), do: %{}
 
   defp normalize_milestone(nil), do: nil
 

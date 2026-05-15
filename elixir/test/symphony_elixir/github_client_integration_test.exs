@@ -531,6 +531,53 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
            } = issue.tracker_metadata
   end
 
+  test "linked pull request normalization preserves lifecycle state metadata" do
+    Req.Test.stub(__MODULE__, fn conn ->
+      payload = %{
+        "data" => %{
+          "nodes" => [
+            issue_node("I57", 57, "OPEN",
+              linked_prs: [
+                %{
+                  "id" => "PR-MERGED",
+                  "number" => 210,
+                  "url" => "https://github.com/acme/polyphony/pull/210",
+                  "title" => "Ship feature",
+                  "state" => "MERGED",
+                  "mergedAt" => "2026-05-15T18:00:00Z",
+                  "repository" => %{"nameWithOwner" => "acme/polyphony"}
+                },
+                %{
+                  "id" => "PR-CLOSED",
+                  "number" => 211,
+                  "url" => "https://github.com/acme/polyphony/pull/211",
+                  "title" => "Superseded change",
+                  "state" => "CLOSED",
+                  "mergedAt" => nil,
+                  "repository" => %{"nameWithOwner" => "acme/polyphony"}
+                }
+              ]
+            )
+          ]
+        }
+      }
+
+      Req.Test.json(conn, payload)
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+    assert {:ok, [issue]} = Client.fetch_issue_states_by_ids(["I57"])
+
+    prs = issue.tracker_metadata["linked_pull_requests"]
+    merged_pr = Enum.find(prs, &(&1["id"] == "PR-MERGED"))
+    closed_pr = Enum.find(prs, &(&1["id"] == "PR-CLOSED"))
+
+    assert merged_pr["state"] == "MERGED"
+    assert merged_pr["merged_at"] == "2026-05-15T18:00:00Z"
+    assert closed_pr["state"] == "CLOSED"
+    assert is_nil(closed_pr["merged_at"])
+  end
+
   test "dependency hydration preserves blocker terminal state from github dependency edges" do
     Req.Test.stub(__MODULE__, fn conn ->
       cond do
