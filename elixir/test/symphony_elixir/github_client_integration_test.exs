@@ -123,10 +123,79 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
     Req.default_options(plug: {Req.Test, __MODULE__})
 
     assert {:ok, issues} = Client.fetch_candidate_issues()
-    assert Enum.map(issues, & &1.id) == ["I1", "I2"]
+    assert Enum.map(issues, & &1.id) == ["I2"]
 
     assert_receive {:graphql_request, nil, ["OPEN"]}
     assert_receive {:graphql_request, "CURSOR-1", ["OPEN"]}
+  end
+
+  test "project status takes precedence over issue state for dispatch eligibility" do
+    Req.Test.stub(__MODULE__, fn conn ->
+      query = get_in(conn.body_params, ["query"]) || ""
+
+      cond do
+        String.contains?(query, "OwnerLookup") ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "organization" => %{
+                "id" => "ORG1",
+                "projectsV2" => %{"nodes" => [%{"id" => "PROJ1", "title" => "Polyphony", "url" => "u", "number" => 1}]}
+              }
+            }
+          })
+
+        String.contains?(query, "ProjectFields") ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "node" => %{
+                "fields" => %{"nodes" => [%{"id" => "F1", "name" => "Status", "dataType" => "SINGLE_SELECT"}]}
+              }
+            }
+          })
+
+        String.contains?(query, "RepositoryIssues") ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "repository" => %{
+                "issues" => %{
+                  "nodes" => [
+                    issue_node("I10", 10, "OPEN", status_name: "Done")
+                  ],
+                  "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+                }
+              }
+            }
+          })
+
+        String.contains?(query, "ProjectIssues") ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "node" => %{
+                "items" => %{
+                  "nodes" => [
+                    %{
+                      "id" => "ITEM-10",
+                      "isArchived" => false,
+                      "content" => Map.put(issue_node("I10", 10, "OPEN", status_name: "Done"), "repository", %{"nameWithOwner" => "acme/polyphony"}),
+                      "fieldValues" => %{"nodes" => status_field_nodes("Done")}
+                    }
+                  ],
+                  "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+                }
+              }
+            }
+          })
+
+        String.contains?(query, "AddProjectItem") ->
+          Req.Test.json(conn, %{"data" => %{"addProjectV2ItemById" => %{"item" => %{"id" => "ITEMNEW"}}}})
+
+        true ->
+          Req.Test.json(conn, %{"data" => %{}})
+      end
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+    assert {:ok, []} = Client.fetch_candidate_issues()
   end
 
   test "fetch_issue_states_by_ids preserves requested ordering" do

@@ -902,8 +902,13 @@ defmodule SymphonyElixir.GitHub.Client do
     issue_state = normalize_state_name(issue.state || "")
     project_state_values = project_state_values(issue)
 
-    Enum.member?(normalized_active_states, issue_state) or
-      Enum.any?(project_state_values, &Enum.member?(normalized_active_states, &1))
+    cond do
+      project_state_values != [] ->
+        Enum.any?(project_state_values, &Enum.member?(normalized_active_states, &1))
+
+      true ->
+        Enum.member?(normalized_active_states, issue_state)
+    end
   end
 
   defp candidate_issue?(_issue, _active_states), do: false
