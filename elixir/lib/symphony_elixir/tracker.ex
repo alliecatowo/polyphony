@@ -49,6 +49,7 @@ defmodule SymphonyElixir.Tracker do
     assignees = desired_assignees(issue)
     labels = desired_labels(issue)
     blocked_by_issue_ids = desired_blocked_by_issue_ids(issue)
+    project_custom_fields = desired_project_custom_fields(issue)
     tracker_adapter = adapter()
 
     with :ok <-
@@ -80,7 +81,8 @@ defmodule SymphonyElixir.Tracker do
              tracker_adapter,
              :reconcile_issue_blocked_by,
              [issue_id, blocked_by_issue_ids]
-           ) do
+           ),
+         :ok <- maybe_reconcile_project_custom_fields(tracker_adapter, issue, project_custom_fields) do
       :ok
     end
   end
@@ -114,6 +116,7 @@ defmodule SymphonyElixir.Tracker do
     labels
     |> Enum.filter(&is_binary/1)
     |> Enum.map(&String.trim/1)
+    |> Enum.map(&String.downcase/1)
     |> Enum.reject(&(&1 == ""))
     |> Enum.uniq()
   end
@@ -134,4 +137,38 @@ defmodule SymphonyElixir.Tracker do
   end
 
   defp desired_blocked_by_issue_ids(_issue), do: []
+
+  defp desired_project_custom_fields(%{tracker_metadata: tracker_metadata}) when is_map(tracker_metadata) do
+    cond do
+      is_map(Map.get(tracker_metadata, "project_custom_fields")) ->
+        Map.get(tracker_metadata, "project_custom_fields")
+
+      is_map(Map.get(tracker_metadata, :project_custom_fields)) ->
+        Map.get(tracker_metadata, :project_custom_fields)
+
+      is_map(Map.get(tracker_metadata, "project_desired_fields")) ->
+        Map.get(tracker_metadata, "project_desired_fields")
+
+      is_map(Map.get(tracker_metadata, :project_desired_fields)) ->
+        Map.get(tracker_metadata, :project_desired_fields)
+
+      true ->
+        %{}
+    end
+  end
+
+  defp desired_project_custom_fields(_issue), do: %{}
+
+  defp maybe_reconcile_project_custom_fields(_adapter_module, _issue, desired_fields)
+       when desired_fields in [%{}, nil],
+       do: :ok
+
+  defp maybe_reconcile_project_custom_fields(adapter_module, issue, desired_fields)
+       when is_atom(adapter_module) and is_map(desired_fields) do
+    maybe_call_reconcile(
+      adapter_module,
+      :reconcile_issue_project_custom_fields,
+      [issue, desired_fields]
+    )
+  end
 end
