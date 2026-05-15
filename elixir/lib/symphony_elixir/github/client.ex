@@ -95,8 +95,8 @@ defmodule SymphonyElixir.GitHub.Client do
   updatedAt
   """
 
-  @query """
-  query SymphonyGitHubCandidateIssues($owner: String!, $name: String!, $after: String, $first: Int!, $states: [IssueState!]) {
+  @repo_issues_query """
+  query SymphonyGitHubRepositoryIssues($owner: String!, $name: String!, $after: String, $first: Int!, $states: [IssueState!]) {
     repository(owner: $owner, name: $name) {
       issues(first: $first, after: $after, states: $states, orderBy: {field: UPDATED_AT, direction: DESC}) {
         nodes {
@@ -105,6 +105,59 @@ defmodule SymphonyElixir.GitHub.Client do
         pageInfo {
           hasNextPage
           endCursor
+        }
+      }
+    }
+  }
+  """
+
+  @project_items_query """
+  query SymphonyGitHubProjectIssues($projectId: ID!, $after: String, $first: Int!) {
+    node(id: $projectId) {
+      ... on ProjectV2 {
+        id
+        title
+        url
+        items(first: $first, after: $after) {
+          nodes {
+            id
+            isArchived
+            content {
+              ... on Issue {
+                #{@issue_fields}
+                repository { id nameWithOwner }
+              }
+            }
+            fieldValues(first: 50) {
+              nodes {
+                __typename
+                ... on ProjectV2ItemFieldDateValue {
+                  date
+                  field { ... on ProjectV2FieldCommon { id name } }
+                }
+                ... on ProjectV2ItemFieldIterationValue {
+                  title
+                  startDate
+                  duration
+                  field { ... on ProjectV2FieldCommon { id name } }
+                }
+                ... on ProjectV2ItemFieldNumberValue {
+                  number
+                  field { ... on ProjectV2FieldCommon { id name } }
+                }
+                ... on ProjectV2ItemFieldSingleSelectValue {
+                  name
+                  optionId
+                  field { ... on ProjectV2FieldCommon { id name } }
+                }
+                ... on ProjectV2ItemFieldTextValue {
+                  text
+                  field { ... on ProjectV2FieldCommon { id name } }
+                }
+              }
+            }
+          }
+          pageInfo { hasNextPage endCursor }
         }
       }
     }
@@ -191,12 +244,79 @@ defmodule SymphonyElixir.GitHub.Client do
   }
   """
 
+  @owner_lookup_query """
+  query SymphonyGitHubOwnerLookup($login: String!, $isOrg: Boolean!, $isUser: Boolean!) {
+    organization(login: $login) @include(if: $isOrg) {
+      id
+      projectsV2(first: 100) {
+        nodes { id title url number }
+      }
+    }
+    user(login: $login) @include(if: $isUser) {
+      id
+      projectsV2(first: 100) {
+        nodes { id title url number }
+      }
+    }
+  }
+  """
+
+  @create_project_query """
+  mutation SymphonyGitHubCreateProject($ownerId: ID!, $title: String!) {
+    createProjectV2(input: {ownerId: $ownerId, title: $title}) {
+      projectV2 { id title url number }
+    }
+  }
+  """
+
+  @project_fields_query """
+  query SymphonyGitHubProjectFields($projectId: ID!) {
+    node(id: $projectId) {
+      ... on ProjectV2 {
+        fields(first: 100) {
+          nodes {
+            ... on ProjectV2FieldCommon {
+              id
+              name
+              dataType
+            }
+            ... on ProjectV2SingleSelectField {
+              options { id name }
+            }
+          }
+        }
+      }
+    }
+  }
+  """
+
+  @create_project_field_query """
+  mutation SymphonyGitHubCreateProjectField($projectId: ID!, $name: String!, $dataType: ProjectV2CustomFieldType!) {
+    createProjectV2Field(input: {projectId: $projectId, name: $name, dataType: $dataType}) {
+      projectV2Field {
+        ... on ProjectV2FieldCommon { id name dataType }
+      }
+    }
+  }
+  """
+
+  @add_project_item_query """
+  mutation SymphonyGitHubAddProjectItem($projectId: ID!, $contentId: ID!) {
+    addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
+      item { id }
+    }
+  }
+  """
+
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
     tracker = Config.settings!().tracker
 
     with :ok <- validate_tracker!(tracker),
-         {:ok, issues} <- fetch_repository_issues(tracker.repo_owner, tracker.repo_name, tracker.active_states) do
+         {:ok, project_ctx} <- ensure_project_context(tracker),
+         {:ok, _} <- ensure_project_fields(project_ctx.project_id),
+         {:ok, _} <- ensure_repository_issues_in_project(tracker, project_ctx.project_id),
+         {:ok, issues} <- fetch_project_issues(project_ctx.project_id, tracker.repo_owner, tracker.repo_name) do
       {:ok, Enum.filter(issues, &candidate_issue?(&1, tracker.active_states))}
     end
   end
@@ -207,7 +327,8 @@ defmodule SymphonyElixir.GitHub.Client do
     tracker = Config.settings!().tracker
 
     with :ok <- validate_tracker!(tracker),
-         {:ok, issues} <- fetch_repository_issues(tracker.repo_owner, tracker.repo_name, normalized_states) do
+         {:ok, project_ctx} <- ensure_project_context(tracker),
+         {:ok, issues} <- fetch_project_issues(project_ctx.project_id, tracker.repo_owner, tracker.repo_name) do
       {:ok, Enum.filter(issues, &candidate_issue?(&1, normalized_states))}
     end
   end
@@ -378,13 +499,87 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
+  defp ensure_project_context(tracker) do
+    owner_login = tracker.project_owner_login || tracker.repo_owner
+    owner_type = normalize_owner_type(tracker.project_owner_type)
+    project_title = normalized_project_title(tracker.project_title)
+
+    with {:ok, body} <-
+           graphql(@owner_lookup_query, %{
+             login: owner_login,
+             isOrg: owner_type == "organization",
+             isUser: owner_type == "user"
+           }),
+         {:ok, owner} <- extract_owner_node(body, owner_type),
+         {:ok, project} <- find_or_create_project(owner, project_title) do
+      {:ok, %{owner_login: owner_login, owner_type: owner_type, owner_id: owner["id"], project_id: project["id"]}}
+    end
+  end
+
+  defp ensure_project_fields(project_id) do
+    with {:ok, body} <- graphql(@project_fields_query, %{projectId: project_id}),
+         fields when is_list(fields) <- get_in(body, ["data", "node", "fields", "nodes"]) do
+      field_names =
+        fields
+        |> Enum.map(fn field -> normalize_state_name(field["name"] || "") end)
+        |> MapSet.new()
+
+      with :ok <- maybe_create_number_field(project_id, field_names, "Points"),
+           :ok <- maybe_create_number_field(project_id, field_names, "Progress") do
+        {:ok, :ensured}
+      end
+    else
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :github_unknown_payload}
+    end
+  end
+
+  defp ensure_repository_issues_in_project(tracker, project_id) do
+    with {:ok, issues} <- fetch_repository_issues(tracker.repo_owner, tracker.repo_name, tracker.active_states) do
+      Enum.reduce_while(issues, {:ok, :done}, fn %Issue{} = issue, _acc ->
+        case has_project_item_for_project?(issue, project_id) do
+          true ->
+            {:cont, {:ok, :done}}
+
+          false ->
+            case graphql_mutation(@add_project_item_query, %{projectId: project_id, contentId: issue.id}) do
+              {:ok, _} -> {:cont, {:ok, :done}}
+              {:error, reason} -> {:halt, {:error, reason}}
+            end
+        end
+      end)
+    end
+  end
+
   defp fetch_repository_issues(owner, repo, active_states) do
     fetch_repository_issues_page(owner, repo, active_states, nil, [])
   end
 
+  defp fetch_project_issues(project_id, repo_owner, repo_name) do
+    fetch_project_issues_page(project_id, repo_owner, repo_name, nil, [])
+  end
+
+  defp fetch_project_issues_page(project_id, repo_owner, repo_name, after_cursor, acc_issues) do
+    with {:ok, body} <-
+           graphql(@project_items_query, %{
+             projectId: project_id,
+             first: @issue_page_size,
+             after: after_cursor
+           }),
+         {:ok, issues, page_info} <- decode_project_page_response(body, repo_owner, repo_name) do
+      updated = Enum.reverse(issues, acc_issues)
+
+      case next_page_cursor(page_info) do
+        {:ok, next_cursor} -> fetch_project_issues_page(project_id, repo_owner, repo_name, next_cursor, updated)
+        :done -> {:ok, Enum.reverse(updated)}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
   defp fetch_repository_issues_page(owner, repo, active_states, after_cursor, acc_issues) do
     with {:ok, body} <-
-           graphql(@query, %{
+           graphql(@repo_issues_query, %{
              owner: owner,
              name: repo,
              first: @issue_page_size,
@@ -422,6 +617,55 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp decode_repository_page_response(%{"errors" => errors}), do: {:error, {:github_graphql_errors, errors}}
   defp decode_repository_page_response(_payload), do: {:error, :github_unknown_payload}
+
+  defp decode_project_page_response(
+         %{
+           "data" => %{
+             "node" => %{
+               "items" => %{
+                 "nodes" => item_nodes,
+                 "pageInfo" => %{"hasNextPage" => has_next_page, "endCursor" => end_cursor}
+               }
+             }
+           }
+         },
+         repo_owner,
+         repo_name
+       ) do
+    expected_repo = String.downcase("#{repo_owner}/#{repo_name}")
+
+    issues =
+      item_nodes
+      |> Enum.flat_map(fn item ->
+        with %{} = content <- item["content"],
+             repo when is_binary(repo) <- get_in(content, ["repository", "nameWithOwner"]),
+             true <- String.downcase(repo) == expected_repo,
+             %Issue{} = issue <- normalize_issue(content) do
+          item_payload = %{
+            "id" => item["id"],
+            "is_archived" => item["isArchived"] == true,
+            "project" => nil,
+            "field_values" => normalize_project_field_values(get_in(item, ["fieldValues", "nodes"]))
+          }
+
+          metadata =
+            issue
+            |> Map.get(:tracker_metadata, %{})
+            |> Map.put("project_items", [item_payload])
+
+          [Map.put(issue, :tracker_metadata, metadata)]
+        else
+          _ -> []
+        end
+      end)
+
+    {:ok, issues, %{has_next_page: has_next_page == true, end_cursor: end_cursor}}
+  end
+
+  defp decode_project_page_response(%{"errors" => errors}, _repo_owner, _repo_name),
+    do: {:error, {:github_graphql_errors, errors}}
+
+  defp decode_project_page_response(_payload, _repo_owner, _repo_name), do: {:error, :github_unknown_payload}
 
   defp decode_nodes_response(%{"data" => %{"nodes" => nodes}}) when is_list(nodes) do
     nodes
@@ -815,6 +1059,82 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp validate_optional_id(nil, _field_name), do: :ok
   defp validate_optional_id(value, field_name), do: ensure_present(value, field_name)
+
+  defp normalize_owner_type(owner_type) when is_binary(owner_type) do
+    case String.downcase(String.trim(owner_type)) do
+      "user" -> "user"
+      _ -> "organization"
+    end
+  end
+
+  defp normalize_owner_type(_), do: "organization"
+
+  defp normalized_project_title(title) when is_binary(title) do
+    trimmed = String.trim(title)
+    if trimmed == "", do: "Polyphony", else: trimmed
+  end
+
+  defp normalized_project_title(_), do: "Polyphony"
+
+  defp extract_owner_node(body, "organization") do
+    case get_in(body, ["data", "organization"]) do
+      %{"id" => _} = org -> {:ok, org}
+      _ -> {:error, :github_owner_not_found}
+    end
+  end
+
+  defp extract_owner_node(body, "user") do
+    case get_in(body, ["data", "user"]) do
+      %{"id" => _} = user -> {:ok, user}
+      _ -> {:error, :github_owner_not_found}
+    end
+  end
+
+  defp find_or_create_project(owner, project_title) do
+    existing =
+      owner
+      |> get_in(["projectsV2", "nodes"])
+      |> List.wrap()
+      |> Enum.find(fn project ->
+        normalize_state_name(project["title"] || "") == normalize_state_name(project_title)
+      end)
+
+    case existing do
+      %{"id" => _} = project ->
+        {:ok, project}
+
+      _ ->
+        with {:ok, body} <- graphql_mutation(@create_project_query, %{ownerId: owner["id"], title: project_title}),
+             %{"id" => _} = project <- get_in(body, ["data", "createProjectV2", "projectV2"]) do
+          {:ok, project}
+        else
+          _ -> {:error, :github_project_create_failed}
+        end
+    end
+  end
+
+  defp maybe_create_number_field(project_id, existing_names, field_name) do
+    if MapSet.member?(existing_names, normalize_state_name(field_name)) do
+      :ok
+    else
+      case graphql_mutation(@create_project_field_query, %{projectId: project_id, name: field_name, dataType: "NUMBER"}) do
+        {:ok, _} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  defp has_project_item_for_project?(%Issue{} = issue, project_id) when is_binary(project_id) do
+    issue
+    |> Map.get(:tracker_metadata, %{})
+    |> Map.get("project_items", [])
+    |> Enum.any?(fn item ->
+      case get_in(item, ["project", "id"]) do
+        ^project_id -> true
+        _ -> false
+      end
+    end)
+  end
 
   defp summarize_error_body(body) when is_binary(body) do
     body

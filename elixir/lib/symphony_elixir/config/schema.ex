@@ -51,6 +51,9 @@ defmodule SymphonyElixir.Config.Schema do
       field(:project_slug, :string)
       field(:repo_owner, :string)
       field(:repo_name, :string)
+      field(:project_title, :string, default: "Polyphony")
+      field(:project_owner_login, :string)
+      field(:project_owner_type, :string, default: "organization")
       field(:assignee, :string)
       field(:active_states, {:array, :string}, default: ["OPEN"])
       field(:terminal_states, {:array, :string}, default: ["CLOSED", "DONE", "COMPLETED", "CANCELLED", "CANCELED"])
@@ -68,6 +71,9 @@ defmodule SymphonyElixir.Config.Schema do
           :project_slug,
           :repo_owner,
           :repo_name,
+          :project_title,
+          :project_owner_login,
+          :project_owner_type,
           :assignee,
           :active_states,
           :terminal_states

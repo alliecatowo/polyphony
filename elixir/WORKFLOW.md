@@ -3,6 +3,9 @@ tracker:
   kind: github
   repo_owner: "your-org"
   repo_name: "polyphony"
+  project_owner_type: "organization"
+  project_owner_login: "your-org"
+  project_title: "Polyphony"
   active_states:
     - OPEN
     - In Progress

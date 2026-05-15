@@ -27,43 +27,97 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
     test_pid = self()
 
     Req.Test.stub(__MODULE__, fn conn ->
+      query = get_in(conn.body_params, ["query"]) || ""
       vars = get_in(conn.body_params, ["variables"]) || %{}
 
-      send(test_pid, {:graphql_request, vars["after"], vars["states"]})
+      cond do
+        String.contains?(query, "OwnerLookup") ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "organization" => %{
+                "id" => "ORG1",
+                "projectsV2" => %{"nodes" => [%{"id" => "PROJ1", "title" => "Polyphony", "url" => "u", "number" => 1}]}
+              }
+            }
+          })
 
-      page =
-        case vars["after"] do
-          nil ->
-            %{
-              "data" => %{
-                "repository" => %{
-                  "issues" => %{
-                    "nodes" => [
-                      issue_node("I1", 1, "OPEN", status_name: "Backlog"),
-                      issue_node("I2", 2, "CLOSED", status_name: "OPEN")
-                    ],
-                    "pageInfo" => %{"hasNextPage" => true, "endCursor" => "CURSOR-1"}
+        String.contains?(query, "ProjectFields") ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "node" => %{
+                "fields" => %{"nodes" => [%{"id" => "F1", "name" => "Status", "dataType" => "SINGLE_SELECT"}]}
+              }
+            }
+          })
+
+        String.contains?(query, "RepositoryIssues") ->
+          send(test_pid, {:graphql_request, vars["after"], vars["states"]})
+
+          page =
+            case vars["after"] do
+              nil ->
+                %{
+                  "data" => %{
+                    "repository" => %{
+                      "issues" => %{
+                        "nodes" => [
+                          issue_node("I1", 1, "OPEN", status_name: "Backlog"),
+                          issue_node("I2", 2, "CLOSED", status_name: "OPEN")
+                        ],
+                        "pageInfo" => %{"hasNextPage" => true, "endCursor" => "CURSOR-1"}
+                      }
+                    }
                   }
+                }
+
+              "CURSOR-1" ->
+                %{
+                  "data" => %{
+                    "repository" => %{
+                      "issues" => %{
+                        "nodes" => [
+                          issue_node("I3", 3, "CLOSED", status_name: "DONE")
+                        ],
+                        "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+                      }
+                    }
+                  }
+                }
+            end
+
+          Req.Test.json(conn, page)
+
+        String.contains?(query, "AddProjectItem") ->
+          Req.Test.json(conn, %{"data" => %{"addProjectV2ItemById" => %{"item" => %{"id" => "ITEMNEW"}}}})
+
+        String.contains?(query, "ProjectIssues") ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "node" => %{
+                "items" => %{
+                  "nodes" => [
+                    %{
+                      "id" => "ITEM-A",
+                      "isArchived" => false,
+                      "content" => Map.put(issue_node("I1", 1, "OPEN", status_name: "Backlog"), "repository", %{"nameWithOwner" => "acme/polyphony"}),
+                      "fieldValues" => %{"nodes" => status_field_nodes("Backlog")}
+                    },
+                    %{
+                      "id" => "ITEM-B",
+                      "isArchived" => false,
+                      "content" => Map.put(issue_node("I2", 2, "CLOSED", status_name: "OPEN"), "repository", %{"nameWithOwner" => "acme/polyphony"}),
+                      "fieldValues" => %{"nodes" => status_field_nodes("OPEN")}
+                    }
+                  ],
+                  "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
                 }
               }
             }
+          })
 
-          "CURSOR-1" ->
-            %{
-              "data" => %{
-                "repository" => %{
-                  "issues" => %{
-                    "nodes" => [
-                      issue_node("I3", 3, "CLOSED", status_name: "DONE")
-                    ],
-                    "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
-                  }
-                }
-              }
-            }
-        end
-
-      Req.Test.json(conn, page)
+        true ->
+          Req.Test.json(conn, %{"data" => %{}})
+      end
     end)
 
     Req.default_options(plug: {Req.Test, __MODULE__})
@@ -173,6 +227,17 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
             }
           ]
         }
+      }
+    ]
+  end
+
+  defp status_field_nodes(status_name) do
+    [
+      %{
+        "__typename" => "ProjectV2ItemFieldSingleSelectValue",
+        "name" => status_name,
+        "optionId" => "OPT-#{status_name}",
+        "field" => %{"id" => "F1", "name" => "Status"}
       }
     ]
   end
