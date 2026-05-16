@@ -28,6 +28,10 @@ defmodule SymphonyElixirWeb.Router do
   end
 
   scope "/", SymphonyElixirWeb do
+    get("/auth/github/start", GitHubAuthController, :start)
+    get("/auth/github/callback", GitHubAuthController, :callback)
+    post("/github/webhook", GitHubWebhookController, :receive)
+
     get("/api/v1/state", ObservabilityApiController, :state)
 
     match(:*, "/", ObservabilityApiController, :method_not_allowed)

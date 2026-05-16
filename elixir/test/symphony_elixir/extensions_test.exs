@@ -77,6 +77,27 @@ defmodule SymphonyElixir.ExtensionsTest do
     end
   end
 
+  defmodule WebhookOrchestrator do
+    use GenServer
+
+    def start_link(opts) do
+      name = Keyword.fetch!(opts, :name)
+      parent = Keyword.fetch!(opts, :parent)
+      GenServer.start_link(__MODULE__, parent, name: name)
+    end
+
+    def init(parent), do: {:ok, parent}
+
+    def handle_call(:request_refresh, _from, parent) do
+      send(parent, :webhook_refresh_requested)
+      {:reply, %{queued: true, coalesced: false, operations: ["poll", "reconcile"]}, parent}
+    end
+
+    def handle_call(:snapshot, _from, parent) do
+      {:reply, %{}, parent}
+    end
+  end
+
   setup do
     linear_client_module = Application.get_env(:symphony_elixir, :linear_client_module)
 
@@ -463,6 +484,50 @@ defmodule SymphonyElixir.ExtensionsTest do
              }
   end
 
+  test "github webhook endpoint verifies signature and requests refresh for issue events" do
+    webhook_secret = "test-webhook-secret"
+    previous_secret = System.get_env("GITHUB_WEBHOOK_SECRET")
+    on_exit(fn -> restore_env("GITHUB_WEBHOOK_SECRET", previous_secret) end)
+    System.put_env("GITHUB_WEBHOOK_SECRET", webhook_secret)
+
+    orchestrator_name = Module.concat(__MODULE__, :WebhookOrchestrator)
+    {:ok, _pid} = WebhookOrchestrator.start_link(name: orchestrator_name, parent: self())
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 5)
+
+    payload = ~s({"action":"opened"})
+    signature = "sha256=" <> hmac_sha256_hex(webhook_secret, payload)
+
+    conn =
+      build_conn()
+      |> Plug.Conn.put_req_header("x-github-event", "issues")
+      |> Plug.Conn.put_req_header("x-hub-signature-256", signature)
+      |> Plug.Conn.put_req_header("content-type", "application/json")
+      |> post("/github/webhook", payload)
+
+    assert json_response(conn, 200) == %{"ok" => true, "event" => "issues"}
+    assert_receive :webhook_refresh_requested, 200
+  end
+
+  test "github webhook endpoint rejects invalid signatures" do
+    webhook_secret = "test-webhook-secret"
+    previous_secret = System.get_env("GITHUB_WEBHOOK_SECRET")
+    on_exit(fn -> restore_env("GITHUB_WEBHOOK_SECRET", previous_secret) end)
+    System.put_env("GITHUB_WEBHOOK_SECRET", webhook_secret)
+
+    start_test_endpoint(orchestrator: Module.concat(__MODULE__, :NoopOrchestrator), snapshot_timeout_ms: 5)
+
+    conn =
+      build_conn()
+      |> Plug.Conn.put_req_header("x-github-event", "issues")
+      |> Plug.Conn.put_req_header("x-hub-signature-256", "sha256=deadbeef")
+      |> Plug.Conn.put_req_header("content-type", "application/json")
+      |> post("/github/webhook", ~s({"action":"opened"}))
+
+    assert json_response(conn, 401) == %{
+             "error" => %{"code" => "invalid_signature", "message" => "Invalid webhook signature"}
+           }
+  end
+
   test "phoenix observability api preserves snapshot timeout behavior" do
     timeout_orchestrator = Module.concat(__MODULE__, :TimeoutOrchestrator)
     {:ok, _pid} = SlowOrchestrator.start_link(name: timeout_orchestrator)
@@ -722,6 +787,11 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
 
     HttpServer.bound_port()
+  end
+
+  defp hmac_sha256_hex(secret, payload) do
+    :crypto.mac(:hmac, :sha256, secret, payload)
+    |> Base.encode16(case: :lower)
   end
 
   defp assert_eventually(fun, attempts \\ 20)

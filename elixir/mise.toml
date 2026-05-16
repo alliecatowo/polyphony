@@ -4,15 +4,12 @@ elixir = "1.19.5-otp-28"
 
 [tasks.webhook]
 description = "Start local Polyphony server with GitHub webhook endpoint at /github/webhook"
-run = "mix run --no-halt"
+run = "set -a; . ./.env; set +a; mix run --no-halt"
 
 [tasks.funnel]
 description = "Expose local webhook server to the public internet via Tailscale Funnel"
-run = "tailscale funnel --https=443 http://127.0.0.1:${WEBHOOK_PORT:-4000}"
+run = "set -a; . ./.env; set +a; tailscale funnel --https=443 http://127.0.0.1:${WEBHOOK_PORT:-4000}"
 
 [tasks.funnel-stop]
 description = "Disable Tailscale Funnel on HTTPS 443"
 run = "tailscale funnel --https=443 off"
-
-[env]
-_.path=".env"

@@ -35,6 +35,21 @@ defmodule SymphonyElixir.GitHub.Auth do
     end
   end
 
+  @spec project_authorization_token(map(), keyword()) :: {:ok, String.t()} | {:error, term()}
+  def project_authorization_token(tracker, opts \\ []) when is_map(tracker) do
+    case oauth_token() do
+      {:ok, token} ->
+        {:ok, token}
+
+      :missing ->
+        if String.downcase(to_string(Map.get(tracker, :project_owner_type, ""))) == "user" do
+          {:error, :missing_github_oauth_token}
+        else
+          authorization_token(tracker, opts)
+        end
+    end
+  end
+
   @spec github_auth_available?(map()) :: boolean()
   def github_auth_available?(tracker) when is_map(tracker) do
     match?({:ok, _token}, tracker_api_key(tracker)) or match?({:ok, _, _}, app_credentials())
@@ -195,6 +210,14 @@ defmodule SymphonyElixir.GitHub.Auth do
   end
 
   defp tracker_repo(_), do: {:error, :missing_github_repo}
+
+  defp oauth_token do
+    token =
+      Application.get_env(:symphony_elixir, :github_oauth_token) ||
+        System.get_env("GITHUB_OAUTH_TOKEN")
+
+    if is_binary(token) and String.trim(token) != "", do: {:ok, token}, else: :missing
+  end
 
   defp request(method, url, body, headers, opts) do
     request_fun = Keyword.get(opts, :request_fun, &default_request/4)

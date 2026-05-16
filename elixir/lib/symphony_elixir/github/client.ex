@@ -99,10 +99,6 @@ defmodule SymphonyElixir.GitHub.Client do
             users(first: 20) { nodes { id login } }
             field { ... on ProjectV2FieldCommon { id name } }
           }
-          ... on ProjectV2ItemIssueFieldValue {
-            issue { id number title state url }
-            field { ... on ProjectV2FieldCommon { id name } }
-          }
         }
       }
     }
@@ -1696,7 +1692,9 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp graphql_headers do
-    with {:ok, token} <- Auth.authorization_token(Config.settings!().tracker) do
+    tracker = Config.settings!().tracker
+
+    with {:ok, token} <- graphql_token(tracker) do
       {:ok,
        [
          {"Authorization", "Bearer #{token}"},
@@ -1704,6 +1702,16 @@ defmodule SymphonyElixir.GitHub.Client do
        ]}
     end
   end
+
+  defp graphql_token(%{project_owner_type: owner_type} = tracker) do
+    if String.downcase(to_string(owner_type)) == "user" do
+      Auth.project_authorization_token(tracker)
+    else
+      Auth.authorization_token(tracker)
+    end
+  end
+
+  defp graphql_token(tracker), do: Auth.authorization_token(tracker)
 
   defp post_graphql_request(payload, headers) do
     Req.post(Config.settings!().tracker.endpoint,

@@ -82,6 +82,19 @@ Required environment variable:
 
 The `webhook` task auto-loads `../.env` when present.
 
+## GitHub OAuth For User-Owned Projects
+
+When `tracker.project_owner_type` is `user`, Project v2 GraphQL operations run as the signed-in
+user (OAuth token), while issue/PR/repo automation continues to use app identity.
+
+1. Set callback URL in your GitHub App:
+   - Local: `http://127.0.0.1:4000/auth/github/callback`
+   - Funnel: `https://<your-funnel-host>/auth/github/callback`
+2. Ensure `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` are in `elixir/.env`.
+3. Start Polyphony (`mise run webhook`) and open:
+   - `http://127.0.0.1:4000/auth/github/start`
+4. Complete GitHub auth; callback stores token in runtime memory.
+
 Current auth note:
 
 - Webhook verification uses `GITHUB_WEBHOOK_SECRET`.

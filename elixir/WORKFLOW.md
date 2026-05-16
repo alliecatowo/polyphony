@@ -1,11 +1,12 @@
 ---
 tracker:
   kind: github
-  repo_owner: "your-org"
-  repo_name: "polyphony"
-  project_owner_type: "organization"
-  project_owner_login: "your-org"
-  project_title: "Polyphony"
+  api_key: "$GITHUB_TOKEN"
+  repo_owner: "$GITHUB_REPO_OWNER"
+  repo_name: "$GITHUB_REPO_NAME"
+  project_owner_type: "$GITHUB_PROJECT_OWNER_TYPE"
+  project_owner_login: "$GITHUB_PROJECT_OWNER_LOGIN"
+  project_title: "$GITHUB_PROJECT_TITLE"
   active_states:
     - OPEN
     - In Progress
@@ -62,7 +63,7 @@ workspace:
   root: ~/code/polyphony-workspaces
 hooks:
   after_create: |
-    git clone --depth 1 https://github.com/your-org/polyphony .
+    git clone --depth 1 https://github.com/$GITHUB_REPO_OWNER/$GITHUB_REPO_NAME .
     if command -v mise >/dev/null 2>&1; then
       cd elixir && mise trust && mise exec -- mix deps.get
     fi
