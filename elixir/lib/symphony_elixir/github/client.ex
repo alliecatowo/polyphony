@@ -274,6 +274,19 @@ defmodule SymphonyElixir.GitHub.Client do
   }
   """
 
+  @owner_project_by_number_query """
+  query SymphonyGitHubOwnerProjectByNumber($login: String!, $number: Int!, $isOrg: Boolean!, $isUser: Boolean!) {
+    organization(login: $login) @include(if: $isOrg) {
+      id
+      projectV2(number: $number) { id title url number }
+    }
+    user(login: $login) @include(if: $isUser) {
+      id
+      projectV2(number: $number) { id title url number }
+    }
+  }
+  """
+
   @create_project_query """
   mutation SymphonyGitHubCreateProject($ownerId: ID!, $title: String!) {
     createProjectV2(input: {ownerId: $ownerId, title: $title}) {
@@ -731,6 +744,7 @@ defmodule SymphonyElixir.GitHub.Client do
     owner_login = tracker.project_owner_login || tracker.repo_owner
     owner_type = normalize_owner_type(tracker.project_owner_type)
     project_title = normalized_project_title(tracker.project_title)
+    project_number = parse_project_number(tracker.project_slug)
 
     with {:ok, maybe_repo_project} <- find_repository_project(tracker.repo_owner, tracker.repo_name, project_title) do
       case maybe_repo_project do
@@ -742,6 +756,17 @@ defmodule SymphonyElixir.GitHub.Client do
              owner_id: nil,
              project_id: project_id
            }}
+
+        _ when is_integer(project_number) and project_number > 0 ->
+          with {:ok, project} <- find_owner_project_by_number(owner_login, owner_type, project_number) do
+            {:ok,
+             %{
+               owner_login: owner_login,
+               owner_type: owner_type,
+               owner_id: nil,
+               project_id: project["id"]
+             }}
+          end
 
         _ ->
           with {:ok, body} <-
@@ -794,6 +819,22 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp find_repository_project(_owner, _repo, _project_title), do: {:ok, nil}
+
+  defp find_owner_project_by_number(owner_login, owner_type, number)
+       when is_binary(owner_login) and owner_login != "" and is_integer(number) and number > 0 do
+    with {:ok, body} <-
+           graphql(@owner_project_by_number_query, %{
+             login: owner_login,
+             number: number,
+             isOrg: owner_type == "organization",
+             isUser: owner_type == "user"
+           }),
+         {:ok, project} <- extract_owner_project_node(body, owner_type) do
+      {:ok, project}
+    end
+  end
+
+  defp find_owner_project_by_number(_owner_login, _owner_type, _number), do: {:error, :github_project_not_found}
 
   defp create_project_permission_error?(errors) when is_list(errors) do
     Enum.any?(errors, fn error ->
@@ -2178,6 +2219,15 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp normalized_project_title(_), do: "Polyphony"
 
+  defp parse_project_number(value) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {number, ""} when number > 0 -> number
+      _ -> nil
+    end
+  end
+
+  defp parse_project_number(_value), do: nil
+
   defp extract_owner_node(body, "organization") do
     case get_in(body, ["data", "organization"]) do
       %{"id" => _} = org -> {:ok, org}
@@ -2189,6 +2239,20 @@ defmodule SymphonyElixir.GitHub.Client do
     case get_in(body, ["data", "user"]) do
       %{"id" => _} = user -> {:ok, user}
       _ -> {:error, :github_owner_not_found}
+    end
+  end
+
+  defp extract_owner_project_node(body, "organization") do
+    case get_in(body, ["data", "organization", "projectV2"]) do
+      %{"id" => _} = project -> {:ok, project}
+      _ -> {:error, :github_project_not_found}
+    end
+  end
+
+  defp extract_owner_project_node(body, "user") do
+    case get_in(body, ["data", "user", "projectV2"]) do
+      %{"id" => _} = project -> {:ok, project}
+      _ -> {:error, :github_project_not_found}
     end
   end
 

@@ -441,10 +441,30 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp github_tracker_url(%{repo_owner: owner, repo_name: name})
        when is_binary(owner) and owner != "" and is_binary(name) and name != "" do
-    "https://github.com/#{owner}/#{name}/issues"
+    tracker = Config.settings!().tracker
+    project_url_from_tracker(tracker) || "https://github.com/#{owner}/#{name}/issues"
   end
 
   defp github_tracker_url(_tracker), do: nil
+
+  defp project_url_from_tracker(%{project_owner_type: owner_type, project_owner_login: owner_login, project_slug: slug})
+       when is_binary(owner_type) and is_binary(owner_login) and is_binary(slug) do
+    owner_login = String.trim(owner_login)
+    slug = String.trim(slug)
+
+    cond do
+      owner_login == "" or slug == "" ->
+        nil
+
+      String.downcase(String.trim(owner_type)) == "user" ->
+        "https://github.com/users/#{owner_login}/projects/#{slug}"
+
+      true ->
+        "https://github.com/orgs/#{owner_login}/projects/#{slug}"
+    end
+  end
+
+  defp project_url_from_tracker(_tracker), do: nil
 
   defp dashboard_url do
     dashboard_url(Config.settings!().server.host, Config.server_port(), HttpServer.bound_port())

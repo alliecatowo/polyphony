@@ -539,6 +539,7 @@ defmodule SymphonyElixir.Config.Schema do
           ),
         kind: resolve_tracker_string_setting(settings.tracker.kind),
         endpoint: normalize_tracker_endpoint(settings.tracker.kind, settings.tracker.endpoint),
+        project_slug: resolve_tracker_string_setting(settings.tracker.project_slug),
         repo_owner: resolve_tracker_string_setting(settings.tracker.repo_owner),
         repo_name: resolve_tracker_string_setting(settings.tracker.repo_name),
         project_title: resolve_tracker_string_setting(settings.tracker.project_title),
@@ -659,9 +660,15 @@ defmodule SymphonyElixir.Config.Schema do
   defp normalize_secret_value(_value), do: nil
 
   defp resolve_tracker_string_setting(value) when is_binary(value) do
-    case resolve_env_value(value, value) do
-      resolved when is_binary(resolved) -> resolved
-      _ -> value
+    case env_reference_name(value) do
+      {:ok, _env_name} ->
+        case resolve_env_value(value, nil) do
+          resolved when is_binary(resolved) -> resolved
+          _ -> nil
+        end
+
+      :error ->
+        value
     end
   end
 

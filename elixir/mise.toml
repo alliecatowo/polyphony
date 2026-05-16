@@ -13,3 +13,11 @@ run = "set -a; . ./.env; set +a; tailscale funnel --https=443 http://127.0.0.1:$
 [tasks.funnel-stop]
 description = "Disable Tailscale Funnel on HTTPS 443"
 run = "tailscale funnel --https=443 off"
+
+[tasks.oauth-start]
+description = "Open GitHub OAuth authorization start URL for local Polyphony"
+run = "url=${GITHUB_OAUTH_START_URL:-http://127.0.0.1:4000/auth/github/start}; (command -v xdg-open >/dev/null 2>&1 && xdg-open \"$url\") || (command -v open >/dev/null 2>&1 && open \"$url\") || echo \"$url\""
+
+[tasks.webhook-auth]
+description = "Start Polyphony webhook server and automatically open GitHub OAuth auth page"
+run = "set -a; . ./.env; set +a; (mix run --no-halt &) ; pid=$!; sleep 2; url=${GITHUB_OAUTH_START_URL:-http://127.0.0.1:4000/auth/github/start}; (command -v xdg-open >/dev/null 2>&1 && xdg-open \"$url\") || (command -v open >/dev/null 2>&1 && open \"$url\") || echo \"$url\"; wait $pid"

@@ -2,6 +2,7 @@
 tracker:
   kind: github
   api_key: "$GITHUB_TOKEN"
+  project_slug: "$GITHUB_PROJECT_NUMBER"
   repo_owner: "$GITHUB_REPO_OWNER"
   repo_name: "$GITHUB_REPO_NAME"
   project_owner_type: "$GITHUB_PROJECT_OWNER_TYPE"
@@ -82,6 +83,9 @@ codex:
   thread_sandbox: workspace-write
   turn_sandbox_policy:
     type: workspaceWrite
+server:
+  host: "127.0.0.1"
+  port: 4000
 ---
 
 You are working on a GitHub issue `{{ issue.identifier }}`

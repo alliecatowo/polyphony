@@ -95,6 +95,26 @@ user (OAuth token), while issue/PR/repo automation continues to use app identity
    - `http://127.0.0.1:4000/auth/github/start`
 4. Complete GitHub auth; callback stores token in runtime memory.
 
+### Required `elixir/.env` (User-Owned Projects)
+
+- `GITHUB_APP_ID`
+- `GITHUB_PRIVATE_KEY`
+- `GITHUB_CLIENT_ID`
+- `GITHUB_CLIENT_SECRET`
+- `GITHUB_WEBHOOK_SECRET`
+- `GITHUB_REPO_OWNER`
+- `GITHUB_REPO_NAME`
+- `GITHUB_PROJECT_OWNER_TYPE=user`
+- `GITHUB_PROJECT_OWNER_LOGIN`
+- `GITHUB_PROJECT_NUMBER` (for URL like `/users/<login>/projects/<number>`)
+- `GITHUB_PROJECT_TITLE`
+
+### One-Pass Flow
+
+1. `cd elixir && mise run webhook`
+2. `cd elixir && mise run oauth-start`
+3. `cd elixir && mise run funnel` (optional for remote callback/webhooks)
+
 Current auth note:
 
 - Webhook verification uses `GITHUB_WEBHOOK_SECRET`.
