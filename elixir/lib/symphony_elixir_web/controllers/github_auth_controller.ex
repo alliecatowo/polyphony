@@ -7,6 +7,7 @@ defmodule SymphonyElixirWeb.GitHubAuthController do
   def start(conn, _params) do
     with {:ok, client_id} <- env("GITHUB_CLIENT_ID"),
          {:ok, callback_url} <- callback_url(conn),
+         scopes <- oauth_scopes(),
          state <- random_state(),
          :ok <- put_state(state) do
       authorize_url =
@@ -17,7 +18,8 @@ defmodule SymphonyElixirWeb.GitHubAuthController do
           query: URI.encode_query(%{
             "client_id" => client_id,
             "redirect_uri" => callback_url,
-            "state" => state
+            "state" => state,
+            "scope" => scopes
           })
         })
 
@@ -36,20 +38,31 @@ defmodule SymphonyElixirWeb.GitHubAuthController do
          {:ok, token} <- exchange_code(client_id, client_secret, code, callback_url),
          {:ok, login} <- fetch_user_login(token) do
       Application.put_env(:symphony_elixir, :github_oauth_token, token)
-
-      json(conn, %{
-        "ok" => true,
-        "message" => "GitHub OAuth token stored for project operations",
-        "login" => login
-      })
+      redirect(conn, to: "/?oauth=ok&login=#{URI.encode(login)}")
     else
       {:error, reason} ->
-        conn |> put_status(400) |> json(%{"error" => reason})
+        redirect(conn, to: "/?oauth=error&reason=#{URI.encode(to_string(reason))}")
     end
   end
 
   def callback(conn, _params) do
     conn |> put_status(400) |> json(%{"error" => "Missing code/state"})
+  end
+
+  def status(conn, _params) do
+    case oauth_token() do
+      nil ->
+        json(conn, %{"authorized" => false, "reason" => "missing_oauth_token"})
+
+      token ->
+        case fetch_user_login(token) do
+          {:ok, login} ->
+            json(conn, %{"authorized" => true, "login" => login})
+
+          {:error, reason} ->
+            json(conn, %{"authorized" => false, "reason" => reason})
+        end
+    end
   end
 
   defp exchange_code(client_id, client_secret, code, callback_url) do
@@ -108,6 +121,18 @@ defmodule SymphonyElixirWeb.GitHubAuthController do
       value when is_binary(value) and value != "" -> {:ok, value}
       _ -> {:error, "Missing #{name} in environment"}
     end
+  end
+
+  defp oauth_scopes do
+    case System.get_env("GITHUB_OAUTH_SCOPES") do
+      scopes when is_binary(scopes) and scopes != "" -> scopes
+      _ -> "project,read:project,repo"
+    end
+  end
+
+  defp oauth_token do
+    Application.get_env(:symphony_elixir, :github_oauth_token) ||
+      System.get_env("GITHUB_OAUTH_TOKEN")
   end
 
   defp random_state do

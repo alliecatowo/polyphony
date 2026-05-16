@@ -30,6 +30,7 @@ defmodule SymphonyElixirWeb.Router do
   scope "/", SymphonyElixirWeb do
     get("/auth/github/start", GitHubAuthController, :start)
     get("/auth/github/callback", GitHubAuthController, :callback)
+    get("/auth/github/status", GitHubAuthController, :status)
     post("/github/webhook", GitHubWebhookController, :receive)
 
     get("/api/v1/state", ObservabilityApiController, :state)

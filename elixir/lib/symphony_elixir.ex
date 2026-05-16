@@ -18,6 +18,7 @@ defmodule SymphonyElixir.Application do
   """
 
   use Application
+  alias SymphonyElixir.GitHub.OAuthBootstrap
 
   @impl true
   def start(_type, _args) do
@@ -32,11 +33,18 @@ defmodule SymphonyElixir.Application do
       SymphonyElixir.StatusDashboard
     ]
 
-    Supervisor.start_link(
+    case Supervisor.start_link(
       children,
       strategy: :one_for_one,
       name: SymphonyElixir.Supervisor
-    )
+    ) do
+      {:ok, pid} = result ->
+        _ = OAuthBootstrap.maybe_open_browser()
+        result
+
+      other ->
+        other
+    end
   end
 
   @impl true
