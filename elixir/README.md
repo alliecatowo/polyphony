@@ -41,9 +41,10 @@ without leaving GitHub.
 
 ```bash
 git clone https://github.com/your-org/polyphony
-cd polyphony/elixir
+cd polyphony
 mise trust
 mise install
+cd elixir
 mise exec -- mix setup
 mise exec -- mix build
 mise exec -- ./bin/symphony ./WORKFLOW.md
@@ -54,21 +55,21 @@ mise exec -- ./bin/symphony ./WORKFLOW.md
 If you run a private GitHub App with a local tunnel/Funnel, start the webhook receiver with:
 
 ```bash
-cd elixir
+cd polyphony
 mise run webhook
 ```
 
 Expose it publicly with Tailscale Funnel:
 
 ```bash
-cd elixir
+cd polyphony
 mise run funnel
 ```
 
 Turn Funnel back off:
 
 ```bash
-cd elixir
+cd polyphony
 mise run funnel-stop
 ```
 
@@ -90,17 +91,21 @@ user (OAuth token), while issue/PR/repo automation continues to use app identity
 1. Set callback URL in your GitHub App:
    - Local: `http://127.0.0.1:4000/auth/github/callback`
    - Funnel: `https://<your-funnel-host>/auth/github/callback`
-2. Ensure `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` are in `elixir/.env`.
+2. Ensure `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` are in repo-root `.env`.
+   - Set one of:
+     - `GITHUB_OAUTH_CALLBACK_URL=https://<your-funnel-host>/auth/github/callback` (exact match to app settings)
+     - `WEBHOOK_PUBLIC_BASE_URL=https://<your-funnel-host>` (Polyphony derives callback path)
 3. Start Polyphony (`mise run webhook`) and open:
    - `http://127.0.0.1:4000/auth/github/start`
 4. Complete GitHub auth; callback stores token in runtime memory.
 
-### Required `elixir/.env` (User-Owned Projects)
+### Required `.env` (User-Owned Projects)
 
 - `GITHUB_APP_ID`
 - `GITHUB_PRIVATE_KEY`
 - `GITHUB_CLIENT_ID`
 - `GITHUB_CLIENT_SECRET`
+- `GITHUB_OAUTH_CALLBACK_URL` (recommended for funnel setups)
 - `GITHUB_WEBHOOK_SECRET`
 - `GITHUB_REPO_OWNER`
 - `GITHUB_REPO_NAME`
@@ -108,12 +113,15 @@ user (OAuth token), while issue/PR/repo automation continues to use app identity
 - `GITHUB_PROJECT_OWNER_LOGIN`
 - `GITHUB_PROJECT_NUMBER` (for URL like `/users/<login>/projects/<number>`)
 - `GITHUB_PROJECT_TITLE`
+- `GITHUB_PROJECTS_PAT` (recommended: PAT used only for Projects v2 GraphQL when user-owned projects block app user tokens)
+
+`GITHUB_PROJECTS_PAT` is used only for project-surface GraphQL calls. Issue/PR/repo operations continue to run via GitHub App identity.
 
 ### One-Pass Flow
 
-1. `cd elixir && mise run webhook`
-2. `cd elixir && mise run oauth-start`
-3. `cd elixir && mise run funnel` (optional for remote callback/webhooks)
+1. `cd polyphony && mise run webhook`
+2. `cd polyphony && mise run oauth-start`
+3. `cd polyphony && mise run funnel` (optional for remote callback/webhooks)
 
 Current auth note:
 

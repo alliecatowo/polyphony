@@ -4,11 +4,15 @@ elixir = "1.19.5-otp-28"
 
 [tasks.webhook]
 description = "Start local Polyphony server with GitHub webhook endpoint at /github/webhook"
-run = "set -a; . ./.env; set +a; mix run --no-halt"
+run = "set -a; [ -f ../.env ] && . ../.env; [ -f ./.env ] && . ./.env; set +a; export GITHUB_TOKEN=${GITHUB_TOKEN:-$GITHUB_PROJECTS_PAT}; echo \"[webhook] env loaded\"; echo \"[webhook] WEBHOOK_PORT=${WEBHOOK_PORT:-4000}\"; echo \"[webhook] GITHUB_REPO=${GITHUB_REPO_OWNER:-?}/${GITHUB_REPO_NAME:-?}\"; echo \"[webhook] PROJECT=${GITHUB_PROJECT_OWNER_LOGIN:-?}/${GITHUB_PROJECT_NUMBER:-?}\"; echo \"[webhook] starting foreground server\"; exec mix run --no-halt"
+
+[tasks.webhook-stop]
+description = "Stop local Polyphony webhook server by freeing WEBHOOK_PORT (default 4000)"
+run = "port=${WEBHOOK_PORT:-4000}; pids=$(lsof -tiTCP:${port} -sTCP:LISTEN 2>/dev/null || true); if [ -n \"$pids\" ]; then echo \"[webhook-stop] killing pids on ${port}: $pids\"; kill $pids || true; else echo \"[webhook-stop] nothing listening on ${port}\"; fi"
 
 [tasks.funnel]
 description = "Expose local webhook server to the public internet via Tailscale Funnel"
-run = "set -a; . ./.env; set +a; tailscale funnel --https=443 http://127.0.0.1:${WEBHOOK_PORT:-4000}"
+run = "set -a; [ -f ../.env ] && . ../.env; [ -f ./.env ] && . ./.env; set +a; tailscale funnel --https=443 http://127.0.0.1:${WEBHOOK_PORT:-4000}"
 
 [tasks.funnel-stop]
 description = "Disable Tailscale Funnel on HTTPS 443"
@@ -16,8 +20,8 @@ run = "tailscale funnel --https=443 off"
 
 [tasks.oauth-start]
 description = "Open GitHub OAuth authorization start URL for local Polyphony"
-run = "url=${GITHUB_OAUTH_START_URL:-http://127.0.0.1:4000/auth/github/start}; (command -v xdg-open >/dev/null 2>&1 && xdg-open \"$url\") || (command -v open >/dev/null 2>&1 && open \"$url\") || echo \"$url\""
+run = "set -a; [ -f ../.env ] && . ../.env; [ -f ./.env ] && . ./.env; set +a; url=${GITHUB_OAUTH_START_URL:-http://127.0.0.1:4000/auth/github/start}; (command -v xdg-open >/dev/null 2>&1 && xdg-open \"$url\") || (command -v open >/dev/null 2>&1 && open \"$url\") || echo \"$url\""
 
 [tasks.webhook-auth]
 description = "Start Polyphony webhook server and automatically open GitHub OAuth auth page"
-run = "set -a; . ./.env; set +a; (mix run --no-halt &) ; pid=$!; sleep 2; url=${GITHUB_OAUTH_START_URL:-http://127.0.0.1:4000/auth/github/start}; (command -v xdg-open >/dev/null 2>&1 && xdg-open \"$url\") || (command -v open >/dev/null 2>&1 && open \"$url\") || echo \"$url\"; wait $pid"
+run = "echo 'Use `mise run webhook` in one terminal, then `mise run oauth-start` in another. webhook-auth is disabled to prevent duplicate runtime processes.' && exit 1"

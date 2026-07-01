@@ -58,6 +58,6 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   end
 
   defp snapshot_timeout_ms do
-    Endpoint.config(:snapshot_timeout_ms) || 15_000
+    Endpoint.config(:snapshot_timeout_ms) || 250
   end
 end

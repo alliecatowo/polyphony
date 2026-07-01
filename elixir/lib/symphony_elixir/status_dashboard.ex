@@ -53,7 +53,9 @@ defmodule SymphonyElixir.StatusDashboard do
     :last_rendered_at_ms,
     :pending_content,
     :flush_timer_ref,
-    :last_snapshot_fingerprint
+    :last_snapshot_fingerprint,
+    :last_snapshot_data,
+    :refresh_pending
   ]
 
   @type t :: %__MODULE__{
@@ -71,7 +73,9 @@ defmodule SymphonyElixir.StatusDashboard do
           last_rendered_at_ms: integer() | nil,
           pending_content: String.t() | nil,
           flush_timer_ref: reference() | nil,
-          last_snapshot_fingerprint: term() | nil
+          last_snapshot_fingerprint: term() | nil,
+          last_snapshot_data: map() | nil,
+          refresh_pending: boolean()
         }
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -122,7 +126,9 @@ defmodule SymphonyElixir.StatusDashboard do
        last_rendered_at_ms: nil,
        pending_content: nil,
        flush_timer_ref: nil,
-       last_snapshot_fingerprint: nil
+       last_snapshot_fingerprint: nil,
+       last_snapshot_data: nil,
+       refresh_pending: false
      }}
   end
 
@@ -147,12 +153,12 @@ defmodule SymphonyElixir.StatusDashboard do
   @spec handle_info(term(), t()) :: {:noreply, t()}
   def handle_info(:tick, %{enabled: true} = state) do
     state = refresh_runtime_config(state)
-    state = maybe_render(state)
+    state = maybe_render(%{state | refresh_pending: false})
     schedule_tick(state.refresh_ms, true)
     {:noreply, state}
   end
 
-  def handle_info(:refresh, %{enabled: true} = state), do: {:noreply, maybe_render(refresh_runtime_config(state))}
+  def handle_info(:refresh, %{enabled: true} = state), do: {:noreply, %{state | refresh_pending: true}}
   def handle_info(:refresh, state), do: {:noreply, state}
 
   def handle_info({:flush_render, timer_ref}, %{enabled: true, flush_timer_ref: timer_ref} = state) do
@@ -192,8 +198,12 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp maybe_render(state) do
     now_ms = System.monotonic_time(:millisecond)
-    {snapshot_data, token_samples} = snapshot_with_samples(state.token_samples, now_ms)
-    state = Map.put(state, :token_samples, token_samples)
+    {snapshot_data, token_samples, last_snapshot_data} = snapshot_with_samples(state, now_ms)
+
+    state =
+      state
+      |> Map.put(:token_samples, token_samples)
+      |> Map.put(:last_snapshot_data, last_snapshot_data)
 
     current_tokens = snapshot_total_tokens(snapshot_data)
 
@@ -305,8 +315,8 @@ defmodule SymphonyElixir.StatusDashboard do
       %{state | pending_content: nil, flush_timer_ref: nil}
   end
 
-  defp snapshot_with_samples(token_samples, now_ms) do
-    case snapshot_payload() do
+  defp snapshot_with_samples(state, now_ms) do
+    case snapshot_payload(state.last_snapshot_data) do
       {:ok, %{running: running, retrying: retrying, codex_totals: codex_totals} = snapshot} ->
         total_tokens = Map.get(codex_totals, :total_tokens, 0)
 
@@ -319,14 +329,14 @@ defmodule SymphonyElixir.StatusDashboard do
              rate_limits: Map.get(snapshot, :rate_limits),
              polling: Map.get(snapshot, :polling)
            }},
-          update_token_samples(token_samples, now_ms, total_tokens)
+          update_token_samples(state.token_samples, now_ms, total_tokens),
+          snapshot
         }
 
-      :error ->
-        {
-          :error,
-          prune_samples(token_samples, now_ms)
-        }
+      other ->
+        Logger.warning("Unexpected snapshot payload shape: #{inspect(other)}")
+        snapshot = state.last_snapshot_data || degraded_snapshot()
+        {{:ok, snapshot}, prune_samples(state.token_samples, now_ms), state.last_snapshot_data}
     end
   end
 
@@ -378,17 +388,6 @@ defmodule SymphonyElixir.StatusDashboard do
         |> List.flatten()
         |> Enum.join("\n")
 
-      :error ->
-        [
-          colorize("╭─ SYMPHONY STATUS", @ansi_bold),
-          colorize("│ Orchestrator snapshot unavailable", @ansi_red),
-          colorize("│ Throughput: ", @ansi_bold) <> colorize("#{format_tps(tps)} tps", @ansi_cyan),
-          format_project_link_lines(),
-          format_project_refresh_line(nil),
-          closing_border()
-        ]
-        |> List.flatten()
-        |> Enum.join("\n")
     end
   end
 
@@ -419,8 +418,14 @@ defmodule SymphonyElixir.StatusDashboard do
     end
   end
 
+  defp format_project_refresh_line(%{checking?: true, checking_for_ms: checking_for_ms})
+       when is_integer(checking_for_ms) do
+    seconds = div(max(checking_for_ms, 0), 1000)
+    colorize("│ Next refresh: ", @ansi_bold) <> colorize("checking now… #{seconds}s", @ansi_cyan)
+  end
+
   defp format_project_refresh_line(%{checking?: true}) do
-    colorize("│ Next refresh: ", @ansi_bold) <> colorize("checking now…", @ansi_cyan)
+    colorize("│ Next refresh: ", @ansi_bold) <> colorize("checking now… 0s", @ansi_cyan)
   end
 
   defp format_project_refresh_line(%{next_poll_in_ms: due_in_ms}) when is_integer(due_in_ms) do
@@ -584,30 +589,42 @@ defmodule SymphonyElixir.StatusDashboard do
   def dashboard_url_for_test(host, configured_port, bound_port),
     do: dashboard_url(host, configured_port, bound_port)
 
-  defp snapshot_payload do
-    if Process.whereis(Orchestrator) do
-      case Orchestrator.snapshot() do
-        %{
-          running: running,
-          retrying: retrying,
-          codex_totals: codex_totals
-        } = snapshot
-        when is_list(running) and is_list(retrying) ->
-          {:ok,
-           %{
-             running: running,
-             retrying: retrying,
-             codex_totals: codex_totals,
-             rate_limits: Map.get(snapshot, :rate_limits),
-             polling: Map.get(snapshot, :polling)
-           }}
+  defp snapshot_payload(last_snapshot_data) do
+    case Orchestrator.snapshot(Orchestrator, 250) do
+      %{
+        running: running,
+        retrying: retrying,
+        codex_totals: codex_totals
+      } = snapshot
+      when is_list(running) and is_list(retrying) ->
+        {:ok,
+         %{
+           running: running,
+           retrying: retrying,
+           codex_totals: codex_totals,
+           rate_limits: Map.get(snapshot, :rate_limits),
+           polling: Map.get(snapshot, :polling)
+         }}
 
-        _ ->
-          :error
-      end
-    else
-      :error
+      :timeout ->
+        {:ok, last_snapshot_data || degraded_snapshot()}
+
+      :unavailable ->
+        {:ok, last_snapshot_data || degraded_snapshot()}
+
+      _ ->
+        {:ok, last_snapshot_data || degraded_snapshot()}
     end
+  end
+
+  defp degraded_snapshot do
+    %{
+      running: [],
+      retrying: [],
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      rate_limits: nil,
+      polling: %{checking?: false, next_poll_in_ms: nil, poll_interval_ms: nil}
+    }
   end
 
   defp format_running_rows(running, running_event_width) do
@@ -1142,6 +1159,7 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp humanize_codex_event(:turn_input_required, _message, _payload), do: "turn blocked: waiting for user input"
+  defp humanize_codex_event(:elicitation_requested, _message, _payload), do: "mcp elicitation requested"
 
   defp humanize_codex_event(:approval_auto_approved, message, payload) do
     method =

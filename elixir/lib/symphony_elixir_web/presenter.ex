@@ -4,14 +4,16 @@ defmodule SymphonyElixirWeb.Presenter do
   """
 
   alias SymphonyElixir.{Config, Orchestrator, StatusDashboard}
+  @snapshot_cache_key {__MODULE__, :last_state_payload}
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
     generated_at = DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+    effective_timeout_ms = snapshot_timeout_ms
 
-    case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
+    case Orchestrator.snapshot(orchestrator, effective_timeout_ms) do
       %{} = snapshot ->
-        %{
+        payload = %{
           generated_at: generated_at,
           counts: %{
             running: length(snapshot.running),
@@ -20,20 +22,47 @@ defmodule SymphonyElixirWeb.Presenter do
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           codex_totals: snapshot.codex_totals,
-          rate_limits: snapshot.rate_limits
+          rate_limits: snapshot.rate_limits,
+          polling: Map.get(snapshot, :polling)
         }
+        put_cached_payload(payload)
+        payload
 
       :timeout ->
-        %{generated_at: generated_at, error: %{code: "snapshot_timeout", message: "Snapshot timed out"}}
+        stale_or_error_payload(generated_at, "snapshot_timeout", "Snapshot timed out")
 
       :unavailable ->
-        %{generated_at: generated_at, error: %{code: "snapshot_unavailable", message: "Snapshot unavailable"}}
+        stale_or_error_payload(generated_at, "snapshot_unavailable", "Snapshot unavailable")
     end
+  end
+
+  defp stale_or_error_payload(generated_at, code, message) do
+    case get_cached_payload() do
+      %{} = cached ->
+        cached
+        |> Map.put(:generated_at, generated_at)
+        |> Map.put(:stale, true)
+        |> Map.put(:warning, %{code: code, message: message})
+
+      _ ->
+        %{generated_at: generated_at, error: %{code: code, message: message}}
+    end
+  end
+
+  defp put_cached_payload(payload) when is_map(payload) do
+    :persistent_term.put(@snapshot_cache_key, payload)
+    :ok
+  end
+
+  defp get_cached_payload do
+    :persistent_term.get(@snapshot_cache_key, nil)
   end
 
   @spec issue_payload(String.t(), GenServer.name(), timeout()) :: {:ok, map()} | {:error, :issue_not_found}
   def issue_payload(issue_identifier, orchestrator, snapshot_timeout_ms) when is_binary(issue_identifier) do
-    case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
+    effective_timeout_ms = snapshot_timeout_ms
+
+    case Orchestrator.snapshot(orchestrator, effective_timeout_ms) do
       %{} = snapshot ->
         running = Enum.find(snapshot.running, &(&1.identifier == issue_identifier))
         retry = Enum.find(snapshot.retrying, &(&1.identifier == issue_identifier))

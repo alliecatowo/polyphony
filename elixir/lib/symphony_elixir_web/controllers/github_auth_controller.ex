@@ -1,6 +1,8 @@
 defmodule SymphonyElixirWeb.GitHubAuthController do
   use Phoenix.Controller, formats: [:json]
 
+  alias SymphonyElixir.GitHub.OAuthTokenStore
+
   @state_table :symphony_github_oauth_state
   @state_ttl_seconds 600
 
@@ -38,6 +40,7 @@ defmodule SymphonyElixirWeb.GitHubAuthController do
          {:ok, token} <- exchange_code(client_id, client_secret, code, callback_url),
          {:ok, login} <- fetch_user_login(token) do
       Application.put_env(:symphony_elixir, :github_oauth_token, token)
+      _ = OAuthTokenStore.save(token)
       redirect(conn, to: "/?oauth=ok&login=#{URI.encode(login)}")
     else
       {:error, reason} ->
@@ -101,18 +104,24 @@ defmodule SymphonyElixirWeb.GitHubAuthController do
   end
 
   defp callback_url(conn) do
-    case System.get_env("GITHUB_OAUTH_CALLBACK_URL") do
-      url when is_binary(url) and url != "" ->
-        {:ok, url}
+    case env_trimmed("GITHUB_OAUTH_CALLBACK_URL") do
+      callback when is_binary(callback) ->
+        {:ok, callback}
 
-      _ ->
-        {:ok,
-         URI.to_string(%URI{
-           scheme: to_string(conn.scheme),
-           host: conn.host,
-           port: conn.port,
-           path: "/auth/github/callback"
-         })}
+      nil ->
+        case env_trimmed("WEBHOOK_PUBLIC_BASE_URL") do
+          base_url when is_binary(base_url) ->
+            {:ok, "#{String.trim_trailing(base_url, "/")}/auth/github/callback"}
+
+          nil ->
+            {:ok,
+             URI.to_string(%URI{
+               scheme: to_string(conn.scheme),
+               host: conn.host,
+               port: conn.port,
+               path: "/auth/github/callback"
+             })}
+        end
     end
   end
 
@@ -120,6 +129,17 @@ defmodule SymphonyElixirWeb.GitHubAuthController do
     case System.get_env(name) do
       value when is_binary(value) and value != "" -> {:ok, value}
       _ -> {:error, "Missing #{name} in environment"}
+    end
+  end
+
+  defp env_trimmed(name) do
+    case System.get_env(name) do
+      value when is_binary(value) ->
+        trimmed = String.trim(value)
+        if trimmed == "", do: nil, else: trimmed
+
+      _ ->
+        nil
     end
   end
 
@@ -132,7 +152,8 @@ defmodule SymphonyElixirWeb.GitHubAuthController do
 
   defp oauth_token do
     Application.get_env(:symphony_elixir, :github_oauth_token) ||
-      System.get_env("GITHUB_OAUTH_TOKEN")
+      System.get_env("GITHUB_OAUTH_TOKEN") ||
+      OAuthTokenStore.load()
   end
 
   defp random_state do

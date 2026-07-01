@@ -7,6 +7,7 @@ defmodule SymphonyElixir.HttpServer do
   alias SymphonyElixirWeb.Endpoint
 
   @secret_key_bytes 48
+  @secret_file ".symphony_secret_key_base"
 
   @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do
@@ -22,7 +23,7 @@ defmodule SymphonyElixir.HttpServer do
       port when is_integer(port) and port >= 0 ->
         host = Keyword.get(opts, :host, Config.settings!().server.host)
         orchestrator = Keyword.get(opts, :orchestrator, Orchestrator)
-        snapshot_timeout_ms = Keyword.get(opts, :snapshot_timeout_ms, 15_000)
+        snapshot_timeout_ms = Keyword.get(opts, :snapshot_timeout_ms, 250)
 
         with {:ok, ip} <- parse_host(host) do
           endpoint_opts = [
@@ -83,6 +84,34 @@ defmodule SymphonyElixir.HttpServer do
   defp normalize_host(host), do: to_string(host)
 
   defp secret_key_base do
-    Base.encode64(:crypto.strong_rand_bytes(@secret_key_bytes), padding: false)
+    case System.get_env("SECRET_KEY_BASE") do
+      value when is_binary(value) and value != "" ->
+        value
+
+      _ ->
+        ensure_persisted_secret_key_base()
+    end
+  end
+
+  defp ensure_persisted_secret_key_base do
+    case File.read(@secret_file) do
+      {:ok, contents} ->
+        key = String.trim(contents)
+
+        if key == "" do
+          generate_and_store_secret_key_base()
+        else
+          key
+        end
+
+      {:error, _reason} ->
+        generate_and_store_secret_key_base()
+    end
+  end
+
+  defp generate_and_store_secret_key_base do
+    key = Base.encode64(:crypto.strong_rand_bytes(@secret_key_bytes), padding: false)
+    _ = File.write(@secret_file, key <> "\n")
+    key
   end
 end

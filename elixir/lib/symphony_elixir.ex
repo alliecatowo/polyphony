@@ -19,10 +19,12 @@ defmodule SymphonyElixir.Application do
 
   use Application
   alias SymphonyElixir.GitHub.OAuthBootstrap
+  alias SymphonyElixir.StartupDiagnostics
 
   @impl true
   def start(_type, _args) do
     :ok = SymphonyElixir.LogFile.configure()
+    :ok = StartupDiagnostics.log_preflight()
 
     children = [
       {Phoenix.PubSub, name: SymphonyElixir.PubSub},
@@ -35,10 +37,10 @@ defmodule SymphonyElixir.Application do
 
     case Supervisor.start_link(
       children,
-      strategy: :one_for_one,
+      strategy: :rest_for_one,
       name: SymphonyElixir.Supervisor
     ) do
-      {:ok, pid} = result ->
+      {:ok, _supervisor_pid} = result ->
         _ = OAuthBootstrap.maybe_open_browser()
         result
 

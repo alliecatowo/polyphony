@@ -1,7 +1,7 @@
 ---
 tracker:
   kind: github
-  api_key: "$GITHUB_TOKEN"
+  api_key: "$GITHUB_PROJECTS_PAT"
   project_slug: "$GITHUB_PROJECT_NUMBER"
   repo_owner: "$GITHUB_REPO_OWNER"
   repo_name: "$GITHUB_REPO_NAME"
@@ -65,24 +65,34 @@ workspace:
 hooks:
   after_create: |
     git clone --depth 1 https://github.com/$GITHUB_REPO_OWNER/$GITHUB_REPO_NAME .
-    if command -v mise >/dev/null 2>&1; then
+    if [ -d elixir ] && command -v mise >/dev/null 2>&1; then
       cd elixir && mise trust && mise exec -- mix deps.get
     fi
   before_run: |
-    ./elixir/scripts/polyphony_issue_artifacts.sh before_run
+    if [ -x ./elixir/scripts/polyphony_issue_artifacts.sh ]; then
+      ./elixir/scripts/polyphony_issue_artifacts.sh before_run
+    fi
   after_run: |
-    ./elixir/scripts/polyphony_issue_artifacts.sh after_run
+    if [ -x ./elixir/scripts/polyphony_issue_artifacts.sh ]; then
+      ./elixir/scripts/polyphony_issue_artifacts.sh after_run
+    fi
   before_remove: |
-    cd elixir && mise exec -- mix workspace.before_remove
+    if [ -d elixir ] && command -v mise >/dev/null 2>&1; then
+      cd elixir && mise exec -- mix workspace.before_remove
+    fi
 agent:
   max_concurrent_agents: 10
   max_turns: 20
 codex:
-  command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
+  command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=high app-server
   approval_policy: never
   thread_sandbox: workspace-write
   turn_sandbox_policy:
     type: workspaceWrite
+  read_timeout_ms: 30000
+  startup_timeout_ms: 120000
+  stall_timeout_ms: 600000
+  turn_timeout_ms: 7200000
 server:
   host: "127.0.0.1"
   port: 4000

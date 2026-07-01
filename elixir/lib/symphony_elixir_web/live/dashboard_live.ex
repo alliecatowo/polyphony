@@ -258,7 +258,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp snapshot_timeout_ms do
-    Endpoint.config(:snapshot_timeout_ms) || 15_000
+    Endpoint.config(:snapshot_timeout_ms) || 1_000
   end
 
   defp completed_runtime_seconds(payload) do

@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.GitHub.Auth do
   @moduledoc false
 
+  alias SymphonyElixir.GitHub.OAuthTokenStore
+
   @cache_table :symphony_github_app_auth_cache
   @token_expiry_buffer_seconds 60
   @jwt_backdate_seconds 60
@@ -37,6 +39,16 @@ defmodule SymphonyElixir.GitHub.Auth do
 
   @spec project_authorization_token(map(), keyword()) :: {:ok, String.t()} | {:error, term()}
   def project_authorization_token(tracker, opts \\ []) when is_map(tracker) do
+    case projects_pat_token() do
+      {:ok, token} ->
+        {:ok, token}
+
+      :missing ->
+        project_authorization_token_without_pat(tracker, opts)
+    end
+  end
+
+  defp project_authorization_token_without_pat(tracker, opts) do
     case oauth_token() do
       {:ok, token} ->
         {:ok, token}
@@ -214,8 +226,14 @@ defmodule SymphonyElixir.GitHub.Auth do
   defp oauth_token do
     token =
       Application.get_env(:symphony_elixir, :github_oauth_token) ||
-        System.get_env("GITHUB_OAUTH_TOKEN")
+        System.get_env("GITHUB_OAUTH_TOKEN") ||
+        OAuthTokenStore.load()
 
+    if is_binary(token) and String.trim(token) != "", do: {:ok, token}, else: :missing
+  end
+
+  defp projects_pat_token do
+    token = System.get_env("GITHUB_PROJECTS_PAT")
     if is_binary(token) and String.trim(token) != "", do: {:ok, token}, else: :missing
   end
 

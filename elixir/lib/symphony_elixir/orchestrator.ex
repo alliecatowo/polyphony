@@ -22,6 +22,7 @@ defmodule SymphonyElixir.Orchestrator do
     total_tokens: 0,
     seconds_running: 0
   }
+  @snapshot_cache_key {__MODULE__, :last_snapshot}
 
   defmodule State do
     @moduledoc """
@@ -33,6 +34,7 @@ defmodule SymphonyElixir.Orchestrator do
       :max_concurrent_agents,
       :next_poll_due_at_ms,
       :poll_check_in_progress,
+      :poll_started_at_ms,
       :tick_timer_ref,
       :tick_token,
       running: %{},
@@ -60,19 +62,30 @@ defmodule SymphonyElixir.Orchestrator do
       max_concurrent_agents: config.agent.max_concurrent_agents,
       next_poll_due_at_ms: now_ms,
       poll_check_in_progress: false,
+      poll_started_at_ms: nil,
       tick_timer_ref: nil,
       tick_token: nil,
       codex_totals: @empty_codex_totals,
       codex_rate_limits: nil
     }
 
-    run_terminal_workspace_cleanup()
+    put_cached_snapshot(build_snapshot(state))
+    send(self(), :startup_cleanup)
     state = schedule_tick(state, 0)
 
     {:ok, state}
   end
 
+  def handle_info(:startup_cleanup, state) do
+    run_terminal_workspace_cleanup()
+    {:noreply, state}
+  end
+
   @impl true
+  def handle_info({:tick, _tick_token}, %{poll_check_in_progress: true} = state) do
+    {:noreply, state}
+  end
+
   def handle_info({:tick, tick_token}, %{tick_token: tick_token} = state)
       when is_reference(tick_token) do
     state = refresh_runtime_config(state)
@@ -80,6 +93,7 @@ defmodule SymphonyElixir.Orchestrator do
     state = %{
       state
       | poll_check_in_progress: true,
+        poll_started_at_ms: System.monotonic_time(:millisecond),
         next_poll_due_at_ms: nil,
         tick_timer_ref: nil,
         tick_token: nil
@@ -92,12 +106,15 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:tick, _tick_token}, state), do: {:noreply, state}
 
+  def handle_info(:tick, %{poll_check_in_progress: true} = state), do: {:noreply, state}
+
   def handle_info(:tick, state) do
     state = refresh_runtime_config(state)
 
     state = %{
       state
       | poll_check_in_progress: true,
+        poll_started_at_ms: System.monotonic_time(:millisecond),
         next_poll_due_at_ms: nil,
         tick_timer_ref: nil,
         tick_token: nil
@@ -110,9 +127,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
-    state = maybe_dispatch(state)
+    state = safe_maybe_dispatch(state)
     state = schedule_tick(state, state.poll_interval_ms)
-    state = %{state | poll_check_in_progress: false}
+    state = %{state | poll_check_in_progress: false, poll_started_at_ms: nil}
+    put_cached_snapshot(build_snapshot(state))
 
     notify_dashboard()
     {:noreply, state}
@@ -223,6 +241,18 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, state}
   end
 
+  defp safe_maybe_dispatch(state) do
+    maybe_dispatch(state)
+  rescue
+    error ->
+      Logger.error("Poll cycle dispatch crashed: #{Exception.format(:error, error, __STACKTRACE__)}")
+      state
+  catch
+    kind, reason ->
+      Logger.error("Poll cycle dispatch crashed: #{inspect({kind, reason})}")
+      state
+  end
+
   defp maybe_dispatch(%State{} = state) do
     state = reconcile_running_issues(state)
 
@@ -253,6 +283,11 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, :missing_tracker_kind} ->
         Logger.error("Tracker kind missing in WORKFLOW.md")
+
+        state
+
+      {:error, :github_project_oauth_forbidden} ->
+        Logger.error("GitHub Project access forbidden for OAuth/app token. Set GITHUB_PROJECTS_PAT with project scope (read:project or project), then restart webhook.")
 
         state
 
@@ -499,7 +534,11 @@ defmodule SymphonyElixir.Orchestrator do
       identifier = Map.get(running_entry, :identifier, issue_id)
       session_id = running_entry_session_id(running_entry)
 
-      Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
+      reason = stall_reason(running_entry, elapsed_ms)
+
+      Logger.warning(
+        "Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff reason=#{reason}"
+      )
 
       next_attempt = next_retry_attempt_from_running(running_entry)
 
@@ -507,7 +546,7 @@ defmodule SymphonyElixir.Orchestrator do
       |> terminate_running_issue(issue_id, false)
       |> schedule_issue_retry(issue_id, next_attempt, %{
         identifier: identifier,
-        error: "stalled for #{elapsed_ms}ms without codex activity"
+        error: reason
       })
     else
       state
@@ -531,6 +570,18 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp last_activity_timestamp(_running_entry), do: nil
+
+  defp stall_reason(running_entry, elapsed_ms) do
+    event = Map.get(running_entry, :last_codex_event)
+
+    cond do
+      event in [:turn_input_required, :elicitation_requested] ->
+        "stalled for #{elapsed_ms}ms while waiting for input/elicitation"
+
+      true ->
+        "stalled for #{elapsed_ms}ms without codex activity"
+    end
+  end
 
   defp terminate_task(pid) when is_pid(pid) do
     case Task.Supervisor.terminate_child(SymphonyElixir.TaskSupervisor, pid) do
@@ -1295,13 +1346,24 @@ defmodule SymphonyElixir.Orchestrator do
 
   @spec request_refresh() :: map() | :unavailable
   def request_refresh do
-    request_refresh(__MODULE__)
+    request_refresh(__MODULE__, 250)
   end
 
   @spec request_refresh(GenServer.server()) :: map() | :unavailable
-  def request_refresh(server) do
+  def request_refresh(server), do: request_refresh(server, 250)
+
+  @spec request_refresh(GenServer.server(), timeout()) :: map() | :unavailable
+  def request_refresh(server, timeout_ms) when is_integer(timeout_ms) and timeout_ms > 0 do
     if Process.whereis(server) do
-      GenServer.call(server, :request_refresh)
+      try do
+        GenServer.call(server, :request_refresh, timeout_ms)
+      catch
+        :exit, {:timeout, _} ->
+          %{queued: true, coalesced: true, requested_at: DateTime.utc_now(), operations: ["poll", "reconcile"]}
+
+        :exit, _ ->
+          :unavailable
+      end
     else
       :unavailable
     end
@@ -1312,73 +1374,27 @@ defmodule SymphonyElixir.Orchestrator do
 
   @spec snapshot(GenServer.server(), timeout()) :: map() | :timeout | :unavailable
   def snapshot(server, timeout) do
+    cached_snapshot = cached_snapshot()
+
     if Process.whereis(server) do
       try do
-        GenServer.call(server, :snapshot, timeout)
+        snapshot = GenServer.call(server, :snapshot, timeout)
+        put_cached_snapshot(snapshot)
+        snapshot
       catch
-        :exit, {:timeout, _} -> :timeout
-        :exit, _ -> :unavailable
+        :exit, {:timeout, _} -> cached_snapshot || :timeout
+        :exit, _ -> cached_snapshot || :unavailable
       end
     else
-      :unavailable
+      cached_snapshot || :unavailable
     end
   end
 
   @impl true
   def handle_call(:snapshot, _from, state) do
-    state = refresh_runtime_config(state)
-    now = DateTime.utc_now()
-    now_ms = System.monotonic_time(:millisecond)
-
-    running =
-      state.running
-      |> Enum.map(fn {issue_id, metadata} ->
-        %{
-          issue_id: issue_id,
-          identifier: metadata.identifier,
-          state: metadata.issue.state,
-          worker_host: Map.get(metadata, :worker_host),
-          workspace_path: Map.get(metadata, :workspace_path),
-          session_id: metadata.session_id,
-          codex_app_server_pid: metadata.codex_app_server_pid,
-          codex_input_tokens: metadata.codex_input_tokens,
-          codex_output_tokens: metadata.codex_output_tokens,
-          codex_total_tokens: metadata.codex_total_tokens,
-          turn_count: Map.get(metadata, :turn_count, 0),
-          started_at: metadata.started_at,
-          last_codex_timestamp: metadata.last_codex_timestamp,
-          last_codex_message: metadata.last_codex_message,
-          last_codex_event: metadata.last_codex_event,
-          runtime_seconds: running_seconds(metadata.started_at, now)
-        }
-      end)
-
-    retrying =
-      state.retry_attempts
-      |> Enum.map(fn {issue_id, %{attempt: attempt, due_at_ms: due_at_ms} = retry} ->
-        %{
-          issue_id: issue_id,
-          attempt: attempt,
-          due_in_ms: max(0, due_at_ms - now_ms),
-          identifier: Map.get(retry, :identifier),
-          error: Map.get(retry, :error),
-          worker_host: Map.get(retry, :worker_host),
-          workspace_path: Map.get(retry, :workspace_path)
-        }
-      end)
-
-    {:reply,
-     %{
-       running: running,
-       retrying: retrying,
-       codex_totals: state.codex_totals,
-       rate_limits: Map.get(state, :codex_rate_limits),
-       polling: %{
-         checking?: state.poll_check_in_progress == true,
-         next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
-         poll_interval_ms: state.poll_interval_ms
-       }
-     }, state}
+    snapshot = build_snapshot(state)
+    put_cached_snapshot(snapshot)
+    {:reply, snapshot, state}
   end
 
   def handle_call(:request_refresh, _from, state) do
@@ -1468,6 +1484,86 @@ defmodule SymphonyElixir.Orchestrator do
       message: update[:payload] || update[:raw],
       timestamp: update[:timestamp]
     }
+  end
+
+  defp build_snapshot(state) do
+    now = DateTime.utc_now()
+    now_ms = System.monotonic_time(:millisecond)
+
+    running =
+      state.running
+      |> Enum.map(fn {issue_id, metadata} ->
+        %{
+          issue_id: issue_id,
+          identifier: metadata.identifier,
+          state: metadata.issue.state,
+          worker_host: Map.get(metadata, :worker_host),
+          workspace_path: Map.get(metadata, :workspace_path),
+          session_id: metadata.session_id,
+          codex_app_server_pid: metadata.codex_app_server_pid,
+          codex_input_tokens: metadata.codex_input_tokens,
+          codex_output_tokens: metadata.codex_output_tokens,
+          codex_total_tokens: metadata.codex_total_tokens,
+          turn_count: Map.get(metadata, :turn_count, 0),
+          started_at: metadata.started_at,
+          last_codex_timestamp: metadata.last_codex_timestamp,
+          last_codex_message: metadata.last_codex_message,
+          last_codex_event: metadata.last_codex_event,
+          runtime_seconds: running_seconds(metadata.started_at, now)
+        }
+      end)
+
+    retrying =
+      state.retry_attempts
+      |> Enum.map(fn {issue_id, %{attempt: attempt, due_at_ms: due_at_ms} = retry} ->
+        %{
+          issue_id: issue_id,
+          attempt: attempt,
+          due_in_ms: max(0, due_at_ms - now_ms),
+          identifier: Map.get(retry, :identifier),
+          error: Map.get(retry, :error),
+          worker_host: Map.get(retry, :worker_host),
+          workspace_path: Map.get(retry, :workspace_path)
+        }
+      end)
+
+    %{
+      running: running,
+      retrying: retrying,
+      codex_totals: state.codex_totals,
+      rate_limits: Map.get(state, :codex_rate_limits),
+      polling: %{
+        checking?: poll_checking?(state, now_ms),
+        checking_for_ms: checking_for_ms(state, now_ms),
+        next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
+        poll_interval_ms: state.poll_interval_ms
+      }
+    }
+  end
+
+  defp poll_checking?(%State{poll_check_in_progress: true, poll_started_at_ms: started_at, poll_interval_ms: interval}, now_ms)
+       when is_integer(started_at) and is_integer(interval) and is_integer(now_ms) do
+    elapsed_ms = max(0, now_ms - started_at)
+    elapsed_ms <= max(interval * 2, 5_000)
+  end
+
+  defp poll_checking?(%State{poll_check_in_progress: true}, _now_ms), do: true
+  defp poll_checking?(_state, _now_ms), do: false
+
+  defp checking_for_ms(%State{poll_check_in_progress: true, poll_started_at_ms: started_at}, now_ms)
+       when is_integer(started_at) and is_integer(now_ms) do
+    max(0, now_ms - started_at)
+  end
+
+  defp checking_for_ms(_state, _now_ms), do: nil
+
+  defp put_cached_snapshot(snapshot) when is_map(snapshot) do
+    :persistent_term.put(@snapshot_cache_key, snapshot)
+    :ok
+  end
+
+  defp cached_snapshot do
+    :persistent_term.get(@snapshot_cache_key, nil)
   end
 
   defp schedule_tick(%State{} = state, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do

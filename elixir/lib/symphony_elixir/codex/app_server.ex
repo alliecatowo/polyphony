@@ -199,7 +199,9 @@ defmodule SymphonyElixir.Codex.AppServer do
             :binary,
             :exit_status,
             :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(Config.settings!().codex.command)],
+            # Use non-login shell so we inherit the exact runtime PATH from BEAM/mise.
+            # `-l` can source user dotfiles and accidentally resolve an older codex binary.
+            args: [~c"-c", String.to_charlist(Config.settings!().codex.command)],
             cd: String.to_charlist(workspace),
             line: @port_line_bytes
           ]
@@ -256,7 +258,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     send_message(port, payload)
 
-    with {:ok, _} <- await_response(port, @initialize_id) do
+    with {:ok, _} <- await_response(port, @initialize_id, startup_timeout_ms()) do
       send_message(port, %{"method" => "initialized", "params" => %{}})
       :ok
     end
@@ -289,7 +291,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       }
     })
 
-    case await_response(port, @thread_start_id) do
+    case await_response(port, @thread_start_id, startup_timeout_ms()) do
       {:ok, %{"thread" => thread_payload}} ->
         case thread_payload do
           %{"id" => thread_id} -> {:ok, thread_id}
@@ -320,7 +322,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       }
     })
 
-    case await_response(port, @turn_start_id) do
+    case await_response(port, @turn_start_id, startup_timeout_ms()) do
       {:ok, %{"turn" => %{"id" => turn_id}}} -> {:ok, turn_id}
       other -> other
     end
@@ -669,6 +671,43 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp maybe_handle_approval_request(
+         port,
+         "mcpServer/elicitation/request",
+         %{"id" => id} = payload,
+         payload_string,
+         on_message,
+         metadata,
+         _tool_executor,
+         auto_approve_requests
+       ) do
+    params = Map.get(payload, "params", %{})
+
+    case maybe_auto_answer_tool_request_user_input(
+           port,
+           id,
+           params,
+           payload,
+           payload_string,
+           on_message,
+           metadata,
+           auto_approve_requests
+         ) do
+      :input_required ->
+        emit_message(
+          on_message,
+          :elicitation_requested,
+          %{payload: payload, raw: payload_string},
+          metadata
+        )
+
+        :input_required
+
+      other ->
+        other
+    end
+  end
+
+  defp maybe_handle_approval_request(
          _port,
          _method,
          _payload,
@@ -919,8 +958,21 @@ defmodule SymphonyElixir.Codex.AppServer do
     String.starts_with?(normalized_label, "approve") or String.starts_with?(normalized_label, "allow")
   end
 
-  defp await_response(port, request_id) do
-    with_timeout_response(port, request_id, Config.settings!().codex.read_timeout_ms, "")
+  defp await_response(port, request_id, timeout_ms) when is_integer(timeout_ms) and timeout_ms > 0 do
+    with_timeout_response(port, request_id, timeout_ms, "")
+  end
+
+  defp startup_timeout_ms do
+    codex = Config.settings!().codex
+    startup_timeout = Map.get(codex, :startup_timeout_ms, nil)
+
+    cond do
+      is_integer(startup_timeout) and startup_timeout > 0 ->
+        startup_timeout
+
+      true ->
+        max(codex.read_timeout_ms, 30_000)
+    end
   end
 
   defp with_timeout_response(port, request_id, timeout_ms, pending_line) do
@@ -1061,7 +1113,8 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp needs_input?(method, payload)
        when is_binary(method) and is_map(payload) do
-    String.starts_with?(method, "turn/") && input_required_method?(method, payload)
+    (String.starts_with?(method, "turn/") || method == "mcpServer/elicitation/request") &&
+      input_required_method?(method, payload)
   end
 
   defp needs_input?(_method, _payload), do: false
@@ -1074,7 +1127,8 @@ defmodule SymphonyElixir.Codex.AppServer do
       "turn/request_input",
       "turn/request_response",
       "turn/provide_input",
-      "turn/approval_required"
+      "turn/approval_required",
+      "mcpServer/elicitation/request"
     ] || request_payload_requires_input?(payload)
   end
 

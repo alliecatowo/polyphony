@@ -211,6 +211,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:turn_sandbox_policy, :map)
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)
+      field(:startup_timeout_ms, :integer, default: 60_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
     end
 
@@ -226,6 +227,7 @@ defmodule SymphonyElixir.Config.Schema do
           :turn_sandbox_policy,
           :turn_timeout_ms,
           :read_timeout_ms,
+          :startup_timeout_ms,
           :stall_timeout_ms
         ],
         empty_values: []
@@ -233,6 +235,7 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_required([:command])
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
+      |> validate_number(:startup_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
     end
   end

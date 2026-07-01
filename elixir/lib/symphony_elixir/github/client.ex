@@ -62,28 +62,12 @@ defmodule SymphonyElixir.GitHub.Client do
             duration
             field { ... on ProjectV2FieldCommon { id name } }
           }
-          ... on ProjectV2ItemFieldLabelValue {
-            labels(first: 20) { nodes { id name } }
-            field { ... on ProjectV2FieldCommon { id name } }
-          }
           ... on ProjectV2ItemFieldMilestoneValue {
             milestone { id number title dueOn state }
             field { ... on ProjectV2FieldCommon { id name } }
           }
           ... on ProjectV2ItemFieldNumberValue {
             number
-            field { ... on ProjectV2FieldCommon { id name } }
-          }
-          ... on ProjectV2ItemFieldPullRequestValue {
-            pullRequests(first: 20) { nodes { id number url title state isDraft merged mergeStateStatus mergedAt closedAt } }
-            field { ... on ProjectV2FieldCommon { id name } }
-          }
-          ... on ProjectV2ItemFieldRepositoryValue {
-            repository { id nameWithOwner url }
-            field { ... on ProjectV2FieldCommon { id name } }
-          }
-          ... on ProjectV2ItemFieldReviewerValue {
-            reviewers(first: 20) { nodes { ... on User { id login } } }
             field { ... on ProjectV2FieldCommon { id name } }
           }
           ... on ProjectV2ItemFieldSingleSelectValue {
@@ -95,12 +79,40 @@ defmodule SymphonyElixir.GitHub.Client do
             text
             field { ... on ProjectV2FieldCommon { id name } }
           }
-          ... on ProjectV2ItemFieldUserValue {
-            users(first: 20) { nodes { id login } }
-            field { ... on ProjectV2FieldCommon { id name } }
-          }
         }
       }
+    }
+  }
+  createdAt
+  updatedAt
+  """
+
+  @project_issue_fields """
+  id
+  number
+  title
+  body
+  state
+  stateReason
+  url
+  assignees(first: 10) { nodes { login } }
+  labels(first: 20) { nodes { name } }
+  milestone { id number title dueOn state description }
+  parent { id number title state url }
+  subIssues(first: 20) { nodes { id number title state url } }
+  closedByPullRequestsReferences(first: 20) {
+    nodes {
+      id
+      number
+      url
+      title
+      state
+      isDraft
+      merged
+      mergeStateStatus
+      mergedAt
+      closedAt
+      repository { nameWithOwner }
     }
   }
   createdAt
@@ -136,7 +148,7 @@ defmodule SymphonyElixir.GitHub.Client do
             isArchived
             content {
               ... on Issue {
-                #{@issue_fields}
+                #{@project_issue_fields}
                 repository { id nameWithOwner }
               }
             }
@@ -338,14 +350,12 @@ defmodule SymphonyElixir.GitHub.Client do
 
   @update_single_select_field_query """
   mutation SymphonyGitHubUpdateSingleSelectField(
-    $projectId: ID!,
     $fieldId: ID!,
     $name: String!,
     $singleSelectOptions: [ProjectV2SingleSelectFieldOptionInput!]!
   ) {
     updateProjectV2Field(
       input: {
-        projectId: $projectId,
         fieldId: $fieldId,
         name: $name,
         singleSelectOptions: $singleSelectOptions
@@ -419,25 +429,33 @@ defmodule SymphonyElixir.GitHub.Client do
 
   @spec graphql(String.t(), map()) :: {:ok, map()} | {:error, term()}
   def graphql(query, variables \\ %{}) when is_binary(query) and is_map(variables) do
+    tracker = Config.settings!().tracker
     payload = %{"query" => query, "variables" => variables}
 
-    with {:ok, headers} <- graphql_headers(),
-         {:ok, %{status: 200, body: body}} <- post_graphql_request(payload, headers),
-         :ok <- ensure_no_graphql_errors(body) do
-      {:ok, body}
-    else
-      {:ok, response} ->
-        Logger.error("GitHub GraphQL request failed status=#{response.status} body=#{summarize_error_body(response.body)}")
+    with {:ok, headers} <- graphql_headers(:project_preferred),
+         result <- execute_graphql(payload, headers) do
+      case result do
+        {:error, {:github_graphql_errors, errors}} ->
+          if String.downcase(to_string(tracker.project_owner_type)) == "user" do
+            cond do
+              user_project_forbidden?(errors) ->
+                {:error, :github_project_oauth_forbidden}
 
-        {:error, {:github_api_status, response.status}}
+              oauth_integration_forbidden?(errors) ->
+                with {:ok, fallback_headers} <- graphql_headers(:installation_only) do
+                  execute_graphql(payload, fallback_headers)
+                end
 
-      {:error, {:github_graphql_errors, errors}} ->
-        Logger.error("GitHub GraphQL response errors=#{inspect(errors)}")
-        {:error, {:github_graphql_errors, errors}}
+              true ->
+                result
+            end
+          else
+            result
+          end
 
-      {:error, reason} ->
-        Logger.error("GitHub GraphQL request failed: #{inspect(reason)}")
-        {:error, {:github_api_request, reason}}
+        _ ->
+          result
+      end
     end
   end
 
@@ -813,6 +831,9 @@ defmodule SymphonyElixir.GitHub.Client do
 
       {:ok, match}
     else
+      {:error, {:github_graphql_errors, errors}} ->
+        if repository_projects_forbidden?(errors), do: {:ok, nil}, else: {:error, {:github_graphql_errors, errors}}
+
       {:error, reason} -> {:error, reason}
       _ -> {:ok, nil}
     end
@@ -841,6 +862,18 @@ defmodule SymphonyElixir.GitHub.Client do
       message = to_string(Map.get(error, "message", ""))
       type = to_string(Map.get(error, "type", ""))
       type == "FORBIDDEN" and String.contains?(String.downcase(message), "does not have permission to create projects")
+    end)
+  end
+
+  defp repository_projects_forbidden?(errors) when is_list(errors) do
+    Enum.any?(errors, fn error ->
+      message = to_string(Map.get(error, "message", ""))
+      path = List.wrap(Map.get(error, "path", []))
+      type = to_string(Map.get(error, "type", ""))
+
+      type == "FORBIDDEN" and
+        String.contains?(String.downcase(message), "resource not accessible by integration") and
+        Enum.any?(path, &(to_string(&1) == "projectsV2"))
     end)
   end
 
@@ -1567,6 +1600,9 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
+  defp extract_dependency_nodes(body, _key) when is_list(body), do: body
+  defp extract_dependency_nodes(_body, _key), do: []
+
   defp normalize_dependency_links(nodes) when is_list(nodes) do
     Enum.map(nodes, fn issue ->
       %{
@@ -1720,10 +1756,10 @@ defmodule SymphonyElixir.GitHub.Client do
       |> Map.get("field_values", [])
       |> Enum.flat_map(fn value ->
         field_name =
-          value
-          |> Map.get("field", %{})
-          |> Map.get("name")
-          |> normalize_state_name()
+          case Map.get(value, "field") do
+            %{} = field -> field |> Map.get("name") |> normalize_state_name()
+            _ -> ""
+          end
 
         value_name = value |> Map.get("name") |> normalize_state_name()
 
@@ -1732,10 +1768,29 @@ defmodule SymphonyElixir.GitHub.Client do
     end)
   end
 
-  defp graphql_headers do
+  defp execute_graphql(payload, headers) do
+    with {:ok, %{status: 200, body: body}} <- post_graphql_request(payload, headers),
+         :ok <- ensure_no_graphql_errors(body) do
+      {:ok, body}
+    else
+      {:ok, response} ->
+        Logger.error("GitHub GraphQL request failed status=#{response.status} body=#{summarize_error_body(response.body)}")
+        {:error, {:github_api_status, response.status}}
+
+      {:error, {:github_graphql_errors, errors}} ->
+        Logger.error("GitHub GraphQL response errors=#{inspect(errors)}")
+        {:error, {:github_graphql_errors, errors}}
+
+      {:error, reason} ->
+        Logger.error("GitHub GraphQL request failed: #{inspect(reason)}")
+        {:error, {:github_api_request, reason}}
+    end
+  end
+
+  defp graphql_headers(mode) do
     tracker = Config.settings!().tracker
 
-    with {:ok, token} <- graphql_token(tracker) do
+    with {:ok, token} <- graphql_token(tracker, mode) do
       {:ok,
        [
          {"Authorization", "Bearer #{token}"},
@@ -1744,15 +1799,33 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp graphql_token(%{project_owner_type: owner_type} = tracker) do
-    if String.downcase(to_string(owner_type)) == "user" do
-      Auth.project_authorization_token(tracker)
-    else
-      Auth.authorization_token(tracker)
-    end
+  defp graphql_token(tracker, :installation_only), do: Auth.authorization_token(tracker)
+
+  defp graphql_token(%{project_owner_type: owner_type} = tracker, :project_preferred) do
+    if String.downcase(to_string(owner_type)) == "user",
+      do: Auth.project_authorization_token(tracker),
+      else: Auth.authorization_token(tracker)
   end
 
-  defp graphql_token(tracker), do: Auth.authorization_token(tracker)
+  defp graphql_token(tracker, _mode), do: Auth.authorization_token(tracker)
+
+  defp oauth_integration_forbidden?(errors) when is_list(errors) do
+    Enum.any?(errors, fn error ->
+      message = to_string(Map.get(error, "message", ""))
+      type = to_string(Map.get(error, "type", ""))
+
+      type == "FORBIDDEN" and String.contains?(String.downcase(message), "resource not accessible by integration")
+    end)
+  end
+
+  defp user_project_forbidden?(errors) when is_list(errors) do
+    Enum.any?(errors, fn error ->
+      path = List.wrap(Map.get(error, "path", []))
+      type = to_string(Map.get(error, "type", ""))
+
+      type == "FORBIDDEN" and Enum.any?(path, &(to_string(&1) == "projectV2"))
+    end)
+  end
 
   defp post_graphql_request(payload, headers) do
     Req.post(Config.settings!().tracker.endpoint,
@@ -1897,8 +1970,18 @@ defmodule SymphonyElixir.GitHub.Client do
     |> Enum.reduce(%{}, fn value, acc ->
       field_name =
         value
-        |> Map.get("field", %{})
-        |> Map.get("name")
+        |> case do
+          %{} = field_value ->
+            field_value
+            |> Map.get("field", %{})
+            |> case do
+              %{} = field -> Map.get(field, "name")
+              _ -> nil
+            end
+
+          _ ->
+            nil
+        end
         |> normalize_state_name()
 
       if field_name == "" do
@@ -2103,6 +2186,19 @@ defmodule SymphonyElixir.GitHub.Client do
           issues
           |> Enum.map(& &1["number"])
           |> Enum.filter(&is_integer/1)
+          |> Enum.uniq()
+          |> Enum.sort()
+
+        {:ok, blocked_numbers}
+
+      {:ok, %{status: 200, body: body}} when is_list(body) ->
+        blocked_numbers =
+          body
+          |> Enum.map(fn
+            %{"number" => number} when is_integer(number) -> number
+            _ -> nil
+          end)
+          |> Enum.reject(&is_nil/1)
           |> Enum.uniq()
           |> Enum.sort()
 
@@ -2408,10 +2504,14 @@ defmodule SymphonyElixir.GitHub.Client do
         :ok
       else
         case graphql_mutation(@update_single_select_field_query, %{
-               projectId: project_id,
                fieldId: field_id,
                name: field_name,
-               singleSelectOptions: Enum.map(resolved_options, &%{name: &1})
+               singleSelectOptions:
+                 Enum.map(resolved_options, &%{
+                   name: &1,
+                   color: "GRAY",
+                   description: ""
+                 })
              }) do
           {:ok, _} -> :ok
           {:error, reason} -> {:error, reason}

@@ -4,6 +4,7 @@ defmodule SymphonyElixir.GitHub.OAuthBootstrap do
   require Logger
 
   alias SymphonyElixir.Config
+  alias SymphonyElixir.GitHub.OAuthTokenStore
 
   @spec maybe_open_browser() :: :ok
   def maybe_open_browser do
@@ -34,7 +35,8 @@ defmodule SymphonyElixir.GitHub.OAuthBootstrap do
   defp missing_oauth_token? do
     token =
       Application.get_env(:symphony_elixir, :github_oauth_token) ||
-        System.get_env("GITHUB_OAUTH_TOKEN")
+        System.get_env("GITHUB_OAUTH_TOKEN") ||
+        OAuthTokenStore.load()
 
     not (is_binary(token) and String.trim(token) != "")
   end
