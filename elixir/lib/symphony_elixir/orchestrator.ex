@@ -14,6 +14,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @github_rate_limit_fallback_ms 60_000
+  @github_rate_limit_max_backoff_ms 900_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -28,6 +30,8 @@ defmodule SymphonyElixir.Orchestrator do
     Runtime state for the orchestrator polling loop.
     """
 
+    @github_rate_limit_fallback_ms 60_000
+
     defstruct [
       :poll_interval_ms,
       :max_concurrent_agents,
@@ -40,7 +44,9 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       retry_attempts: %{},
       codex_totals: nil,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      github_rate_limited_until_ms: nil,
+      github_rate_limit_backoff_ms: @github_rate_limit_fallback_ms
     ]
 
     @type t :: %__MODULE__{}
@@ -65,7 +71,9 @@ defmodule SymphonyElixir.Orchestrator do
       tick_timer_ref: nil,
       tick_token: nil,
       codex_totals: @empty_codex_totals,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      github_rate_limited_until_ms: nil,
+      github_rate_limit_backoff_ms: @github_rate_limit_fallback_ms
     }
 
     start_terminal_workspace_cleanup()
@@ -150,7 +158,7 @@ defmodule SymphonyElixir.Orchestrator do
     state =
       state
       |> merge_poll_cycle_state(polled_state, base_running_ids)
-      |> schedule_tick(polled_state.poll_interval_ms)
+      |> schedule_tick(poll_delay(polled_state))
       |> Map.put(:poll_check_in_progress, false)
 
     notify_dashboard()
@@ -363,66 +371,76 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_dispatch(%State{} = state, orchestrator) when is_pid(orchestrator) do
-    state = reconcile_running_issues(state, orchestrator)
-
-    with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_candidate_issues(),
-         :ok <- log_candidate_count(issues),
-         true <- available_slots(state) > 0 do
-      choose_issues(issues, state, orchestrator)
+    if github_rate_limited?(state) do
+      Logger.warning("GitHub API circuit open; skipping tracker poll until #{state.github_rate_limited_until_ms}")
+      state
     else
-      {:error, :missing_linear_api_token} ->
-        Logger.error("Linear API token missing in WORKFLOW.md")
-        state
+      state = reconcile_running_issues(state, orchestrator)
 
-      {:error, :missing_linear_project_slug} ->
-        Logger.error("Linear project slug missing in WORKFLOW.md")
-        state
+      with :ok <- Config.validate!(),
+           {:ok, issues} <- Tracker.fetch_candidate_issues(),
+           :ok <- log_candidate_count(issues),
+           true <- available_slots(state) > 0 do
+        clear_github_rate_limit(state)
+        |> choose_issues(issues, orchestrator)
+      else
+        {:error, :missing_linear_api_token} ->
+          Logger.error("Linear API token missing in WORKFLOW.md")
+          state
 
-      {:error, :missing_github_api_token} ->
-        Logger.error("GitHub API token missing in WORKFLOW.md")
-        state
+        {:error, :missing_linear_project_slug} ->
+          Logger.error("Linear project slug missing in WORKFLOW.md")
+          state
 
-      {:error, :missing_github_repo_owner} ->
-        Logger.error("GitHub repo owner missing in WORKFLOW.md")
-        state
+        {:error, :missing_github_api_token} ->
+          Logger.error("GitHub API token missing in WORKFLOW.md")
+          state
 
-      {:error, :missing_github_repo_name} ->
-        Logger.error("GitHub repo name missing in WORKFLOW.md")
-        state
+        {:error, :missing_github_repo_owner} ->
+          Logger.error("GitHub repo owner missing in WORKFLOW.md")
+          state
 
-      {:error, :missing_tracker_kind} ->
-        Logger.error("Tracker kind missing in WORKFLOW.md")
+        {:error, :missing_github_repo_name} ->
+          Logger.error("GitHub repo name missing in WORKFLOW.md")
+          state
 
-        state
+        {:error, :missing_tracker_kind} ->
+          Logger.error("Tracker kind missing in WORKFLOW.md")
 
-      {:error, {:unsupported_tracker_kind, kind}} ->
-        Logger.error("Unsupported tracker kind in WORKFLOW.md: #{inspect(kind)}")
+          state
 
-        state
+        {:error, {:unsupported_tracker_kind, kind}} ->
+          Logger.error("Unsupported tracker kind in WORKFLOW.md: #{inspect(kind)}")
 
-      {:error, {:invalid_workflow_config, message}} ->
-        Logger.error("Invalid WORKFLOW.md config: #{message}")
-        state
+          state
 
-      {:error, {:missing_workflow_file, path, reason}} ->
-        Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
-        state
+        {:error, {:invalid_workflow_config, message}} ->
+          Logger.error("Invalid WORKFLOW.md config: #{message}")
+          state
 
-      {:error, :workflow_front_matter_not_a_map} ->
-        Logger.error("Failed to parse WORKFLOW.md: workflow front matter must decode to a map")
-        state
+        {:error, {:missing_workflow_file, path, reason}} ->
+          Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
+          state
 
-      {:error, {:workflow_parse_error, reason}} ->
-        Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
-        state
+        {:error, :workflow_front_matter_not_a_map} ->
+          Logger.error("Failed to parse WORKFLOW.md: workflow front matter must decode to a map")
+          state
 
-      {:error, reason} ->
-        Logger.error("Failed to fetch tracker candidates: #{inspect(reason)}")
-        state
+        {:error, {:workflow_parse_error, reason}} ->
+          Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
+          state
 
-      false ->
-        state
+        {:error, reason} ->
+          if github_rate_limit_error?(reason) do
+            mark_github_rate_limited(state, reason)
+          else
+            Logger.error("Failed to fetch tracker candidates: #{inspect(reason)}")
+            state
+          end
+
+        false ->
+          state
+      end
     end
   end
 
@@ -1664,6 +1682,10 @@ defmodule SymphonyElixir.Orchestrator do
        retrying: retrying,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
+       github_api: %{
+         rate_limited?: github_rate_limited?(state),
+         retry_in_ms: next_poll_in_ms(state.github_rate_limited_until_ms, now_ms)
+       },
        polling: %{
          checking?: state.poll_check_in_progress == true,
          next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
@@ -1776,6 +1798,56 @@ defmodule SymphonyElixir.Orchestrator do
         next_poll_due_at_ms: System.monotonic_time(:millisecond) + delay_ms
     }
   end
+
+  defp poll_delay(%State{github_rate_limited_until_ms: until_ms}) when is_integer(until_ms) do
+    max(0, until_ms - System.monotonic_time(:millisecond))
+  end
+
+  defp poll_delay(%State{poll_interval_ms: interval_ms}), do: interval_ms
+
+  defp github_rate_limited?(%State{github_rate_limited_until_ms: until_ms})
+       when is_integer(until_ms),
+       do: until_ms > System.monotonic_time(:millisecond)
+
+  defp github_rate_limited?(%State{}), do: false
+
+  defp clear_github_rate_limit(%State{} = state) do
+    %{state | github_rate_limited_until_ms: nil, github_rate_limit_backoff_ms: @github_rate_limit_fallback_ms}
+  end
+
+  defp mark_github_rate_limited(%State{} = state, reason) do
+    backoff_ms = min(state.github_rate_limit_backoff_ms || @github_rate_limit_fallback_ms, @github_rate_limit_max_backoff_ms)
+    until_ms = System.monotonic_time(:millisecond) + backoff_ms
+
+    Logger.error("GitHub API rate limit detected; pausing tracker requests for #{backoff_ms}ms: #{inspect(reason)}")
+
+    %{
+      state
+      | github_rate_limited_until_ms: until_ms,
+        github_rate_limit_backoff_ms: min(backoff_ms * 2, @github_rate_limit_max_backoff_ms)
+    }
+  end
+
+  defp github_rate_limit_error?({:github_graphql_errors, errors}) when is_list(errors) do
+    Enum.any?(errors, fn error ->
+      code = Map.get(error, "type") || Map.get(error, :type) || Map.get(error, "code") || Map.get(error, :code)
+      message = Map.get(error, "message") || Map.get(error, :message) || ""
+
+      code in ["RATE_LIMIT", "graphql_rate_limit", :rate_limit] or
+        String.contains?(String.downcase(to_string(message)), "rate limit")
+    end)
+  end
+
+  defp github_rate_limit_error?(reason) when is_tuple(reason) do
+    reason
+    |> Tuple.to_list()
+    |> Enum.any?(&github_rate_limit_error?/1)
+  end
+
+  defp github_rate_limit_error?(reason) when is_binary(reason),
+    do: String.contains?(String.downcase(reason), "rate limit")
+
+  defp github_rate_limit_error?(_reason), do: false
 
   defp schedule_poll_cycle_start do
     :timer.send_after(@poll_transition_render_delay_ms, self(), :run_poll_cycle)
