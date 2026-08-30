@@ -7,32 +7,17 @@ defmodule SymphonyElixirWeb.GitHubWebhookController do
 
   require Logger
 
-  alias SymphonyElixir.Orchestrator
+  alias SymphonyElixir.GitHub.WebhookStore
   alias SymphonyElixirWeb.Endpoint
 
-  @refresh_events MapSet.new([
-                    "issues",
-                    "issue_comment",
-                    "pull_request",
-                    "pull_request_review",
-                    "pull_request_review_comment",
-                    "projects_v2",
-                    "projects_v2_item"
-                  ])
-
   @spec receive(Plug.Conn.t(), map()) :: Plug.Conn.t()
-  def receive(conn, _params) do
+  def receive(conn, params) when is_map(params) do
     with :ok <- ensure_secret_configured(),
          :ok <- verify_signature(conn),
-         {:ok, event} <- fetch_event(conn) do
-      case event do
-        "ping" ->
-          json(conn, %{"ok" => true, "event" => "ping"})
-
-        event_name ->
-          maybe_request_refresh(event_name)
-          json(conn, %{"ok" => true, "event" => event_name})
-      end
+         {:ok, event} <- fetch_event(conn),
+         {:ok, delivery_id} <- fetch_delivery(conn),
+         {:ok, result} <- WebhookStore.ingest(webhook_headers(conn), params, store: webhook_store()) do
+      acknowledge(conn, event, delivery_id, result)
     else
       {:error, :missing_webhook_secret} ->
         conn
@@ -53,17 +38,46 @@ defmodule SymphonyElixirWeb.GitHubWebhookController do
         conn
         |> put_status(400)
         |> json(%{"error" => %{"code" => "missing_event", "message" => "Missing X-GitHub-Event header"}})
+
+      {:error, :missing_delivery} ->
+        conn
+        |> put_status(400)
+        |> json(%{"error" => %{"code" => "missing_delivery", "message" => "Missing X-GitHub-Delivery header"}})
+
+      {:error, {:persist_failed, reason}} ->
+        Logger.error("Unable to persist GitHub webhook delivery: #{inspect(reason)}")
+
+        conn
+        |> put_status(503)
+        |> json(%{"error" => %{"code" => "webhook_store_unavailable", "message" => "Webhook could not be durably recorded"}})
+
+      {:error, {:missing_header, "x-github-delivery"}} ->
+        conn
+        |> put_status(400)
+        |> json(%{"error" => %{"code" => "missing_delivery", "message" => "Missing X-GitHub-Delivery header"}})
+
+      {:error, {:missing_header, "x-github-event"}} ->
+        conn
+        |> put_status(400)
+        |> json(%{"error" => %{"code" => "missing_event", "message" => "Missing X-GitHub-Event header"}})
     end
   end
 
-  defp maybe_request_refresh(event) do
-    if MapSet.member?(@refresh_events, event) do
-      orchestrator = Endpoint.config(:orchestrator) || Orchestrator
-      _ = Orchestrator.request_refresh(orchestrator)
-      :ok
-    else
-      :ok
-    end
+  def receive(conn, _params) do
+    conn
+    |> put_status(400)
+    |> json(%{"error" => %{"code" => "invalid_payload", "message" => "Webhook payload must be a JSON object"}})
+  end
+
+  defp acknowledge(conn, event, delivery_id, result) do
+    json(conn, %{
+      "ok" => true,
+      "event" => event,
+      "action" => result.action,
+      "delivery_id" => delivery_id,
+      "duplicate" => result.status == :duplicate,
+      "targeted_refresh" => result.targeted_refresh
+    })
   end
 
   defp fetch_event(conn) do
@@ -71,6 +85,25 @@ defmodule SymphonyElixirWeb.GitHubWebhookController do
       [event | _] when is_binary(event) and event != "" -> {:ok, event}
       _ -> {:error, :missing_event}
     end
+  end
+
+  defp fetch_delivery(conn) do
+    case get_req_header(conn, "x-github-delivery") do
+      [delivery | _] when is_binary(delivery) and delivery != "" -> {:ok, delivery}
+      _ -> {:error, :missing_delivery}
+    end
+  end
+
+  defp webhook_headers(conn) do
+    %{
+      "x-github-delivery" => List.first(get_req_header(conn, "x-github-delivery")),
+      "x-github-event" => List.first(get_req_header(conn, "x-github-event")),
+      "x-github-hook-id" => List.first(get_req_header(conn, "x-github-hook-id"))
+    }
+  end
+
+  defp webhook_store do
+    Endpoint.config(:webhook_store) || WebhookStore
   end
 
   defp ensure_secret_configured do

@@ -484,7 +484,7 @@ defmodule SymphonyElixir.ExtensionsTest do
              }
   end
 
-  test "github webhook endpoint verifies signature and requests refresh for issue events" do
+  test "github webhook endpoint verifies signature and records issue events" do
     webhook_secret = "test-webhook-secret"
     previous_secret = System.get_env("GITHUB_WEBHOOK_SECRET")
     on_exit(fn -> restore_env("GITHUB_WEBHOOK_SECRET", previous_secret) end)
@@ -500,12 +500,17 @@ defmodule SymphonyElixir.ExtensionsTest do
     conn =
       build_conn()
       |> Plug.Conn.put_req_header("x-github-event", "issues")
+      |> Plug.Conn.put_req_header("x-github-delivery", "delivery-extensions-1")
       |> Plug.Conn.put_req_header("x-hub-signature-256", signature)
       |> Plug.Conn.put_req_header("content-type", "application/json")
       |> post("/github/webhook", payload)
 
-    assert json_response(conn, 200) == %{"ok" => true, "event" => "issues"}
-    assert_receive :webhook_refresh_requested, 200
+    assert response = json_response(conn, 200)
+    assert response["ok"]
+    assert response["event"] == "issues"
+    assert response["delivery_id"] == "delivery-extensions-1"
+    refute response["duplicate"]
+    refute_receive :webhook_refresh_requested, 50
   end
 
   test "github webhook endpoint rejects invalid signatures" do
@@ -519,6 +524,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     conn =
       build_conn()
       |> Plug.Conn.put_req_header("x-github-event", "issues")
+      |> Plug.Conn.put_req_header("x-github-delivery", "delivery-extensions-invalid")
       |> Plug.Conn.put_req_header("x-hub-signature-256", "sha256=deadbeef")
       |> Plug.Conn.put_req_header("content-type", "application/json")
       |> post("/github/webhook", ~s({"action":"opened"}))
