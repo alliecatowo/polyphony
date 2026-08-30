@@ -10,7 +10,8 @@ defmodule SymphonyElixir.GitHub.Client do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, GitHub.Auth, GitHub.Issue}
+  alias SymphonyElixir.Config
+  alias SymphonyElixir.GitHub.{Auth, Gateway, Issue}
 
   @issue_page_size 20
   @max_error_body_log_bytes 1_000
@@ -119,6 +120,23 @@ defmodule SymphonyElixir.GitHub.Client do
   stateReason
   url
   labels(first: 10) { nodes { name } }
+  projectItems(first: 10) {
+    nodes {
+      id
+      isArchived
+      project { id number title url }
+      fieldValues(first: 20) {
+        nodes {
+          __typename
+          ... on ProjectV2ItemFieldSingleSelectValue {
+            name
+            optionId
+            field { ... on ProjectV2FieldCommon { id name } }
+          }
+        }
+      }
+    }
+  }
   createdAt
   updatedAt
   """
@@ -472,10 +490,12 @@ defmodule SymphonyElixir.GitHub.Client do
          {:ok, tracker} <- repo_tracker_config(),
          {:ok, headers} <- rest_headers(),
          {:ok, %{status: status}} when status in [200, 201] <-
-           Req.post("https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}/comments",
-             headers: headers,
-             json: %{"body" => comment}
-           ) do
+           rest_request(fn ->
+             Req.post("https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}/comments",
+               headers: headers,
+               json: %{"body" => comment}
+             )
+           end) do
       :ok
     else
       {:ok, %{status: status, body: body}} ->
@@ -498,10 +518,12 @@ defmodule SymphonyElixir.GitHub.Client do
          {state, state_reason} <- normalize_rest_issue_state(state_name, tracker.status_map),
          payload <- issue_state_payload(state, state_reason),
          {:ok, %{status: status}} when status in [200] <-
-           Req.patch("https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}",
-             headers: headers,
-             json: payload
-           ) do
+           rest_request(fn ->
+             Req.patch("https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}",
+               headers: headers,
+               json: payload
+             )
+           end) do
       :ok
     else
       {:ok, %{status: status, body: body}} ->
@@ -1104,8 +1126,9 @@ defmodule SymphonyElixir.GitHub.Client do
             issue
             |> Map.get(:tracker_metadata, %{})
             |> Map.put("project_items", [item_payload])
+            |> Map.put("project_fields", project_field_snapshot([item_payload]))
 
-          [Map.put(issue, :tracker_metadata, metadata)]
+          [issue |> Map.put(:tracker_metadata, metadata) |> materialize_project_state()]
         else
           _ -> []
         end
@@ -1166,7 +1189,7 @@ defmodule SymphonyElixir.GitHub.Client do
       title: issue["title"],
       description: issue["body"],
       priority: project_priority(project_fields),
-      state: issue["state"],
+      state: project_status_name(metadata["project_items"]) || issue["state"],
       branch_name: nil,
       url: issue["url"],
       assignee_id: normalize_assignee(first_assignee),
@@ -1387,7 +1410,8 @@ defmodule SymphonyElixir.GitHub.Client do
     |> Enum.reduce(%{}, fn value, fields ->
       field_name =
         value
-        |> Map.get("field", %{})
+        |> Map.get("field")
+        |> then(fn field -> if is_map(field), do: field, else: %{} end)
         |> Map.get("name")
         |> normalize_state_name()
 
@@ -1405,6 +1429,41 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp project_field_snapshot(_), do: %{}
+
+  # Project Status is the workflow authority. Keep the exact display value on
+  # Issue.state so downstream orchestration does not accidentally compare the
+  # repository's OPEN/CLOSED lifecycle against Todo/In Progress/Done.
+  defp materialize_project_state(%Issue{} = issue) do
+    project_items =
+      issue
+      |> Map.get(:tracker_metadata, %{})
+      |> Map.get("project_items", [])
+
+    case project_status_name(project_items) do
+      status when is_binary(status) -> %{issue | state: status}
+      _ -> issue
+    end
+  end
+
+  defp project_status_name(project_items) when is_list(project_items) do
+    Enum.find_value(project_items, fn item ->
+      item
+      |> Map.get("field_values", [])
+      |> Enum.find_value(fn value ->
+        field_name =
+          value
+          |> Map.get("field", %{})
+          |> then(fn field -> if is_map(field), do: field, else: %{} end)
+          |> Map.get("name")
+          |> normalize_state_name()
+
+        value_name = value |> Map.get("name") |> to_string() |> String.trim()
+        if field_name == "status" and value_name != "", do: value_name
+      end)
+    end)
+  end
+
+  defp project_status_name(_project_items), do: nil
 
   defp project_priority(fields) when is_map(fields) do
     case Map.get(fields, "priority", %{})["name"] do
@@ -1622,7 +1681,7 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp fetch_dependency_endpoint(endpoint, key, headers) do
-    case Req.get(endpoint, headers: headers) do
+    case rest_request(fn -> Req.get(endpoint, headers: headers) end) do
       {:ok, %{status: 200, body: body}} ->
         {:ok, extract_dependency_nodes(body, key)}
 
@@ -1732,11 +1791,8 @@ defmodule SymphonyElixir.GitHub.Client do
     active_set = normalized_state_set(active_states)
     terminal_set = normalized_state_set(terminal_states)
     effective_state = effective_issue_state(issue)
-    project_states = project_state_values(issue)
-    open_without_project_status? = project_states == [] and normalize_state_name(issue.state) == "open"
 
-    (MapSet.member?(active_set, effective_state) or
-       (open_without_project_status? and MapSet.intersection(active_set, MapSet.new(["todo", "in progress"])) != MapSet.new())) and
+    MapSet.member?(active_set, effective_state) and
       not MapSet.member?(terminal_set, effective_state)
   end
 
@@ -1847,13 +1903,17 @@ defmodule SymphonyElixir.GitHub.Client do
   defp graphql_token(tracker), do: Auth.authorization_token(tracker)
 
   defp post_graphql_request(payload, headers) do
-    Req.post(Config.settings!().tracker.endpoint,
-      headers: headers,
-      json: payload,
-      connect_options: [timeout: 30_000],
-      receive_timeout: 30_000
-    )
+    Gateway.request(:graphql, fn ->
+      Req.post(Config.settings!().tracker.endpoint,
+        headers: headers,
+        json: payload,
+        connect_options: [timeout: 30_000],
+        receive_timeout: 30_000
+      )
+    end)
   end
+
+  defp rest_request(fun) when is_function(fun, 0), do: Gateway.request(:rest, fun)
 
   defp github_api_circuit do
     ensure_api_circuit_table()
@@ -2193,9 +2253,11 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp fetch_issue_details(tracker, headers, issue_number) do
-    case Req.get("https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}",
-           headers: headers
-         ) do
+    case rest_request(fn ->
+           Req.get("https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}",
+             headers: headers
+           )
+         end) do
       {:ok, %{status: 200, body: body}} -> {:ok, body}
       {:ok, %{status: status, body: body}} -> {:ok, %{status: status, body: body}}
       {:error, reason} -> {:error, reason}
@@ -2203,17 +2265,21 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp patch_issue(tracker, headers, issue_number, payload) do
-    Req.patch("https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}",
-      headers: headers,
-      json: payload
-    )
+    rest_request(fn ->
+      Req.patch("https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}",
+        headers: headers,
+        json: payload
+      )
+    end)
   end
 
   defp set_issue_labels(tracker, headers, issue_number, labels) do
-    Req.put("https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}/labels",
-      headers: headers,
-      json: %{"labels" => labels}
-    )
+    rest_request(fn ->
+      Req.put("https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}/labels",
+        headers: headers,
+        json: %{"labels" => labels}
+      )
+    end)
   end
 
   defp milestone_payload(nil), do: %{"milestone" => nil}
@@ -2248,7 +2314,7 @@ defmodule SymphonyElixir.GitHub.Client do
     endpoint =
       "https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}/dependencies/blocked_by"
 
-    case Req.get(endpoint, headers: headers) do
+    case rest_request(fn -> Req.get(endpoint, headers: headers) end) do
       {:ok, %{status: 200, body: %{"blocked_by" => blocked_by}}} when is_list(blocked_by) ->
         blocked_numbers =
           blocked_by
@@ -2313,7 +2379,9 @@ defmodule SymphonyElixir.GitHub.Client do
     endpoint =
       "https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}/dependencies/blocked_by"
 
-    case Req.post(endpoint, headers: headers, json: %{"blocked_by_issue_number" => blocked_by_number}) do
+    case rest_request(fn ->
+           Req.post(endpoint, headers: headers, json: %{"blocked_by_issue_number" => blocked_by_number})
+         end) do
       {:ok, %{status: status}} when status in [200, 201] ->
         {:cont, :ok}
 
@@ -2330,7 +2398,7 @@ defmodule SymphonyElixir.GitHub.Client do
     endpoint =
       "https://api.github.com/repos/#{tracker.repo_owner}/#{tracker.repo_name}/issues/#{issue_number}/dependencies/blocked_by/#{blocked_by_number}"
 
-    case Req.delete(endpoint, headers: headers) do
+    case rest_request(fn -> Req.delete(endpoint, headers: headers) end) do
       {:ok, %{status: status}} when status in [200, 204] ->
         {:cont, :ok}
 

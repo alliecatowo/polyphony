@@ -76,6 +76,163 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server resumes a requested thread and reuses the returned id for the turn" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-thread-resume-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-1002")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-thread-resume.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEx_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"resumed-thread-1002"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-1002"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-thread-resume",
+        identifier: "MT-1002",
+        title: "Validate thread resume",
+        description: "Ensure an existing Codex thread can continue",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-1002",
+        labels: ["backend"]
+      }
+
+      assert {:ok, result} =
+               AppServer.run(workspace, "Continue the existing thread", issue,
+                 resume_thread_id: "original-thread-1002",
+                 model: "gpt-5.6-luna"
+               )
+
+      assert result.thread_id == "resumed-thread-1002"
+      assert result.turn_id == "turn-1002"
+
+      trace =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.map(fn "JSON:" <> json -> Jason.decode!(json) end)
+
+      assert Enum.map(trace, & &1["method"]) == [
+               "initialize",
+               "initialized",
+               "thread/resume",
+               "turn/start"
+             ]
+
+      refute Enum.any?(trace, &(&1["method"] == "thread/start"))
+
+      resume_request = Enum.find(trace, &(&1["method"] == "thread/resume"))
+      assert resume_request["params"]["threadId"] == "original-thread-1002"
+      assert resume_request["params"]["cwd"] == Path.expand(workspace)
+      assert resume_request["params"]["approvalPolicy"]
+      assert resume_request["params"]["sandbox"]
+      refute Map.has_key?(resume_request["params"], "history")
+      refute Map.has_key?(resume_request["params"], "path")
+
+      turn_request = Enum.find(trace, &(&1["method"] == "turn/start"))
+      assert turn_request["params"]["threadId"] == "resumed-thread-1002"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server fails closed when a resumed thread response has no valid id" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-invalid-thread-resume-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-1003")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{}}}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      assert {:error, {:invalid_thread_payload, %{}}} =
+               AppServer.start_session(workspace, resume_thread_id: "thread-with-invalid-response")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server passes explicit turn sandbox policies through unchanged" do
     test_root =
       Path.join(

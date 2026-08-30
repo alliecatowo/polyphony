@@ -7,6 +7,7 @@ defmodule SymphonyElixir.Workspace do
   alias SymphonyElixir.{Config, PathSafety, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
+  @remote_validation_marker "__SYMPHONY_WORKSPACE_VALIDATION__"
 
   @type worker_host :: String.t() | nil
 
@@ -20,17 +21,38 @@ defmodule SymphonyElixir.Workspace do
 
       with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
-           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host) do
-        case maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
+           {:ok, bootstrap_workspace, created?, workspace} <-
+             ensure_workspace(workspace, safe_id, worker_host) do
+        case maybe_run_after_create_hook(bootstrap_workspace, issue_context, created?, worker_host) do
           :ok ->
-            {:ok, workspace}
+            with :ok <- validate_repository_workspace(bootstrap_workspace, issue_context, worker_host),
+                 {:ok, workspace} <- finalize_workspace(bootstrap_workspace, workspace, created?, worker_host) do
+              {:ok, workspace}
+            else
+              {:error, reason} = error ->
+                rollback_bootstrap_workspace(bootstrap_workspace, workspace, created?, worker_host)
+
+                error =
+                  if not created? and bootstrap_workspace == workspace do
+                    quarantine_invalid_workspace(error, workspace, worker_host)
+                  else
+                    error
+                  end
+
+                Logger.warning(
+                  "Workspace validation/finalization rolled back #{issue_log_context(issue_context)} " <>
+                    "worker_host=#{worker_host_for_log(worker_host)} reason=#{inspect(reason)}"
+                )
+
+                error
+            end
 
           {:error, reason} = error ->
             # Never leave a newly-created directory behind after bootstrap
             # fails. Reusing it would skip after_create on the next retry and
             # strand the worker without its repository/branch.
             if created? do
-              _ = remove(workspace, worker_host)
+              _ = remove_bootstrap_workspace(bootstrap_workspace, worker_host)
             end
 
             Logger.warning(
@@ -48,37 +70,53 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp ensure_workspace(workspace, nil) do
+  defp ensure_workspace(workspace, safe_id, nil) do
     cond do
       File.dir?(workspace) ->
-        {:ok, workspace, false}
+        {:ok, workspace, false, workspace}
 
       File.exists?(workspace) ->
-        File.rm_rf!(workspace)
-        create_workspace(workspace)
+        with {:ok, _quarantine_path} <- quarantine_workspace(workspace),
+             {:ok, bootstrap_workspace} <- create_workspace_stage(workspace, safe_id) do
+          {:ok, bootstrap_workspace, true, workspace}
+        end
 
       true ->
-        create_workspace(workspace)
+        with {:ok, bootstrap_workspace} <- create_workspace_stage(workspace, safe_id) do
+          {:ok, bootstrap_workspace, true, workspace}
+        end
     end
   end
 
-  defp ensure_workspace(workspace, worker_host) when is_binary(worker_host) do
+  defp ensure_workspace(workspace, safe_id, worker_host) when is_binary(worker_host) do
     script =
       [
         "set -eu",
         remote_shell_assign("workspace", workspace),
+        remote_shell_assign("safe_id", safe_id),
+        "workspace_root=\"$(dirname \"$workspace\")\"",
+        "bootstrap_root=\"$workspace_root/.symphony-bootstrap\"",
+        "mkdir -p \"$bootstrap_root\"",
         "if [ -d \"$workspace\" ]; then",
         "  created=0",
+        "  bootstrap=\"$workspace\"",
         "elif [ -e \"$workspace\" ]; then",
-        "  rm -rf \"$workspace\"",
-        "  mkdir -p \"$workspace\"",
+        "  quarantine=\"$workspace_root/.\"$(basename \"$workspace\")\".quarantine-\"$(date +%s)-$$\"\"",
+        "  mv \"$workspace\" \"$quarantine\"",
+        "  bootstrap=\"$bootstrap_root/$safe_id\"",
+        "  mkdir \"$bootstrap\"",
         "  created=1",
         "else",
-        "  mkdir -p \"$workspace\"",
+        "  bootstrap=\"$bootstrap_root/$safe_id\"",
+        "  if [ -e \"$bootstrap\" ]; then",
+        "    quarantine=\"$bootstrap_root/.\"$safe_id\".quarantine-\"$(date +%s)-$$\"\"",
+        "    mv \"$bootstrap\" \"$quarantine\"",
+        "  fi",
+        "  mkdir \"$bootstrap\"",
         "  created=1",
         "fi",
-        "cd \"$workspace\"",
-        "printf '%s\\t%s\\t%s\\n' '#{@remote_workspace_marker}' \"$created\" \"$(pwd -P)\""
+        "cd \"$bootstrap\"",
+        "printf '%s\\t%s\\t%s\\t%s\\n' '#{@remote_workspace_marker}' \"$created\" \"$workspace\" \"$(pwd -P)\""
       ]
       |> Enum.reject(&(&1 == ""))
       |> Enum.join("\n")
@@ -95,10 +133,101 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp create_workspace(workspace) do
-    File.rm_rf!(workspace)
-    File.mkdir_p!(workspace)
-    {:ok, workspace, true}
+  defp create_workspace_stage(workspace, safe_id) do
+    workspace_root = Path.dirname(workspace)
+    bootstrap_root = Path.join(workspace_root, ".symphony-bootstrap")
+    bootstrap_workspace = Path.join(bootstrap_root, safe_id)
+
+    File.mkdir_p!(bootstrap_root)
+
+    with :ok <- quarantine_existing_bootstrap(bootstrap_workspace),
+         :ok <- File.mkdir(bootstrap_workspace) do
+      {:ok, bootstrap_workspace}
+    else
+      {:error, :eexist} -> {:error, {:workspace_bootstrap_in_progress, bootstrap_workspace}}
+      {:error, reason} -> {:error, {:workspace_bootstrap_failed, bootstrap_workspace, reason}}
+    end
+  end
+
+  defp quarantine_existing_bootstrap(path) do
+    if File.exists?(path) do
+      case quarantine_workspace(path) do
+        {:ok, _quarantine_path} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp quarantine_workspace(path) do
+    quarantine_path =
+      Path.join(
+        Path.dirname(path),
+        ".#{Path.basename(path)}.quarantine-#{System.unique_integer([:positive])}"
+      )
+
+    case File.rename(path, quarantine_path) do
+      :ok -> {:ok, quarantine_path}
+      {:error, reason} -> {:error, {:workspace_quarantine_failed, path, reason}}
+    end
+  end
+
+  defp finalize_workspace(_bootstrap_workspace, workspace, false, _worker_host),
+    do: {:ok, workspace}
+
+  defp finalize_workspace(bootstrap_workspace, workspace, true, nil) do
+    case File.rename(bootstrap_workspace, workspace) do
+      :ok -> {:ok, workspace}
+      {:error, reason} -> {:error, {:workspace_promote_failed, bootstrap_workspace, workspace, reason}}
+    end
+  end
+
+  defp finalize_workspace(bootstrap_workspace, workspace, true, worker_host)
+       when is_binary(worker_host) do
+    script =
+      [
+        "set -eu",
+        remote_shell_assign("bootstrap", bootstrap_workspace),
+        remote_shell_assign("workspace", workspace),
+        "mv \"$bootstrap\" \"$workspace\"",
+        "cd \"$workspace\"",
+        "printf '%s\\t%s\\n' '#{@remote_workspace_marker}' \"$(pwd -P)\""
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} -> {:ok, workspace}
+      {:ok, {output, status}} -> {:error, {:workspace_promote_failed, worker_host, status, output}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp rollback_bootstrap_workspace(bootstrap_workspace, workspace, created?, worker_host) do
+    if created? and bootstrap_workspace != workspace do
+      _ = remove_bootstrap_workspace(bootstrap_workspace, worker_host)
+    end
+
+    :ok
+  end
+
+  defp quarantine_invalid_workspace({:error, reason}, workspace, nil) do
+    case quarantine_workspace(workspace) do
+      {:ok, quarantine_path} ->
+        {:error, {:workspace_quarantined, reason, quarantine_path}}
+
+      {:error, quarantine_reason} ->
+        {:error, {:workspace_quarantine_failed, workspace, quarantine_reason}}
+    end
+  end
+
+  defp quarantine_invalid_workspace(error, _workspace, _worker_host), do: error
+
+  defp remove_bootstrap_workspace(path, nil), do: File.rm_rf(path)
+
+  defp remove_bootstrap_workspace(path, worker_host) when is_binary(worker_host) do
+    script = [remote_shell_assign("workspace", path), "rm -rf \"$workspace\""] |> Enum.join("\n")
+    run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms)
   end
 
   @spec remove(Path.t()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
@@ -423,6 +552,230 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  defp validate_repository_workspace(workspace, issue_context, nil) do
+    strict_bootstrap? = repository_bootstrap_hook?()
+
+    case git_top_level(workspace) do
+      {:ok, top_level} ->
+        with {:ok, canonical_workspace} <- PathSafety.canonicalize(workspace),
+             {:ok, canonical_top_level} <- PathSafety.canonicalize(top_level),
+             :ok <- ensure_workspace_top_level(canonical_top_level, canonical_workspace),
+             :ok <- validate_workspace_remote(workspace),
+             :ok <- validate_workspace_branch(workspace, issue_context) do
+          :ok
+        end
+
+      {:error, _reason} when strict_bootstrap? ->
+        {:error, {:workspace_missing_repository, workspace}}
+
+      {:error, _reason} ->
+        # Some callers intentionally use Workspace as a plain directory
+        # lifecycle helper. Preserve that legacy behavior when no repository
+        # bootstrap was requested, while never permitting Git to discover a
+        # repository above the workspace.
+        :ok
+    end
+  end
+
+  defp validate_repository_workspace(workspace, issue_context, worker_host)
+       when is_binary(worker_host) do
+    if repository_bootstrap_hook?() do
+      script =
+        [
+          "set +e",
+          remote_shell_assign("workspace", workspace),
+          "canonical=\"$(cd \"$workspace\" 2>/dev/null && pwd -P)\"",
+          "top=\"$(git -C \"$workspace\" rev-parse --show-toplevel 2>/dev/null)\"",
+          "remote=\"$(git -C \"$workspace\" remote get-url origin 2>/dev/null)\"",
+          "branch=\"$(git -C \"$workspace\" branch --show-current 2>/dev/null)\"",
+          "if [ -z \"$top\" ]; then status=missing; elif [ \"$top\" != \"$canonical\" ]; then status=parent; else status=ok; fi",
+          "printf '%s\\t%s\\t%s\\t%s\\t%s\\n' '#{@remote_validation_marker}' \"$status\" \"$canonical\" \"$top\" \"$remote|$branch\"",
+          "exit 0"
+        ]
+        |> Enum.join("\n")
+
+      case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+        {:ok, {output, 0}} ->
+          validate_remote_repository_output(output, workspace, issue_context)
+
+        {:ok, {output, status}} ->
+          {:error, {:workspace_validation_failed, worker_host, status, output}}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp ensure_workspace_top_level(top_level, workspace) when top_level == workspace, do: :ok
+
+  defp ensure_workspace_top_level(top_level, workspace),
+    do: {:error, {:workspace_parent_repository, top_level, workspace}}
+
+  defp git_top_level(workspace) do
+    case run_git(workspace, ["rev-parse", "--show-toplevel"]) do
+      {:ok, output} when byte_size(output) > 0 -> {:ok, String.trim(output)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp validate_workspace_remote(workspace) do
+    case expected_repository() do
+      nil ->
+        :ok
+
+      expected ->
+        case run_git(workspace, ["remote", "get-url", "origin"]) do
+          {:ok, remote} ->
+            if remote_matches_repository?(String.trim(remote), expected) do
+              :ok
+            else
+              {:error, {:workspace_wrong_remote, String.trim(remote), expected}}
+            end
+
+          {:error, _reason} ->
+            {:error, {:workspace_missing_remote, expected}}
+        end
+    end
+  end
+
+  defp validate_workspace_branch(workspace, issue_context) do
+    expected_branch = expected_issue_branch(issue_context)
+
+    case run_git(workspace, ["branch", "--show-current"]) do
+      {:ok, branch} ->
+        validate_branch_name(branch, issue_context)
+
+      {:error, _reason} ->
+        {:error, {:workspace_detached_head, expected_branch}}
+    end
+  end
+
+  defp validate_remote_repository_output(output, workspace, issue_context) do
+    payload =
+      output
+      |> IO.iodata_to_binary()
+      |> String.split("\n", trim: true)
+      |> Enum.find_value(fn line ->
+        case String.split(line, "\t", parts: 5) do
+          [@remote_validation_marker, status, canonical, top, remote_and_branch]
+          when status in ["missing", "parent", "ok"] ->
+            {status, canonical, top, remote_and_branch}
+
+          _ ->
+            nil
+        end
+      end)
+
+    case payload do
+      {"missing", _canonical, _top, _remote_and_branch} ->
+        {:error, {:workspace_missing_repository, workspace}}
+
+      {"parent", canonical, top, _remote_and_branch} ->
+        {:error, {:workspace_parent_repository, top, canonical}}
+
+      {"ok", canonical, canonical, remote_and_branch} ->
+        case String.split(remote_and_branch, "|", parts: 2) do
+          [remote, branch] ->
+            with :ok <- validate_remote_identity(remote),
+                 :ok <- validate_branch_name(branch, issue_context) do
+              :ok
+            end
+
+          _ ->
+            {:error, {:workspace_validation_failed, :remote, :invalid_output, output}}
+        end
+
+      _ ->
+        {:error, {:workspace_validation_failed, :remote, :invalid_output, output}}
+    end
+  end
+
+  defp validate_remote_identity(remote) do
+    case expected_repository() do
+      nil ->
+        :ok
+
+      expected ->
+        if remote_matches_repository?(String.trim(remote), expected) do
+          :ok
+        else
+          {:error, {:workspace_wrong_remote, String.trim(remote), expected}}
+        end
+    end
+  end
+
+  defp validate_branch_name(branch, issue_context) do
+    expected_branch = expected_issue_branch(issue_context)
+
+    case String.trim(branch) do
+      ^expected_branch when expected_branch in ["main", "master", "trunk"] ->
+        {:error, {:workspace_non_unique_branch, expected_branch}}
+
+      ^expected_branch ->
+        :ok
+
+      actual ->
+        {:error, {:workspace_wrong_branch, actual, expected_branch}}
+    end
+  end
+
+  defp expected_issue_branch(%{issue_identifier: identifier, branch_name: branch_name}) do
+    case branch_name do
+      branch when is_binary(branch) ->
+        case String.trim(branch) do
+          "" -> "agent/polyphony-#{safe_identifier(identifier)}"
+          normalized_branch -> normalized_branch
+        end
+
+      _ ->
+        "agent/polyphony-#{safe_identifier(identifier)}"
+    end
+  end
+
+  defp expected_repository do
+    tracker = Config.settings!().tracker
+    owner = tracker.repo_owner
+    name = tracker.repo_name
+
+    if is_binary(owner) and String.trim(owner) != "" and is_binary(name) and String.trim(name) != "" do
+      "#{String.trim(owner)}/#{String.trim(name)}"
+    else
+      nil
+    end
+  end
+
+  defp remote_matches_repository?(remote, expected) do
+    normalized_remote = remote |> String.trim() |> String.trim_trailing(".git") |> String.downcase()
+    normalized_expected = String.downcase(expected)
+
+    String.ends_with?(normalized_remote, "/" <> normalized_expected) or
+      String.ends_with?(normalized_remote, ":" <> normalized_expected) or
+      normalized_remote == normalized_expected
+  end
+
+  defp repository_bootstrap_hook? do
+    case Config.settings!().hooks.after_create do
+      hook when is_binary(hook) ->
+        String.match?(hook, ~r/(^|\s|[;&|])git\s+(clone|init|worktree|switch|checkout|remote)\b/)
+
+      _ ->
+        false
+    end
+  end
+
+  defp run_git(workspace, arguments) when is_binary(workspace) and is_list(arguments) do
+    case System.cmd("git", ["-C", workspace | arguments], stderr_to_stdout: true) do
+      {output, 0} -> {:ok, String.trim(output)}
+      {output, status} -> {:error, {:git_command_failed, arguments, status, output}}
+    end
+  rescue
+    error in [ArgumentError, ErlangError, File.Error] ->
+      {:error, {:git_command_failed, arguments, error}}
+  end
+
   defp remote_shell_assign(variable_name, raw_path)
        when is_binary(variable_name) and is_binary(raw_path) do
     [
@@ -440,9 +793,15 @@ defmodule SymphonyElixir.Workspace do
 
     payload =
       Enum.find_value(lines, fn line ->
-        case String.split(line, "\t", parts: 3) do
+        case String.split(line, "\t", parts: 4) do
+          [@remote_workspace_marker, created, workspace, bootstrap]
+          when created in ["0", "1"] and workspace != "" and bootstrap != "" ->
+            {created == "1", bootstrap, workspace}
+
           [@remote_workspace_marker, created, path] when created in ["0", "1"] and path != "" ->
-            {created == "1", path}
+            # Compatibility with older remote workers and the fake SSH used
+            # by the lifecycle tests.
+            {created == "1", path, path}
 
           _ ->
             nil
@@ -450,8 +809,9 @@ defmodule SymphonyElixir.Workspace do
       end)
 
     case payload do
-      {created?, workspace} when is_boolean(created?) and is_binary(workspace) ->
-        {:ok, workspace, created?}
+      {created?, bootstrap_workspace, workspace}
+      when is_boolean(created?) and is_binary(bootstrap_workspace) and is_binary(workspace) ->
+        {:ok, bootstrap_workspace, created?, workspace}
 
       _ ->
         {:error, {:workspace_prepare_failed, :invalid_output, output}}
@@ -482,24 +842,35 @@ defmodule SymphonyElixir.Workspace do
   defp worker_host_for_log(nil), do: "local"
   defp worker_host_for_log(worker_host), do: worker_host
 
+  defp issue_context(%{id: issue_id, identifier: identifier, branch_name: branch_name}) do
+    %{
+      issue_id: issue_id,
+      issue_identifier: identifier || "issue",
+      branch_name: branch_name
+    }
+  end
+
   defp issue_context(%{id: issue_id, identifier: identifier}) do
     %{
       issue_id: issue_id,
-      issue_identifier: identifier || "issue"
+      issue_identifier: identifier || "issue",
+      branch_name: nil
     }
   end
 
   defp issue_context(identifier) when is_binary(identifier) do
     %{
       issue_id: nil,
-      issue_identifier: identifier
+      issue_identifier: identifier,
+      branch_name: nil
     }
   end
 
   defp issue_context(_identifier) do
     %{
       issue_id: nil,
-      issue_identifier: "issue"
+      issue_identifier: "issue",
+      branch_name: nil
     }
   end
 

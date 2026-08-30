@@ -68,6 +68,9 @@ fi
 # the hot polling path. This keeps candidate discovery responsive.
 export POLYPHONY_SKIP_BOARD_BOOTSTRAP=1
 export POLYPHONY_SKIP_BOARD_ENRICHMENT=1
+export POLYPHONY_RUNTIME_STATE_DIR="$elixir_root/.polyphony/runtime"
+export POLYPHONY_PROJECT_ID="${POLYPHONY_PROJECT_ID:-patches}"
+export POLYPHONY_PROJECT_CGROUP="${POLYPHONY_PROJECT_CGROUP:-polyphony-patches.service}"
 
 # Keep Codex sandboxes and transient files out of shared /tmp pressure, and
 # give the shared app-server enough descriptors for six workers.
@@ -104,7 +107,13 @@ for config_var in \
   GITHUB_PROJECT_OWNER_TYPE \
   GITHUB_PROJECT_OWNER_LOGIN \
   GITHUB_PROJECT_TITLE \
-  GITHUB_ASSIGNEE; do
+  GITHUB_ASSIGNEE \
+  GITHUB_WEBHOOK_SECRET \
+  POLYPHONY_SKIP_BOARD_BOOTSTRAP \
+  POLYPHONY_SKIP_BOARD_ENRICHMENT \
+  POLYPHONY_RUNTIME_STATE_DIR \
+  POLYPHONY_PROJECT_ID \
+  POLYPHONY_PROJECT_CGROUP; do
   if [[ -n "${!config_var:-}" ]]; then
     auth_args+=(--setenv="$config_var=${!config_var}")
   fi

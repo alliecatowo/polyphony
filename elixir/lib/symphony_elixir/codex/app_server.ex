@@ -8,11 +8,14 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   @initialize_id 1
   @thread_start_id 2
+  @thread_resume_id 2
   @turn_start_id 3
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
   @proxy_bridge Path.expand("../../../../scripts/codex-proxy.py", __DIR__)
+  @provider_retry_base_ms 60_000
+  @provider_retry_max_ms 900_000
 
   @type session :: %{
           port: port(),
@@ -37,17 +40,42 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  @doc "Classifies Codex app-server/provider errors without treating ordinary turn failures as outages."
+  @spec classify_provider_error(term(), keyword()) :: {:ok, map()} | :none
+  def classify_provider_error(reason, opts \\ []) do
+    text = provider_error_text(reason)
+
+    cond do
+      usage_limit_text?(text) ->
+        {:ok, provider_error_details(:usage_limit, reason, opts)}
+
+      rate_limit_text?(text) ->
+        {:ok, provider_error_details(:rate_limit, reason, opts)}
+
+      true ->
+        :none
+    end
+  end
+
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
     model = Keyword.get(opts, :model)
+    resume_thread_id = Keyword.get(opts, :resume_thread_id)
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host) do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies, model) do
+           {:ok, thread_id} <-
+             do_start_session(
+               port,
+               expanded_workspace,
+               session_policies,
+               model,
+               resume_thread_id
+             ) do
         {:ok,
          %{
            port: port,
@@ -106,7 +134,13 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+        case await_turn_completion(
+               port,
+               on_message,
+               tool_executor,
+               auto_approve_requests,
+               Keyword.get(opts, :provider_retry_attempt, 0)
+             ) do
           {:ok, result} ->
             Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
@@ -285,9 +319,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace, remote: true)
   end
 
-  defp do_start_session(port, workspace, session_policies, model) do
+  defp do_start_session(port, workspace, session_policies, model, resume_thread_id) do
     case send_initialize(port) do
-      :ok -> start_thread(port, workspace, session_policies, model)
+      :ok -> start_or_resume_thread(port, workspace, session_policies, model, resume_thread_id)
       {:error, reason} -> {:error, reason}
     end
   end
@@ -310,14 +344,62 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     case await_response(port, @thread_start_id) do
       {:ok, %{"thread" => thread_payload}} ->
-        case thread_payload do
-          %{"id" => thread_id} -> {:ok, thread_id}
-          _ -> {:error, {:invalid_thread_payload, thread_payload}}
-        end
+        validate_thread_payload(thread_payload)
 
       other ->
         other
     end
+  end
+
+  defp start_or_resume_thread(port, workspace, session_policies, model, resume_thread_id)
+       when is_binary(resume_thread_id) do
+    case String.trim(resume_thread_id) do
+      "" -> start_thread(port, workspace, session_policies, model)
+      thread_id -> resume_thread(port, workspace, session_policies, model, thread_id)
+    end
+  end
+
+  defp start_or_resume_thread(port, workspace, session_policies, model, _resume_thread_id) do
+    start_thread(port, workspace, session_policies, model)
+  end
+
+  defp resume_thread(
+         port,
+         workspace,
+         %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
+         model,
+         thread_id
+       ) do
+    params = %{
+      "threadId" => thread_id,
+      "approvalPolicy" => approval_policy,
+      "sandbox" => thread_sandbox,
+      "cwd" => workspace
+    }
+
+    params = if is_binary(model) and model != "", do: Map.put(params, "model", model), else: params
+
+    send_message(port, %{
+      "method" => "thread/resume",
+      "id" => @thread_resume_id,
+      "params" => params
+    })
+
+    case await_response(port, @thread_resume_id) do
+      {:ok, %{"thread" => thread_payload}} -> validate_thread_payload(thread_payload)
+      other -> other
+    end
+  end
+
+  defp validate_thread_payload(%{"id" => thread_id}) when is_binary(thread_id) do
+    case String.trim(thread_id) do
+      "" -> {:error, {:invalid_thread_payload, %{"id" => thread_id}}}
+      _ -> {:ok, thread_id}
+    end
+  end
+
+  defp validate_thread_payload(thread_payload) do
+    {:error, {:invalid_thread_payload, thread_payload}}
   end
 
   defp ensure_shared_app_server do
@@ -362,22 +444,23 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests, retry_attempt) do
     receive_loop(
       port,
       on_message,
       Config.settings!().codex.turn_timeout_ms,
       "",
       tool_executor,
-      auto_approve_requests
+      auto_approve_requests,
+      retry_attempt
     )
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, retry_attempt) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests, retry_attempt)
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
@@ -386,7 +469,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           timeout_ms,
           pending_line <> to_string(chunk),
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          retry_attempt
         )
 
       {^port, {:exit_status, status}} ->
@@ -397,7 +481,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
+  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests, retry_attempt) do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
@@ -405,29 +489,42 @@ defmodule SymphonyElixir.Codex.AppServer do
         emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
         {:ok, :turn_completed}
 
-      {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
+      {:ok, %{"method" => "turn/failed", "params" => params} = payload} ->
         emit_turn_event(
           on_message,
           :turn_failed,
           payload,
           payload_string,
           port,
-          Map.get(payload, "params")
+          params
         )
 
-        {:error, {:turn_failed, Map.get(payload, "params")}}
+        provider_error_result({:turn_failed, params}, retry_attempt)
 
-      {:ok, %{"method" => "turn/cancelled", "params" => _} = payload} ->
+      {:ok, %{"method" => "turn/cancelled", "params" => params} = payload} ->
         emit_turn_event(
           on_message,
           :turn_cancelled,
           payload,
           payload_string,
           port,
-          Map.get(payload, "params")
+          params
         )
 
-        {:error, {:turn_cancelled, Map.get(payload, "params")}}
+        provider_error_result({:turn_cancelled, params}, retry_attempt)
+
+      {:ok, %{"method" => "account/rateLimits/updated"} = payload} ->
+        metadata = metadata_from_message(port, payload)
+
+        case classify_rate_limit_notification(payload, retry_attempt) do
+          {:ok, details} ->
+            emit_message(on_message, :provider_unavailable, %{payload: payload, details: details, raw: payload_string}, metadata)
+            {:error, {:codex_provider_unavailable, details}}
+
+          :none ->
+            emit_message(on_message, :notification, %{payload: payload, raw: payload_string}, metadata)
+            receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, retry_attempt)
+        end
 
       {:ok, %{"method" => method} = payload}
       when is_binary(method) ->
@@ -439,7 +536,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           method,
           timeout_ms,
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          retry_attempt
         )
 
       {:ok, payload} ->
@@ -453,7 +551,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata_from_message(port, payload)
         )
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, retry_attempt)
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -470,7 +568,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
         end
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, retry_attempt)
     end
   end
 
@@ -495,7 +593,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          method,
          timeout_ms,
          tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         retry_attempt
        ) do
     metadata = metadata_from_message(port, payload)
 
@@ -520,7 +619,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_input_required, payload}}
 
       :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, retry_attempt)
 
       :approval_required ->
         emit_message(
@@ -554,7 +653,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
 
           Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, retry_attempt)
         end
     end
   end
@@ -981,13 +1080,13 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     case Jason.decode(payload) do
       {:ok, %{"id" => ^request_id, "error" => error}} ->
-        {:error, {:response_error, error}}
+        provider_error_result({:response_error, error}, 0)
 
       {:ok, %{"id" => ^request_id, "result" => result}} ->
         {:ok, result}
 
       {:ok, %{"id" => ^request_id} = response_payload} ->
-        {:error, {:response_error, response_payload}}
+        provider_error_result({:response_error, response_payload}, 0)
 
       {:ok, %{} = other} ->
         Logger.debug("Ignoring message while waiting for response: #{inspect(other)}")
@@ -1062,6 +1161,182 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp maybe_set_usage(metadata, _payload), do: metadata
+
+  defp provider_error_result(reason, retry_attempt) do
+    case classify_provider_error(reason, retry_attempt: retry_attempt) do
+      {:ok, details} -> {:error, {:codex_provider_unavailable, details}}
+      :none -> {:error, reason}
+    end
+  end
+
+  defp classify_rate_limit_notification(payload, retry_attempt) do
+    rate_limits = Map.get(payload, "params", %{}) |> value_from_map(["rateLimits", "rate_limits"])
+
+    if is_map(rate_limits) and exhausted_rate_limits?(rate_limits) do
+      {:ok, provider_error_details(:rate_limit, payload, retry_attempt: retry_attempt)}
+    else
+      :none
+    end
+  end
+
+  defp provider_error_details(kind, reason, opts) do
+    retry_in_ms = provider_retry_in_ms(reason) || computed_retry_in_ms(Keyword.get(opts, :retry_attempt, 0))
+
+    %{
+      kind: kind,
+      message: provider_error_text(reason) |> String.slice(0, @max_stream_log_bytes),
+      retry_in_ms: retry_in_ms,
+      retry_at_ms: System.system_time(:millisecond) + retry_in_ms,
+      source: :codex_app_server
+    }
+  end
+
+  defp provider_error_text(reason) when is_binary(reason), do: String.downcase(reason)
+
+  defp provider_error_text(reason) do
+    reason
+    |> inspect(limit: :infinity, printable_limit: @max_stream_log_bytes)
+    |> String.downcase()
+  end
+
+  defp usage_limit_text?(text) when is_binary(text) do
+    String.contains?(text, [
+      "usage_limit_exceeded",
+      "usage limit",
+      "quota exceeded",
+      "quota_exceeded",
+      "spend_control_reached"
+    ])
+  end
+
+  defp rate_limit_text?(text) when is_binary(text) do
+    String.contains?(text, [
+      "rate_limit_exceeded",
+      "rate limit",
+      "rate_limit",
+      "too many requests",
+      "429"
+    ])
+  end
+
+  defp value_from_map(map, keys) when is_map(map) and is_list(keys) do
+    Enum.find_value(keys, &Map.get(map, &1))
+  end
+
+  defp value_from_map(_map, _keys), do: nil
+
+  defp exhausted_rate_limits?(rate_limits) when is_map(rate_limits) do
+    reached_type = value_from_map(rate_limits, ["rateLimitReachedType", "rate_limit_reached_type"])
+
+    (is_binary(reached_type) and String.trim(reached_type) != "") or
+      Enum.any?(["primary", "secondary"], fn window_name ->
+        case Map.get(rate_limits, window_name) do
+          window when is_map(window) ->
+            used_percent = value_from_map(window, ["usedPercent", "used_percent"])
+            remaining = value_from_map(window, ["remaining"])
+            (is_number(used_percent) and used_percent >= 100) or remaining == 0
+
+          _ ->
+            false
+        end
+      end)
+  end
+
+  defp exhausted_rate_limits?(_rate_limits), do: false
+
+  defp provider_retry_in_ms(reason) when is_map(reason) do
+    retry_values =
+      reason
+      |> provider_retry_candidates()
+      |> Enum.filter(&is_integer/1)
+      |> Enum.filter(&(&1 > 0))
+
+    case retry_values do
+      [] -> nil
+      values -> Enum.min(values)
+    end
+  end
+
+  defp provider_retry_in_ms(reason) when is_tuple(reason) do
+    reason
+    |> Tuple.to_list()
+    |> Enum.find_value(&provider_retry_in_ms/1)
+  end
+
+  defp provider_retry_in_ms(_reason), do: nil
+
+  defp provider_retry_candidates(map) when is_map(map) do
+    Enum.flat_map(map, fn {key, value} ->
+      key = to_string(key)
+
+      direct =
+        cond do
+          key in ["retry_in_ms", "retryInMs", "retry_after_ms", "retryAfterMs"] ->
+            [integer_value(value)]
+
+          key in ["retry_after", "retryAfter"] ->
+            [duration_ms(value)]
+
+          key in ["retry_at_ms", "retryAtMs"] ->
+            case integer_value(value) do
+              retry_at_ms when is_integer(retry_at_ms) -> [retry_at_ms - System.system_time(:millisecond)]
+              _ -> []
+            end
+
+          key in ["resets_at", "resetsAt", "reset_at", "resetAt"] ->
+            [reset_delay_ms(value)]
+
+          true ->
+            []
+        end
+
+      nested = if is_map(value), do: provider_retry_candidates(value), else: []
+      direct ++ nested
+    end)
+  end
+
+  defp provider_retry_candidates(_map), do: []
+
+  defp integer_value(value) when is_integer(value), do: value
+  defp integer_value(value) when is_float(value), do: trunc(value)
+
+  defp integer_value(value) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {integer, _} -> integer
+      _ -> nil
+    end
+  end
+
+  defp integer_value(_value), do: nil
+
+  defp duration_ms(value) do
+    case integer_value(value) do
+      seconds when is_integer(seconds) and seconds > 0 and seconds < 1_000_000 -> seconds * 1_000
+      milliseconds when is_integer(milliseconds) -> milliseconds
+      _ -> nil
+    end
+  end
+
+  defp reset_delay_ms(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, datetime, _offset} -> max(DateTime.to_unix(datetime, :millisecond) - System.system_time(:millisecond), 0)
+      _ -> reset_delay_ms(integer_value(value))
+    end
+  end
+
+  defp reset_delay_ms(value) when is_integer(value) and value > 1_000_000_000 do
+    max(value * 1_000 - System.system_time(:millisecond), 0)
+  end
+
+  defp reset_delay_ms(value) when is_integer(value), do: duration_ms(value)
+  defp reset_delay_ms(_value), do: nil
+
+  defp computed_retry_in_ms(attempt) when is_integer(attempt) and attempt >= 0 do
+    multiplier = Integer.pow(2, min(attempt, 4))
+    min(@provider_retry_base_ms * multiplier, @provider_retry_max_ms)
+  end
+
+  defp computed_retry_in_ms(_attempt), do: @provider_retry_base_ms
 
   defp shell_escape(value) when is_binary(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"

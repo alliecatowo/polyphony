@@ -961,7 +961,16 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp format_rate_limits(rate_limits) when is_map(rate_limits) do
     limit_id =
-      map_value(rate_limits, ["limit_id", :limit_id, "limit_name", :limit_name]) ||
+      map_value(rate_limits, [
+        "limit_id",
+        :limit_id,
+        "limitId",
+        :limitId,
+        "limit_name",
+        :limit_name,
+        "limitName",
+        :limitName
+      ]) ||
         "unknown"
 
     primary = format_rate_limit_bucket(map_value(rate_limits, ["primary", :primary]))
@@ -989,6 +998,8 @@ defmodule SymphonyElixir.StatusDashboard do
   defp format_rate_limit_bucket(bucket) when is_map(bucket) do
     remaining = map_value(bucket, ["remaining", :remaining])
     limit = map_value(bucket, ["limit", :limit])
+    used_percent = map_value(bucket, ["usedPercent", :usedPercent, "used_percent", :used_percent])
+    window_minutes = map_value(bucket, ["windowDurationMins", :windowDurationMins, "window_duration_mins", :window_duration_mins])
 
     reset_value =
       map_value(bucket, [
@@ -1016,6 +1027,12 @@ defmodule SymphonyElixir.StatusDashboard do
 
         integer_like?(limit) ->
           "limit #{format_count(limit)}"
+
+        is_number(used_percent) and integer_like?(window_minutes) ->
+          "#{format_number(used_percent)}% / #{format_count(window_minutes)}m"
+
+        is_number(used_percent) ->
+          "#{format_number(used_percent)}% used"
 
         map_size(bucket) == 0 ->
           "n/a"

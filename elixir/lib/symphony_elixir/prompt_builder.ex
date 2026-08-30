@@ -32,6 +32,7 @@ defmodule SymphonyElixir.PromptBuilder do
     rendered
     |> append_board_context(Keyword.get(opts, :board_context))
     |> append_slice_context(issue)
+    |> append_retry_context(issue)
     |> append_worker_role(issue)
   end
 
@@ -54,6 +55,22 @@ defmodule SymphonyElixir.PromptBuilder do
       prompt <> "\n\n## Explicit slice\nTreat this as one coherent slice and coordinate these related issues in one workspace/PR or stack when appropriate:\n" <> summary
     else
       prompt
+    end
+  end
+
+  defp append_retry_context(prompt, issue) do
+    issue_map = if is_struct(issue), do: Map.from_struct(issue), else: issue
+    metadata = Map.get(issue_map, :tracker_metadata, %{})
+
+    case Map.get(metadata, "delivery_failure_reason") do
+      nil ->
+        prompt
+
+      reason ->
+        encoded = Jason.encode!(reason)
+
+        prompt <>
+          "\n\n## Harness retry context\nThe previous delivery failed after the local handoff. Diagnose and fix the following persisted CI/delivery evidence, then rerun the relevant local validation. Do not poll GitHub or perform delivery yourself.\n\n```json\n#{encoded}\n```"
     end
   end
 

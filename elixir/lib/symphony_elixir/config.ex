@@ -67,11 +67,15 @@ defmodule SymphonyElixir.Config do
   def codex_model_for_issue(issue, opts \\ []) do
     models = settings!().codex.models || %{}
     labels = issue |> Map.get(:labels, Map.get(issue, "labels", [])) |> normalize_worker_labels()
-    attempt = Keyword.get(opts, :attempt, 0)
+    metadata = Map.get(issue, :tracker_metadata, Map.get(issue, "tracker_metadata", %{}))
+    failure_attempt = Keyword.get(opts, :failure_attempt) || Map.get(metadata, "failure_attempt", 0)
+    failure_class = Keyword.get(opts, :failure_class) || Map.get(metadata, "failure_class")
+    escalatable_failure? = failure_class in [:code, :ci, :merge_conflict, "code", "ci", "merge_conflict"]
 
     profile =
       cond do
-        is_integer(attempt) and attempt >= 2 -> "escalation"
+        escalatable_failure? and is_integer(failure_attempt) and failure_attempt >= 3 -> "escalation"
+        escalatable_failure? and is_integer(failure_attempt) and failure_attempt >= 2 -> "review"
         Enum.any?(labels, &(&1 in ["audit", "escalate", "escalation", "sol"])) -> "escalation"
         Enum.any?(labels, &(&1 in ["review", "stack", "stacked-pr", "stack-reconcile", "stack/reconcile"])) -> "review"
         true -> "default"

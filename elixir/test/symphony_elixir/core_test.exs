@@ -126,7 +126,12 @@ defmodule SymphonyElixir.CoreTest do
     assert Config.codex_model_for_issue(%{state: "Todo", labels: []}) == "gpt-5.6-luna"
     assert Config.codex_model_for_issue(%{state: "Todo", labels: ["review"]}) == "gpt-5.6-terra"
     assert Config.codex_model_for_issue(%{state: "Todo", labels: ["audit"]}) == "gpt-5.6-sol"
-    assert Config.codex_model_for_issue(%{state: "Todo", labels: []}, attempt: 2) == "gpt-5.6-sol"
+    assert Config.codex_model_for_issue(%{state: "Todo", labels: []}, attempt: 2) == "gpt-5.6-luna"
+
+    assert Config.codex_model_for_issue(%{state: "Todo", labels: []},
+             failure_class: :ci,
+             failure_attempt: 3
+           ) == "gpt-5.6-sol"
 
     assert String.trim(prompt) != ""
     assert is_binary(Config.workflow_prompt())

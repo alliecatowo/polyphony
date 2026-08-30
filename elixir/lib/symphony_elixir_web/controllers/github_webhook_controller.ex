@@ -8,6 +8,7 @@ defmodule SymphonyElixirWeb.GitHubWebhookController do
   require Logger
 
   alias SymphonyElixir.GitHub.WebhookStore
+  alias SymphonyElixir.Orchestrator
   alias SymphonyElixirWeb.Endpoint
 
   @spec receive(Plug.Conn.t(), map()) :: Plug.Conn.t()
@@ -16,7 +17,8 @@ defmodule SymphonyElixirWeb.GitHubWebhookController do
          :ok <- verify_signature(conn),
          {:ok, event} <- fetch_event(conn),
          {:ok, delivery_id} <- fetch_delivery(conn),
-         {:ok, result} <- WebhookStore.ingest(webhook_headers(conn), params, store: webhook_store()) do
+         {:ok, result} <- WebhookStore.ingest(webhook_headers(conn), params, store: webhook_store()),
+         :ok <- enqueue_targeted_refresh(result.targeted_refresh) do
       acknowledge(conn, event, delivery_id, result)
     else
       {:error, :missing_webhook_secret} ->
@@ -50,6 +52,16 @@ defmodule SymphonyElixirWeb.GitHubWebhookController do
         conn
         |> put_status(503)
         |> json(%{"error" => %{"code" => "webhook_store_unavailable", "message" => "Webhook could not be durably recorded"}})
+
+      {:error, :orchestrator_unavailable} ->
+        conn
+        |> put_status(503)
+        |> json(%{
+          "error" => %{
+            "code" => "orchestrator_unavailable",
+            "message" => "Webhook was recorded but could not be queued yet"
+          }
+        })
 
       {:error, {:missing_header, "x-github-delivery"}} ->
         conn
@@ -104,6 +116,32 @@ defmodule SymphonyElixirWeb.GitHubWebhookController do
 
   defp webhook_store do
     Endpoint.config(:webhook_store) || WebhookStore
+  end
+
+  defp enqueue_targeted_refresh(targets) when is_map(targets) do
+    if targeted_work?(targets) do
+      case Orchestrator.request_targeted_refresh(orchestrator(), targets) do
+        :unavailable -> {:error, :orchestrator_unavailable}
+        %{} -> :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  defp enqueue_targeted_refresh(_targets), do: :ok
+
+  defp targeted_work?(targets) do
+    Enum.any?(["issues", "pull_requests", "checks", "workflows", "refs"], fn key ->
+      case Map.get(targets, key) do
+        values when is_list(values) -> values != []
+        _ -> false
+      end
+    end)
+  end
+
+  defp orchestrator do
+    Endpoint.config(:orchestrator) || Orchestrator
   end
 
   defp ensure_secret_configured do
