@@ -128,7 +128,7 @@ defmodule SymphonyElixir.Config do
 
     prefix =
       [
-        "systemd-run --user --scope --quiet --collect",
+        "systemd-run --user --scope --quiet --collect --expand-environment=no",
         "--unit=#{unit}",
         "--property=CPUQuota=#{worker.cpu_quota_percent}%",
         "--property=MemoryMax=#{worker.memory_max_mb}M",
