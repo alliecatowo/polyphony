@@ -60,6 +60,7 @@ fi
 # older GITHUB_TOKEN may still be exported by the user's shell.
 if [[ -n "${GITHUB_PAT:-}" ]]; then
   export GITHUB_TOKEN="$GITHUB_PAT"
+  export GITHUB_OAUTH_TOKEN="$GITHUB_PAT"
   export GH_TOKEN="$GITHUB_PAT"
 fi
 
