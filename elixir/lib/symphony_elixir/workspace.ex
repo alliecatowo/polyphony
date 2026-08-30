@@ -258,12 +258,14 @@ defmodule SymphonyElixir.Workspace do
         :ok
 
       command ->
+        bounded_command = bounded_hook_command(command, "before_remove", workspace)
+
         script =
           [
             remote_shell_assign("workspace", workspace),
             "if [ -d \"$workspace\" ]; then",
             "  cd \"$workspace\"",
-            "  #{command}",
+            "  #{bounded_command}",
             "fi"
           ]
           |> Enum.join("\n")
@@ -298,7 +300,7 @@ defmodule SymphonyElixir.Workspace do
 
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
+        System.cmd("sh", ["-lc", bounded_hook_command(command, hook_name, workspace)], cd: workspace, stderr_to_stdout: true)
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -319,7 +321,9 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
-    case run_remote_command(worker_host, "cd #{shell_escape(workspace)} && #{command}", timeout_ms) do
+    bounded_command = bounded_hook_command(command, hook_name, workspace)
+
+    case run_remote_command(worker_host, "cd #{shell_escape(workspace)} && #{bounded_command}", timeout_ms) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
@@ -329,6 +333,11 @@ defmodule SymphonyElixir.Workspace do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  defp bounded_hook_command(command, hook_name, workspace)
+       when is_binary(command) and is_binary(hook_name) and is_binary(workspace) do
+    Config.worker_resource_command("sh -lc #{shell_escape(command)}", "hook-#{hook_name}-#{Path.basename(workspace)}")
   end
 
   defp handle_hook_command_result({_output, 0}, _workspace, _issue_id, _hook_name) do

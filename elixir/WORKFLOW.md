@@ -9,76 +9,59 @@ tracker:
   project_owner_login: "$GITHUB_PROJECT_OWNER_LOGIN"
   project_title: "$GITHUB_PROJECT_TITLE"
   active_states:
-    - OPEN
-    - In Progress
     - Todo
-    - Rework
-    - Merging
+    - In Progress
   terminal_states:
-    - Closed
-    - Cancelled
-    - Canceled
-    - Duplicate
     - Done
+    - Closed
+    - Canceled
   status_map:
     Todo:
       state: open
     In Progress:
       state: open
-    Human Review:
-      state: open
-    Rework:
-      state: open
-    Merging:
-      state: open
     Done:
       state: closed
       state_reason: completed
-    Cancelled:
+    Canceled:
       state: closed
       state_reason: not_planned
-  required_project_fields:
-    Status:
-      type: single_select
-      options:
-        - Todo
-        - In Progress
-        - Human Review
-        - Rework
-        - Merging
-        - Done
-        - Cancelled
-    Points:
-      type: number
-    Progress:
-      type: number
-    Target Date:
-      type: date
-    Iteration:
-      type: iteration
-    Notes:
-      type: text
 polling:
   interval_ms: 5000
 workspace:
-  root: ~/code/polyphony-workspaces
+  root: ~/develop/patches/.polyphony/workspaces
 hooks:
   after_create: |
-    git clone --depth 1 https://github.com/$GITHUB_REPO_OWNER/$GITHUB_REPO_NAME .
-    if command -v mise >/dev/null 2>&1; then
-      cd elixir && mise trust && mise exec -- mix deps.get
-    fi
+    git clone --local --no-hardlinks "$HOME/develop/patches" .
   before_run: |
-    ./elixir/scripts/polyphony_issue_artifacts.sh before_run
+    issue_id="$(basename "$PWD")"
+    mkdir -p "docs/issues/${issue_id}/logs" "docs/issues/${issue_id}/evidence" "docs/issues/${issue_id}/decisions" "docs/issues/${issue_id}/spikes"
+    printf '%s phase=before_run workspace=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" >> "docs/issues/${issue_id}/run-log.md"
   after_run: |
-    ./elixir/scripts/polyphony_issue_artifacts.sh after_run
+    issue_id="$(basename "$PWD")"
+    printf '%s phase=after_run workspace=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" >> "docs/issues/${issue_id}/run-log.md"
   before_remove: |
-    cd elixir && mise exec -- mix workspace.before_remove
+    true
+worker:
+  # Model profiles are selected per Codex thread below. Polyphony itself runs locally.
+  ssh_hosts: []
+  max_concurrent_agents_per_host: 4
+  # Hard limits are applied to each Codex process tree with systemd-run --user.
+  # Keep the aggregate below this workstation's 14 GiB RAM / 16 CPU threads.
+  cpu_quota_percent: 250
+  memory_max_mb: 3072
+  tasks_max: 384
+  cgroup_required: true
 agent:
-  max_concurrent_agents: 10
+  max_concurrent_agents: 6
   max_turns: 20
 codex:
-  command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
+  command: codex --config shell_environment_policy.inherit=all app-server
+  shared_app_server: true
+  models:
+    default: gpt-5.6-luna
+    review: gpt-5.6-terra
+    escalation: gpt-5.6-sol
   approval_policy: never
   thread_sandbox: workspace-write
   turn_sandbox_policy:
@@ -123,6 +106,15 @@ Instructions:
 1. This is an unattended orchestration session. Never ask a human to perform follow-up actions.
 2. Only stop early for a true blocker (missing required auth/permissions/secrets). If blocked, record it in the workpad and move the issue according to workflow.
 3. Final message must report completed actions and blockers only. Do not include "next steps for user".
+
+## Slice and stacked-PR policy
+
+- Treat the board as a dependency graph, not a FIFO list. The injected Board context is a compact planning hint; verify the live Project fields, blockers, parent/sub-issues, and linked PRs before editing.
+- Prefer a coherent vertical slice: work on a parent issue and its disjoint leaves together when the board has an explicit parent/sub-issue relationship or shared `slice:` label. Keep heavy CI at the slice boundary and avoid duplicating full-suite runs for every leaf.
+- Normal implementation workers may prepare one logical change or stack layer, but must not merge. Keep branches in the Patches repository and preserve the repository's existing `gh-stack` skill.
+- A worker assigned an issue labelled `stack`, `stacked-pr`, `stack-reconcile`, or `stack/reconcile` is the Terra stack reconciler. It must inspect the complete stack with `gh stack view --json`, synchronize/rebase with `gh stack sync` and `gh stack rebase` as needed, wait for all required checks, and use `gh stack merge --yes` only when every stack PR is green and no human hold is present. Reconcile issue statuses and workpads for the whole stack afterward.
+- When a normal worker finishes a coherent stacked slice and has opened/updated its PRs, it must add `stack-reconcile` to the slice's lead issue and leave the lead issue active. This is the handoff signal that causes the next poll to dispatch Terra for whole-stack reconciliation.
+- Do not invent a stack or merge a single PR merely because one issue is complete. If the stack is ambiguous, leave it in review and record the exact blocker.
 
 Work only in the provided repository copy. Do not touch any other path.
 

@@ -12,7 +12,7 @@ defmodule SymphonyElixir.GitHub.Client do
   require Logger
   alias SymphonyElixir.{Config, GitHub.Auth, GitHub.Issue}
 
-  @issue_page_size 50
+  @issue_page_size 20
   @max_error_body_log_bytes 1_000
 
   @issue_fields """
@@ -39,16 +39,16 @@ defmodule SymphonyElixir.GitHub.Client do
     }
   }
   assignees(first: 10) { nodes { login } }
-  labels(first: 30) { nodes { name } }
+  labels(first: 10) { nodes { name } }
   milestone { id number title dueOn state description }
   parent { id number title state url }
   subIssues(first: 20) { nodes { id number title state url } }
-  projectItems(first: 20) {
+  projectItems(first: 10) {
     nodes {
       id
       isArchived
       project { id number title url }
-      fieldValues(first: 50) {
+      fieldValues(first: 20) {
         nodes {
           __typename
           ... on ProjectV2ItemFieldDateValue {
@@ -63,7 +63,7 @@ defmodule SymphonyElixir.GitHub.Client do
             field { ... on ProjectV2FieldCommon { id name } }
           }
           ... on ProjectV2ItemFieldLabelValue {
-            labels(first: 20) { nodes { id name } }
+            labels(first: 10) { nodes { id name } }
             field { ... on ProjectV2FieldCommon { id name } }
           }
           ... on ProjectV2ItemFieldMilestoneValue {
@@ -136,11 +136,22 @@ defmodule SymphonyElixir.GitHub.Client do
             isArchived
             content {
               ... on Issue {
-                #{@issue_fields}
+                id
+                number
+                title
+                body
+                state
+                stateReason
+                url
+                assignees(first: 10) { nodes { login } }
+                labels(first: 10) { nodes { name } }
+                milestone { id number title dueOn state description }
+                parent { id number title state url }
+                subIssues(first: 10) { nodes { id number title state url } }
                 repository { id nameWithOwner }
               }
             }
-            fieldValues(first: 50) {
+            fieldValues(first: 20) {
               nodes {
                 __typename
                 ... on ProjectV2ItemFieldDateValue {
@@ -338,14 +349,12 @@ defmodule SymphonyElixir.GitHub.Client do
 
   @update_single_select_field_query """
   mutation SymphonyGitHubUpdateSingleSelectField(
-    $projectId: ID!,
     $fieldId: ID!,
     $name: String!,
     $singleSelectOptions: [ProjectV2SingleSelectFieldOptionInput!]!
   ) {
     updateProjectV2Field(
       input: {
-        projectId: $projectId,
         fieldId: $fieldId,
         name: $name,
         singleSelectOptions: $singleSelectOptions
@@ -1136,12 +1145,14 @@ defmodule SymphonyElixir.GitHub.Client do
       "pull_request_lifecycle" => normalize_pr_lifecycle(issue)
     }
 
+    project_fields = project_field_snapshot(metadata["project_items"])
+
     %Issue{
       id: issue["id"],
       identifier: identifier,
       title: issue["title"],
       description: issue["body"],
-      priority: nil,
+      priority: project_priority(project_fields),
       state: issue["state"],
       branch_name: nil,
       url: issue["url"],
@@ -1152,7 +1163,7 @@ defmodule SymphonyElixir.GitHub.Client do
       created_at: parse_datetime(issue["createdAt"]),
       updated_at: parse_datetime(issue["updatedAt"])
     }
-    |> Map.put(:tracker_metadata, metadata)
+    |> Map.put(:tracker_metadata, Map.put(metadata, "project_fields", project_fields))
   end
 
   defp normalize_issue(_issue), do: nil
@@ -1307,6 +1318,13 @@ defmodule SymphonyElixir.GitHub.Client do
         merge_state_status in ["dirty", "behind", "blocked"]
       end)
 
+    ready_for_review? =
+      Enum.any?(prs, fn pr ->
+        normalize_state_name(pr["state"]) == "open" and
+          pr["is_draft"] != true and
+          normalize_state_name(pr["merge_state_status"]) in ["clean", "unstable"]
+      end) and not has_conflict_signal?
+
     %{
       "count" => length(prs),
       "open" => open_count,
@@ -1317,7 +1335,8 @@ defmodule SymphonyElixir.GitHub.Client do
       "has_draft" => draft_count > 0,
       "has_merged" => merged_count > 0,
       "has_closed" => closed_count > 0,
-      "has_conflict_signal" => has_conflict_signal?
+      "has_conflict_signal" => has_conflict_signal?,
+      "ready_for_review" => ready_for_review?
     }
   end
 
@@ -1348,6 +1367,49 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp normalize_project_items(_), do: []
+
+  defp project_field_snapshot(project_items) when is_list(project_items) do
+    project_items
+    |> Enum.flat_map(&Map.get(&1, "field_values", []))
+    |> Enum.reduce(%{}, fn value, fields ->
+      field_name =
+        value
+        |> Map.get("field", %{})
+        |> Map.get("name")
+        |> normalize_state_name()
+
+      if field_name == "" do
+        fields
+      else
+        Map.put(fields, field_name, %{
+          "name" => Map.get(value, "name"),
+          "option_id" => Map.get(value, "option_id"),
+          "number" => Map.get(value, "number"),
+          "text" => Map.get(value, "text")
+        })
+      end
+    end)
+  end
+
+  defp project_field_snapshot(_), do: %{}
+
+  defp project_priority(fields) when is_map(fields) do
+    case Map.get(fields, "priority", %{})["name"] do
+      name when is_binary(name) ->
+        cond do
+          String.starts_with?(name, "P0") -> 1
+          String.starts_with?(name, "P1") -> 2
+          String.starts_with?(name, "P2") -> 3
+          String.starts_with?(name, "P3") -> 4
+          true -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp project_priority(_), do: nil
 
   defp normalize_project(nil), do: nil
 
@@ -1567,6 +1629,8 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
+  defp extract_dependency_nodes(body, _key) when is_list(body), do: body
+
   defp normalize_dependency_links(nodes) when is_list(nodes) do
     Enum.map(nodes, fn issue ->
       %{
@@ -1715,13 +1779,16 @@ defmodule SymphonyElixir.GitHub.Client do
     issue
     |> Map.get(:tracker_metadata, %{})
     |> Map.get("project_items", [])
+    |> Enum.filter(&is_map/1)
     |> Enum.flat_map(fn item ->
       item
       |> Map.get("field_values", [])
+      |> Enum.filter(&is_map/1)
       |> Enum.flat_map(fn value ->
         field_name =
           value
           |> Map.get("field", %{})
+          |> then(fn field -> if is_map(field), do: field, else: %{} end)
           |> Map.get("name")
           |> normalize_state_name()
 
@@ -2408,10 +2475,9 @@ defmodule SymphonyElixir.GitHub.Client do
         :ok
       else
         case graphql_mutation(@update_single_select_field_query, %{
-               projectId: project_id,
                fieldId: field_id,
                name: field_name,
-               singleSelectOptions: Enum.map(resolved_options, &%{name: &1})
+               singleSelectOptions: Enum.map(resolved_options, &%{name: &1, color: "GRAY", description: ""})
              }) do
           {:ok, _} -> :ok
           {:error, reason} -> {:error, reason}

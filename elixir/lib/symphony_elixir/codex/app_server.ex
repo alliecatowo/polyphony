@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
+  @proxy_bridge Path.expand("../../../../scripts/codex-proxy.py", __DIR__)
 
   @type session :: %{
           port: port(),
@@ -39,13 +40,14 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
+    model = Keyword.get(opts, :model)
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host) do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
+           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies, model) do
         {:ok,
          %{
            port: port,
@@ -192,6 +194,15 @@ defmodule SymphonyElixir.Codex.AppServer do
     if is_nil(executable) do
       {:error, :bash_not_found}
     else
+      ensure_shared_app_server()
+
+      command =
+        if Config.settings!().codex.shared_app_server do
+          "python3 #{shell_escape(@proxy_bridge)}"
+        else
+          launch_command(Config.settings!().codex.command, workspace)
+        end
+
       port =
         Port.open(
           {:spawn_executable, String.to_charlist(executable)},
@@ -199,7 +210,7 @@ defmodule SymphonyElixir.Codex.AppServer do
             :binary,
             :exit_status,
             :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(Config.settings!().codex.command)],
+            args: [~c"-lc", String.to_charlist(command)],
             cd: String.to_charlist(workspace),
             line: @port_line_bytes
           ]
@@ -217,9 +228,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp remote_launch_command(workspace) when is_binary(workspace) do
     [
       "cd #{shell_escape(workspace)}",
-      "exec #{Config.settings!().codex.command}"
+      "exec #{launch_command(Config.settings!().codex.command, workspace)}"
     ]
     |> Enum.join(" && ")
+  end
+
+  defp launch_command(command, workspace) do
+    Config.worker_resource_command(command, Path.basename(workspace))
   end
 
   defp port_metadata(port, worker_host) when is_port(port) do
@@ -270,23 +285,27 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace, remote: true)
   end
 
-  defp do_start_session(port, workspace, session_policies) do
+  defp do_start_session(port, workspace, session_policies, model) do
     case send_initialize(port) do
-      :ok -> start_thread(port, workspace, session_policies)
+      :ok -> start_thread(port, workspace, session_policies, model)
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp start_thread(port, workspace, %{approval_policy: approval_policy, thread_sandbox: thread_sandbox}) do
+  defp start_thread(port, workspace, %{approval_policy: approval_policy, thread_sandbox: thread_sandbox}, model) do
+    params = %{
+      "approvalPolicy" => approval_policy,
+      "sandbox" => thread_sandbox,
+      "cwd" => workspace,
+      "dynamicTools" => DynamicTool.tool_specs()
+    }
+
+    params = if is_binary(model) and model != "", do: Map.put(params, "model", model), else: params
+
     send_message(port, %{
       "method" => "thread/start",
       "id" => @thread_start_id,
-      "params" => %{
-        "approvalPolicy" => approval_policy,
-        "sandbox" => thread_sandbox,
-        "cwd" => workspace,
-        "dynamicTools" => DynamicTool.tool_specs()
-      }
+      "params" => params
     })
 
     case await_response(port, @thread_start_id) do
@@ -299,6 +318,23 @@ defmodule SymphonyElixir.Codex.AppServer do
       other ->
         other
     end
+  end
+
+  defp ensure_shared_app_server do
+    if Config.settings!().codex.shared_app_server do
+      case :persistent_term.get({__MODULE__, :shared_daemon_started}, false) do
+        true ->
+          :ok
+
+        false ->
+          case System.cmd("codex", ["app-server", "daemon", "start"], stderr_to_stdout: true) do
+            {_output, 0} -> :persistent_term.put({__MODULE__, :shared_daemon_started}, true)
+            {output, status} -> Logger.warning("Codex shared app-server daemon start returned #{status}: #{String.slice(output, 0, 500)}")
+          end
+      end
+    end
+
+    :ok
   end
 
   defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do

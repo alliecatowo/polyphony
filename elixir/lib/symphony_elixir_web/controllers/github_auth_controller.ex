@@ -4,6 +4,7 @@ defmodule SymphonyElixirWeb.GitHubAuthController do
   @state_table :symphony_github_oauth_state
   @state_ttl_seconds 600
 
+  @spec start(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def start(conn, _params) do
     with {:ok, client_id} <- env("GITHUB_CLIENT_ID"),
          {:ok, callback_url} <- callback_url(conn),
@@ -15,12 +16,13 @@ defmodule SymphonyElixirWeb.GitHubAuthController do
           scheme: "https",
           host: "github.com",
           path: "/login/oauth/authorize",
-          query: URI.encode_query(%{
-            "client_id" => client_id,
-            "redirect_uri" => callback_url,
-            "state" => state,
-            "scope" => scopes
-          })
+          query:
+            URI.encode_query(%{
+              "client_id" => client_id,
+              "redirect_uri" => callback_url,
+              "state" => state,
+              "scope" => scopes
+            })
         })
 
       redirect(conn, external: authorize_url)
@@ -30,6 +32,7 @@ defmodule SymphonyElixirWeb.GitHubAuthController do
     end
   end
 
+  @spec callback(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def callback(conn, %{"code" => code, "state" => state}) do
     with :ok <- pop_state(state),
          {:ok, client_id} <- env("GITHUB_CLIENT_ID"),
@@ -49,6 +52,7 @@ defmodule SymphonyElixirWeb.GitHubAuthController do
     conn |> put_status(400) |> json(%{"error" => "Missing code/state"})
   end
 
+  @spec status(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def status(conn, _params) do
     case oauth_token() do
       nil ->

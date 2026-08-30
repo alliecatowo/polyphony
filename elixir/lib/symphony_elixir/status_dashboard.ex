@@ -467,7 +467,7 @@ defmodule SymphonyElixir.StatusDashboard do
   defp project_url_from_tracker(_tracker), do: nil
 
   defp dashboard_url do
-    dashboard_url(Config.settings!().server.host, Config.server_port(), HttpServer.bound_port())
+    dashboard_url(Config.server_public_host() || Config.server_host(), Config.server_port(), HttpServer.bound_port())
   end
 
   defp dashboard_url(_host, nil, _bound_port), do: nil
@@ -672,7 +672,7 @@ defmodule SymphonyElixir.StatusDashboard do
   @doc false
   @spec format_running_summary_for_test(map(), integer() | nil) :: String.t()
   def format_running_summary_for_test(running_entry, terminal_columns \\ nil),
-    do: format_running_summary(running_entry, running_event_width(terminal_columns))
+    do: format_running_summary(running_entry, running_event_width(terminal_columns || @default_terminal_columns))
 
   @doc false
   @spec format_tps_for_test(number()) :: String.t()

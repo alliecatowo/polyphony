@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, SlicePlanner, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.GitHub.Issue, as: GitHubIssue
   alias SymphonyElixir.Linear.Issue, as: LinearIssue
   @type tracker_issue :: GitHubIssue.t() | LinearIssue.t()
@@ -66,7 +66,7 @@ defmodule SymphonyElixir.Orchestrator do
       codex_rate_limits: nil
     }
 
-    run_terminal_workspace_cleanup()
+    start_terminal_workspace_cleanup()
     state = schedule_tick(state, 0)
 
     {:ok, state}
@@ -110,10 +110,24 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
-    state = maybe_dispatch(state)
-    state = schedule_tick(state, state.poll_interval_ms)
-    state = %{state | poll_check_in_progress: false}
+    orchestrator = self()
 
+    case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
+           send(orchestrator, {:poll_cycle_complete, maybe_dispatch(state)})
+         end) do
+      {:ok, _pid} ->
+        {:noreply, state}
+
+      {:error, reason} ->
+        Logger.warning("Failed to start asynchronous poll cycle: #{inspect(reason)}")
+        state = state |> schedule_tick(state.poll_interval_ms) |> Map.put(:poll_check_in_progress, false)
+        notify_dashboard()
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:poll_cycle_complete, %State{} = polled_state}, _state) do
+    state = polled_state |> schedule_tick(polled_state.poll_interval_ms) |> Map.put(:poll_check_in_progress, false)
     notify_dashboard()
     {:noreply, state}
   end
@@ -128,6 +142,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       issue_id ->
         {running_entry, state} = pop_running_entry(state, issue_id)
+        state = release_running_claims(state, running_entry)
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
 
@@ -142,7 +157,8 @@ defmodule SymphonyElixir.Orchestrator do
                 identifier: running_entry.identifier,
                 delay_type: :continuation,
                 worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
+                workspace_path: Map.get(running_entry, :workspace_path),
+                slice_metadata: slice_metadata_from_running(running_entry)
               })
 
             _ ->
@@ -154,7 +170,8 @@ defmodule SymphonyElixir.Orchestrator do
                 identifier: running_entry.identifier,
                 error: "agent exited: #{inspect(reason)}",
                 worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
+                workspace_path: Map.get(running_entry, :workspace_path),
+                slice_metadata: slice_metadata_from_running(running_entry)
               })
           end
 
@@ -348,6 +365,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec worker_hosts_for_issue_for_test(map(), integer() | nil) :: [String.t()]
+  def worker_hosts_for_issue_for_test(issue, attempt), do: Config.worker_hosts_for_issue(issue, attempt)
+
+  @doc false
   @spec reconcile_issue_primitives_for_test(map()) :: :ok | {:error, term()}
   def reconcile_issue_primitives_for_test(%{} = issue) do
     reconcile_issue_primitives(issue)
@@ -446,6 +467,7 @@ defmodule SymphonyElixir.Orchestrator do
         release_issue_claim(state, issue_id)
 
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
+        state = release_running_claims(state, running_entry)
         state = record_session_completion_totals(state, running_entry)
         worker_host = Map.get(running_entry, :worker_host)
 
@@ -549,10 +571,10 @@ defmodule SymphonyElixir.Orchestrator do
     terminal_states = terminal_state_set()
 
     issues
-    |> sort_issues_for_dispatch()
-    |> Enum.reduce(state, fn issue, state_acc ->
+    |> SlicePlanner.plan()
+    |> Enum.reduce(state, fn %{leader: issue}, state_acc ->
       if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
-        dispatch_issue(state_acc, issue)
+        dispatch_issue(state_acc, issue, nil, nil, board_context(issues))
       else
         state_acc
       end
@@ -672,6 +694,30 @@ defmodule SymphonyElixir.Orchestrator do
     String.downcase(String.trim(state_name))
   end
 
+  defp board_context(issues) when is_list(issues) do
+    issues
+    |> Enum.filter(&is_map/1)
+    |> Enum.sort_by(fn issue -> {priority_rank(Map.get(issue, :priority)), issue_created_at_sort_key(issue)} end)
+    |> Enum.take(24)
+    |> Enum.map_join("\n", fn issue ->
+      fields = get_in(issue, [:tracker_metadata, "project_fields"]) || %{}
+      area = get_in(fields, ["area", "name"]) || "unclassified"
+      kind = get_in(fields, ["kind", "name"]) || "unclassified"
+      priority = priority_label(Map.get(issue, :priority))
+      blockers = issue |> Map.get(:blocked_by, []) |> Enum.map(&Map.get(&1, :identifier, "?")) |> Enum.join(",")
+
+      "- #{issue.identifier || issue.id}: [#{priority}] [#{area}/#{kind}] #{issue.title}#{if blockers != "", do: " (blocked by #{blockers})", else: ""}"
+    end)
+  end
+
+  defp board_context(_issues), do: ""
+
+  defp priority_label(1), do: "P0"
+  defp priority_label(2), do: "P1"
+  defp priority_label(3), do: "P2"
+  defp priority_label(4), do: "P3"
+  defp priority_label(_), do: "unprioritized"
+
   defp terminal_state_set do
     Config.settings!().tracker.terminal_states
     |> Enum.map(&normalize_issue_state/1)
@@ -686,13 +732,18 @@ defmodule SymphonyElixir.Orchestrator do
     |> MapSet.new()
   end
 
-  defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
+  defp dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host),
+    do: dispatch_issue(state, issue, attempt, preferred_worker_host, nil)
+
+  defp dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host, board_context) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %{} = refreshed_issue} ->
+        refreshed_issue = preserve_slice_metadata(issue, refreshed_issue)
+
         refreshed_issue
         |> reconcile_tracker_primitives_for_dispatch()
         |> then(fn reconciled_issue ->
-          do_dispatch_issue(state, reconciled_issue, attempt, preferred_worker_host)
+          do_dispatch_issue(state, reconciled_issue, attempt, preferred_worker_host, board_context)
         end)
 
       {:skip, :missing} ->
@@ -710,7 +761,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
+  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host, board_context) do
     recipient = self()
 
     issue =
@@ -720,11 +771,11 @@ defmodule SymphonyElixir.Orchestrator do
 
     with :ok <- apply_orchestrator_tracker_writes(issue),
          :ok <- reconcile_issue_primitives(issue) do
-      dispatch_on_selected_worker_host(state, issue, attempt, recipient, preferred_worker_host)
+      dispatch_on_selected_worker_host(state, issue, attempt, recipient, preferred_worker_host, board_context)
     else
       {:error, reason} ->
         Logger.warning("Tracker write/reconciliation failed for #{issue_context(issue)}: #{inspect(reason)}; continuing dispatch")
-        dispatch_on_selected_worker_host(state, issue, attempt, recipient, preferred_worker_host)
+        dispatch_on_selected_worker_host(state, issue, attempt, recipient, preferred_worker_host, board_context)
     end
   end
 
@@ -859,20 +910,28 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp maybe_put_progress_default(fields, _issue), do: fields
 
-  defp dispatch_on_selected_worker_host(%State{} = state, issue, attempt, recipient, preferred_worker_host) do
-    case select_worker_host(state, preferred_worker_host) do
+  defp dispatch_on_selected_worker_host(%State{} = state, issue, attempt, recipient, preferred_worker_host, board_context) do
+    candidate_hosts = Config.worker_hosts_for_issue(issue, attempt)
+
+    case select_worker_host(state, preferred_worker_host, candidate_hosts) do
       :no_worker_capacity ->
         Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
         state
 
       worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, board_context)
     end
   end
 
-  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, board_context) do
+    slice_member_ids = SlicePlanner.slice_member_ids(issue)
+
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           AgentRunner.run(issue, recipient,
+             attempt: attempt,
+             worker_host: worker_host,
+             board_context: board_context
+           )
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
@@ -900,13 +959,14 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_total_tokens: 0,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
-            started_at: DateTime.utc_now()
+            started_at: DateTime.utc_now(),
+            slice_member_ids: slice_member_ids
           })
 
         %{
           state
           | running: running,
-            claimed: MapSet.put(state.claimed, issue.id),
+            claimed: Enum.reduce(slice_member_ids, state.claimed, &MapSet.put(&2, &1)),
             retry_attempts: Map.delete(state.retry_attempts, issue.id)
         }
 
@@ -964,6 +1024,23 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  defp preserve_slice_metadata(original, refreshed) when is_map(original) and is_map(refreshed) do
+    original_metadata = Map.get(original, :tracker_metadata, %{})
+    refreshed_metadata = Map.get(refreshed, :tracker_metadata, %{})
+
+    slice_metadata =
+      original_metadata
+      |> Map.take(["slice_key", "slice_member_ids", "slice_members"])
+
+    if slice_metadata == %{} do
+      refreshed
+    else
+      Map.put(refreshed, :tracker_metadata, Map.merge(refreshed_metadata, slice_metadata))
+    end
+  end
+
+  defp preserve_slice_metadata(_original, refreshed), do: refreshed
+
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
@@ -998,7 +1075,8 @@ defmodule SymphonyElixir.Orchestrator do
             identifier: identifier,
             error: error,
             worker_host: worker_host,
-            workspace_path: workspace_path
+            workspace_path: workspace_path,
+            slice_metadata: Map.get(metadata, :slice_metadata, %{})
           })
     }
   end
@@ -1010,7 +1088,8 @@ defmodule SymphonyElixir.Orchestrator do
           identifier: Map.get(retry_entry, :identifier),
           error: Map.get(retry_entry, :error),
           worker_host: Map.get(retry_entry, :worker_host),
-          workspace_path: Map.get(retry_entry, :workspace_path)
+          workspace_path: Map.get(retry_entry, :workspace_path),
+          slice_metadata: Map.get(retry_entry, :slice_metadata, %{})
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -1084,6 +1163,11 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
+  defp start_terminal_workspace_cleanup do
+    Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn -> run_terminal_workspace_cleanup() end)
+    :ok
+  end
+
   defp fetch_terminal_issues_for_cleanup do
     terminal_states =
       terminal_state_set()
@@ -1107,6 +1191,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_active_retry(state, issue, attempt, metadata) do
+    issue = restore_slice_metadata(issue, metadata)
+
     if retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) and
          worker_slots_available?(state, metadata[:worker_host]) do
@@ -1130,6 +1216,31 @@ defmodule SymphonyElixir.Orchestrator do
   defp release_issue_claim(%State{} = state, issue_id) do
     %{state | claimed: MapSet.delete(state.claimed, issue_id)}
   end
+
+  defp release_running_claims(%State{} = state, %{slice_member_ids: member_ids}) when is_list(member_ids) do
+    %{state | claimed: Enum.reduce(member_ids, state.claimed, &MapSet.delete(&2, &1))}
+  end
+
+  defp release_running_claims(%State{} = state, _running_entry), do: state
+
+  defp slice_metadata_from_running(%{slice_member_ids: member_ids, issue: issue})
+       when is_list(member_ids) and is_map(issue) do
+    metadata = Map.get(issue, :tracker_metadata, %{})
+
+    metadata
+    |> Map.take(["slice_key", "slice_member_ids", "slice_members"])
+    |> Map.put_new("slice_member_ids", member_ids)
+  end
+
+  defp slice_metadata_from_running(_running_entry), do: %{}
+
+  defp restore_slice_metadata(issue, %{slice_metadata: metadata})
+       when is_map(issue) and is_map(metadata) and metadata != %{} do
+    current = Map.get(issue, :tracker_metadata, %{})
+    Map.put(issue, :tracker_metadata, Map.merge(current, metadata))
+  end
+
+  defp restore_slice_metadata(issue, _metadata), do: issue
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
     if metadata[:delay_type] == :continuation and attempt == 1 do
@@ -1198,7 +1309,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp select_worker_host(%State{} = state, preferred_worker_host) do
-    case Config.settings!().worker.ssh_hosts do
+    select_worker_host(state, preferred_worker_host, Config.settings!().worker.ssh_hosts)
+  end
+
+  defp select_worker_host(%State{} = state, preferred_worker_host, candidate_hosts) do
+    case candidate_hosts do
       [] ->
         nil
 

@@ -5,6 +5,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
+  alias SymphonyElixir.Config
   alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
   @runtime_tick_ms 1_000
 
@@ -64,6 +65,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
               <span class="status-badge-dot"></span>
               Offline
             </span>
+            <%= if is_nil(@payload[:error]) and stalled_count(@payload, @now) > 0 do %>
+              <span class="status-badge status-badge-offline">
+                <span class="status-badge-dot"></span>
+                <%= stalled_count(@payload, @now) %> stalled
+              </span>
+            <% end %>
           </div>
         </div>
       </header>
@@ -89,6 +96,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <p class="metric-label">Retrying</p>
             <p class="metric-value numeric"><%= @payload.counts.retrying %></p>
             <p class="metric-detail">Issues waiting for the next retry window.</p>
+          </article>
+
+          <article class="metric-card">
+            <p class="metric-label">Stalled</p>
+            <p class="metric-value numeric"><%= stalled_count(@payload, @now) %></p>
+            <p class="metric-detail">Sessions beyond the configured no-activity threshold.</p>
           </article>
 
           <article class="metric-card">
@@ -258,7 +271,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp snapshot_timeout_ms do
-    Endpoint.config(:snapshot_timeout_ms) || 15_000
+    Endpoint.config(:snapshot_timeout_ms) || 1_000
   end
 
   defp completed_runtime_seconds(payload) do
@@ -271,6 +284,29 @@ defmodule SymphonyElixirWeb.DashboardLive do
         total + runtime_seconds_from_started_at(entry.started_at, now)
       end)
   end
+
+  defp stalled_count(%{running: running}, now) when is_list(running) do
+    timeout_ms = Config.settings!().codex.stall_timeout_ms
+
+    if timeout_ms <= 0 do
+      0
+    else
+      Enum.count(running, fn entry ->
+        case entry.last_event_at do
+          timestamp when is_binary(timestamp) ->
+            case DateTime.from_iso8601(timestamp) do
+              {:ok, parsed, _offset} -> DateTime.diff(now, parsed, :millisecond) > timeout_ms
+              _ -> false
+            end
+
+          _ ->
+            false
+        end
+      end)
+    end
+  end
+
+  defp stalled_count(_payload, _now), do: 0
 
   defp format_runtime_and_turns(started_at, turn_count, now) when is_integer(turn_count) and turn_count > 0 do
     "#{format_runtime_seconds(runtime_seconds_from_started_at(started_at, now))} / #{turn_count}"

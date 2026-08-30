@@ -13,10 +13,11 @@ defmodule SymphonyElixir.AgentRunner do
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
     # The orchestrator owns host retries so one worker lifetime never hops machines.
     worker_host = selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
+    model = Config.codex_model_for_issue(issue, attempt: Keyword.get(opts, :attempt, 0))
 
     Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
+    case run_on_worker_host(issue, codex_update_recipient, Keyword.put(opts, :model, model), worker_host) do
       :ok ->
         :ok
 
@@ -80,7 +81,7 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host, model: Keyword.get(opts, :model)) do
       try do
         do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
       after

@@ -147,13 +147,21 @@ defmodule SymphonyElixir.Config.Schema do
     embedded_schema do
       field(:ssh_hosts, {:array, :string}, default: [])
       field(:max_concurrent_agents_per_host, :integer)
+      field(:routing, :map, default: %{})
+      field(:cpu_quota_percent, :integer, default: 350)
+      field(:memory_max_mb, :integer, default: 4096)
+      field(:tasks_max, :integer, default: 512)
+      field(:cgroup_required, :boolean, default: false)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:ssh_hosts, :max_concurrent_agents_per_host], empty_values: [])
+      |> cast(attrs, [:ssh_hosts, :max_concurrent_agents_per_host, :routing, :cpu_quota_percent, :memory_max_mb, :tasks_max, :cgroup_required], empty_values: [])
       |> validate_number(:max_concurrent_agents_per_host, greater_than: 0)
+      |> validate_number(:cpu_quota_percent, greater_than: 0)
+      |> validate_number(:memory_max_mb, greater_than: 0)
+      |> validate_number(:tasks_max, greater_than: 0)
     end
   end
 
@@ -196,6 +204,8 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:command, :string, default: "codex app-server")
+      field(:shared_app_server, :boolean, default: false)
+      field(:models, :map, default: %{})
 
       field(:approval_policy, StringOrMap,
         default: %{
@@ -221,6 +231,8 @@ defmodule SymphonyElixir.Config.Schema do
         attrs,
         [
           :command,
+          :shared_app_server,
+          :models,
           :approval_policy,
           :thread_sandbox,
           :turn_sandbox_policy,
@@ -476,6 +488,7 @@ defmodule SymphonyElixir.Config.Schema do
         field_name
         |> to_string()
         |> String.trim()
+
       normalized_name = String.downcase(original_name)
 
       normalized_definition = normalize_required_project_field_definition(definition)

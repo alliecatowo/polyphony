@@ -144,6 +144,64 @@ codex:
 You are working on a GitHub issue {{ issue.identifier }}.
 ```
 
+### Patches worker profile
+
+The checked-in `WORKFLOW.md` is configured for the GitHub Patches project at
+`alliecatowo/patches` (user Project 5). It uses one local Codex app-server daemon and selects
+`gpt-5.6-luna` for normal issues, `gpt-5.6-terra` for review/stack work, and `gpt-5.6-sol` for
+escalation/audit or retry attempt 2+.
+
+The profile uses isolated workspace clones under `~/develop/patches/.polyphony/workspaces`, made
+from the local Patches checkout at `~/develop/patches`.
+
+Each worker process tree is launched in a required per-run cgroup on the selected host: 250% CPU,
+3 GiB memory, and 384 tasks. The profile allows six workers total. A local systemd cgroup preflight
+passes on the development machine.
+
+The board planner consumes Project v2 Priority, Area, Kind, Status, parent/sub-issue, dependency,
+and linked-PR signals. It sends each worker a compact top-of-board context so workers can preserve
+dependency order. For true multi-issue slices, use explicit parent/sub-issue relationships or a
+shared `slice:` label. A `stack-reconcile` or `stack/reconcile` label routes the work to Terra and
+instructs that worker to use the installed `gh stack` skill to review/rebase/merge the complete
+stack only after all checks are green.
+
+For a local run, keep credentials in the ignored `elixir/.env`, load them, and start from the
+Elixir directory:
+
+```bash
+cd elixir
+set -a; . ./.env; set +a
+mise exec -- ./bin/symphony \
+  --i-understand-that-this-will-be-running-without-the-usual-guardrails \
+  ./WORKFLOW.md
+```
+
+The recommended Patches launcher performs the local cgroup preflight first:
+
+```bash
+/home/allie/develop/polyphony/scripts/launch-patches.sh
+```
+
+It refuses to start if the local user cgroup cannot be created.
+
+Preflight without starting the poller:
+
+```bash
+cd elixir
+set -a; . ./.env; set +a
+mise exec -- mix run --no-start -e 'IO.puts(SymphonyElixir.Config.validate!())'
+systemd-run --user --scope --quiet --collect --unit=polyphony-preflight \
+  --property=CPUQuota=250% --property=MemoryMax=3072M --property=TasksMax=384 \
+  --property=KillMode=control-group -- true
+```
+
+On this Fedora workstation, `.env` also supplies the Homebrew OpenSSL library path required by
+the locally compiled Erlang runtime.
+
+The dashboard is served at `http://127.0.0.1:4000/` by default, or on the configured bind host.
+Codex uses the existing ChatGPT login from
+`~/.codex`; no OpenAI API key is required by Polyphony.
+
 ## Testing
 
 ```bash

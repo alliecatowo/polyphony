@@ -28,17 +28,17 @@ defmodule SymphonyElixir.Application do
       {Phoenix.PubSub, name: SymphonyElixir.PubSub},
       {Task.Supervisor, name: SymphonyElixir.TaskSupervisor},
       SymphonyElixir.WorkflowStore,
-      SymphonyElixir.Orchestrator,
       SymphonyElixir.HttpServer,
+      SymphonyElixir.Orchestrator,
       SymphonyElixir.StatusDashboard
     ]
 
     case Supervisor.start_link(
-      children,
-      strategy: :one_for_one,
-      name: SymphonyElixir.Supervisor
-    ) do
-      {:ok, pid} = result ->
+           children,
+           strategy: :one_for_one,
+           name: SymphonyElixir.Supervisor
+         ) do
+      {:ok, _pid} = result ->
         _ = OAuthBootstrap.maybe_open_browser()
         result
 

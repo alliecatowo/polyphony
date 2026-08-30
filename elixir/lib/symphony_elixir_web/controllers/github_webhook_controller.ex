@@ -20,6 +20,7 @@ defmodule SymphonyElixirWeb.GitHubWebhookController do
                     "projects_v2_item"
                   ])
 
+  @spec receive(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def receive(conn, _params) do
     with :ok <- ensure_secret_configured(),
          :ok <- verify_signature(conn),

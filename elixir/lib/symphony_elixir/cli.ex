@@ -6,7 +6,7 @@ defmodule SymphonyElixir.CLI do
   alias SymphonyElixir.LogFile
 
   @acknowledgement_switch :i_understand_that_this_will_be_running_without_the_usual_guardrails
-  @switches [{@acknowledgement_switch, :boolean}, logs_root: :string, port: :integer]
+  @switches [{@acknowledgement_switch, :boolean}, logs_root: :string, host: :string, public_host: :string, port: :integer]
 
   @type ensure_started_result :: {:ok, [atom()]} | {:error, term()}
   @type deps :: %{
@@ -35,14 +35,18 @@ defmodule SymphonyElixir.CLI do
       {opts, [], []} ->
         with :ok <- require_guardrails_acknowledgement(opts),
              :ok <- maybe_set_logs_root(opts, deps),
-             :ok <- maybe_set_server_port(opts, deps) do
+             :ok <- maybe_set_server_port(opts, deps),
+             :ok <- maybe_set_server_host(opts),
+             :ok <- maybe_set_server_public_host(opts) do
           run(Path.expand("WORKFLOW.md"), deps)
         end
 
       {opts, [workflow_path], []} ->
         with :ok <- require_guardrails_acknowledgement(opts),
              :ok <- maybe_set_logs_root(opts, deps),
-             :ok <- maybe_set_server_port(opts, deps) do
+             :ok <- maybe_set_server_port(opts, deps),
+             :ok <- maybe_set_server_host(opts),
+             :ok <- maybe_set_server_public_host(opts) do
           run(workflow_path, deps)
         end
 
@@ -72,7 +76,7 @@ defmodule SymphonyElixir.CLI do
 
   @spec usage_message() :: String.t()
   defp usage_message do
-    "Usage: polyphony [--logs-root <path>] [--port <port>] [path-to-WORKFLOW.md]"
+    "Usage: polyphony [--logs-root <path>] [--host <host>] [--public-host <host>] [--port <port>] [path-to-WORKFLOW.md]"
   end
 
   @spec runtime_deps() :: deps()
@@ -161,6 +165,33 @@ defmodule SymphonyElixir.CLI do
         else
           {:error, usage_message()}
         end
+    end
+  end
+
+  defp maybe_set_server_host(opts) do
+    case Keyword.get_values(opts, :host) do
+      [] ->
+        :ok
+
+      values ->
+        host = values |> List.last() |> String.trim()
+        if host == "", do: {:error, usage_message()}, else: set_server_host_override(host)
+    end
+  end
+
+  defp set_server_host_override(host) do
+    Application.put_env(:symphony_elixir, :server_host_override, host)
+    :ok
+  end
+
+  defp maybe_set_server_public_host(opts) do
+    case Keyword.get_values(opts, :public_host) do
+      [] ->
+        :ok
+
+      values ->
+        public_host = values |> List.last() |> String.trim()
+        if public_host == "", do: {:error, usage_message()}, else: Application.put_env(:symphony_elixir, :server_public_host_override, public_host)
     end
   end
 
