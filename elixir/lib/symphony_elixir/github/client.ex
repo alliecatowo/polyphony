@@ -14,6 +14,9 @@ defmodule SymphonyElixir.GitHub.Client do
 
   @issue_page_size 20
   @max_error_body_log_bytes 1_000
+  @api_circuit_table :symphony_github_api_circuit
+  @api_circuit_fallback_ms 300_000
+  @api_circuit_max_backoff_ms 3_600_000
 
   @issue_fields """
   id
@@ -428,25 +431,35 @@ defmodule SymphonyElixir.GitHub.Client do
 
   @spec graphql(String.t(), map()) :: {:ok, map()} | {:error, term()}
   def graphql(query, variables \\ %{}) when is_binary(query) and is_map(variables) do
-    payload = %{"query" => query, "variables" => variables}
+    case github_api_circuit() do
+      {:open, until_ms} ->
+        {:error, github_rate_limit_error(until_ms)}
 
-    with {:ok, headers} <- graphql_headers(),
-         {:ok, %{status: 200, body: body}} <- post_graphql_request(payload, headers),
-         :ok <- ensure_no_graphql_errors(body) do
-      {:ok, body}
-    else
-      {:ok, response} ->
-        Logger.error("GitHub GraphQL request failed status=#{response.status} body=#{summarize_error_body(response.body)}")
+      :closed ->
+        payload = %{"query" => query, "variables" => variables}
 
-        {:error, {:github_api_status, response.status}}
+        with {:ok, headers} <- graphql_headers(),
+             {:ok, %{status: 200, body: body}} <- post_graphql_request(payload, headers),
+             :ok <- ensure_no_graphql_errors(body) do
+          close_github_api_circuit()
+          {:ok, body}
+        else
+          {:ok, response} ->
+            Logger.error("GitHub GraphQL request failed status=#{response.status} body=#{summarize_error_body(response.body)}")
 
-      {:error, {:github_graphql_errors, errors}} ->
-        Logger.error("GitHub GraphQL response errors=#{inspect(errors)}")
-        {:error, {:github_graphql_errors, errors}}
+            if rate_limit_status?(response.status), do: open_github_api_circuit()
+            {:error, {:github_api_status, response.status}}
 
-      {:error, reason} ->
-        Logger.error("GitHub GraphQL request failed: #{inspect(reason)}")
-        {:error, {:github_api_request, reason}}
+          {:error, {:github_graphql_errors, errors}} ->
+            Logger.error("GitHub GraphQL response errors=#{inspect(errors)}")
+
+            if github_rate_limit_errors?(errors), do: open_github_api_circuit()
+            {:error, {:github_graphql_errors, errors}}
+
+          {:error, reason} ->
+            Logger.error("GitHub GraphQL request failed: #{inspect(reason)}")
+            {:error, {:github_api_request, reason}}
+        end
     end
   end
 
@@ -1841,6 +1854,76 @@ defmodule SymphonyElixir.GitHub.Client do
       receive_timeout: 30_000
     )
   end
+
+  defp github_api_circuit do
+    ensure_api_circuit_table()
+    now_ms = System.monotonic_time(:millisecond)
+
+    case :ets.lookup(@api_circuit_table, :state) do
+      [{:state, until_ms, _backoff_ms}] when is_integer(until_ms) ->
+        if until_ms > now_ms, do: {:open, until_ms}, else: :closed
+
+      _ ->
+        :closed
+    end
+  end
+
+  defp open_github_api_circuit do
+    ensure_api_circuit_table()
+
+    backoff_ms =
+      case :ets.lookup(@api_circuit_table, :state) do
+        [{:state, _until_ms, previous}] when is_integer(previous) ->
+          min(previous * 2, @api_circuit_max_backoff_ms)
+
+        _ ->
+          @api_circuit_fallback_ms
+      end
+
+    until_ms = System.monotonic_time(:millisecond) + backoff_ms
+    :ets.insert(@api_circuit_table, {:state, until_ms, backoff_ms})
+    Logger.error("GitHub API circuit opened for #{backoff_ms}ms")
+    :ok
+  end
+
+  defp close_github_api_circuit do
+    ensure_api_circuit_table()
+    :ets.delete(@api_circuit_table, :state)
+    :ok
+  end
+
+  defp ensure_api_circuit_table do
+    case :ets.whereis(@api_circuit_table) do
+      :undefined ->
+        try do
+          :ets.new(@api_circuit_table, [:named_table, :public, read_concurrency: true])
+        rescue
+          ArgumentError -> @api_circuit_table
+        end
+
+      _tid ->
+        @api_circuit_table
+    end
+  end
+
+  defp github_rate_limit_error(until_ms) do
+    {:github_graphql_errors, [%{"type" => "RATE_LIMIT", "code" => "graphql_rate_limit", "message" => "GitHub API circuit open until #{until_ms}"}]}
+  end
+
+  defp github_rate_limit_errors?(errors) when is_list(errors) do
+    Enum.any?(errors, fn error ->
+      code = Map.get(error, "type") || Map.get(error, :type) || Map.get(error, "code") || Map.get(error, :code)
+      message = Map.get(error, "message") || Map.get(error, :message) || ""
+
+      code in ["RATE_LIMIT", "graphql_rate_limit", :rate_limit] or
+        String.contains?(String.downcase(to_string(message)), "rate limit")
+    end)
+  end
+
+  defp github_rate_limit_errors?(_errors), do: false
+
+  defp rate_limit_status?(status) when status in [403, 429], do: true
+  defp rate_limit_status?(_status), do: false
 
   defp repo_tracker_config do
     repo_tracker_config(Config.settings!().tracker)
