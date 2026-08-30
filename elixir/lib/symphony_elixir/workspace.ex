@@ -20,9 +20,26 @@ defmodule SymphonyElixir.Workspace do
 
       with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
-           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host),
-           :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
-        {:ok, workspace}
+           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host) do
+        case maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
+          :ok ->
+            {:ok, workspace}
+
+          {:error, reason} = error ->
+            # Never leave a newly-created directory behind after bootstrap
+            # fails. Reusing it would skip after_create on the next retry and
+            # strand the worker without its repository/branch.
+            if created? do
+              _ = remove(workspace, worker_host)
+            end
+
+            Logger.warning(
+              "Workspace bootstrap rolled back #{issue_log_context(issue_context)} " <>
+                "worker_host=#{worker_host_for_log(worker_host)} reason=#{inspect(reason)}"
+            )
+
+            error
+        end
       end
     rescue
       error in [ArgumentError, ErlangError, File.Error] ->

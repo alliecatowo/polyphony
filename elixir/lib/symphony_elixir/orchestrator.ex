@@ -42,6 +42,8 @@ defmodule SymphonyElixir.Orchestrator do
       codex_totals: nil,
       codex_rate_limits: nil
     ]
+
+    @type t :: %__MODULE__{}
   end
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -112,11 +114,12 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
     orchestrator = self()
+    base_running_entries = state.running
 
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
            polled_state =
              try do
-               maybe_dispatch(state)
+               maybe_dispatch(state, orchestrator)
              rescue
                exception ->
                  Logger.error("Poll cycle crashed: #{Exception.format(:error, exception, __STACKTRACE__)}")
@@ -127,7 +130,7 @@ defmodule SymphonyElixir.Orchestrator do
                  state
              end
 
-           send(orchestrator, {:poll_cycle_complete, polled_state})
+           send(orchestrator, {:poll_cycle_complete, polled_state, base_running_entries})
          end) do
       {:ok, _pid} ->
         {:noreply, state}
@@ -140,11 +143,58 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  def handle_info({:poll_cycle_complete, %State{} = polled_state}, _state) do
+  def handle_info({:poll_cycle_complete, %State{} = polled_state, base_running_ids}, state)
+      when is_map(state) do
     Logger.info("Completed orchestrator poll cycle")
-    state = polled_state |> schedule_tick(polled_state.poll_interval_ms) |> Map.put(:poll_check_in_progress, false)
+
+    state =
+      state
+      |> merge_poll_cycle_state(polled_state, base_running_ids)
+      |> schedule_tick(polled_state.poll_interval_ms)
+      |> Map.put(:poll_check_in_progress, false)
+
     notify_dashboard()
     {:noreply, state}
+  end
+
+  # Compatibility for a poll task from an older code version during a
+  # rolling restart. Current poll tasks include the base running set.
+  def handle_info({:poll_cycle_complete, %State{} = polled_state}, state) do
+    handle_info({:poll_cycle_complete, polled_state, %{}}, state)
+  end
+
+  def handle_info(
+        {:worker_started, issue_id, pid, issue, worker_host, slice_member_ids},
+        %State{} = state
+      )
+      when is_binary(issue_id) and is_pid(pid) and is_map(issue) and is_list(slice_member_ids) do
+    case Map.get(state.running, issue_id) do
+      %{pid: ^pid} = running_entry ->
+        # The asynchronous poll may have installed the entry before this
+        # announcement reached the GenServer. Attach the monitor here; the
+        # poll task must never own worker monitors.
+        {ref, running_entry} = ensure_worker_monitor(running_entry, pid)
+        running_entry = Map.merge(running_entry, %{ref: ref, worker_host: worker_host, issue: issue})
+        notify_dashboard()
+        {:noreply, %{state | running: Map.put(state.running, issue_id, running_entry)}}
+
+      nil ->
+        ref = Process.monitor(pid)
+        entry = new_running_entry(pid, ref, issue, worker_host, slice_member_ids, nil)
+
+        next_state = %{
+          state
+          | running: Map.put(state.running, issue_id, entry),
+            claimed: Enum.reduce(slice_member_ids, state.claimed, &MapSet.put(&2, &1))
+        }
+
+        notify_dashboard()
+        {:noreply, next_state}
+
+      _other ->
+        Logger.warning("Ignoring worker-start announcement for already-running issue_id=#{issue_id} pid=#{inspect(pid)}")
+        {:noreply, state}
+    end
   end
 
   def handle_info(
@@ -209,8 +259,9 @@ defmodule SymphonyElixir.Orchestrator do
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
 
+        next_state = %{state | running: Map.put(running, issue_id, updated_running_entry)}
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        {:noreply, next_state}
     end
   end
 
@@ -229,40 +280,96 @@ defmodule SymphonyElixir.Orchestrator do
           state
           |> apply_codex_token_delta(token_delta)
           |> apply_codex_rate_limits(update)
+          |> Map.put(:running, Map.put(running, issue_id, updated_running_entry))
 
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        {:noreply, state}
     end
   end
 
   def handle_info({:codex_worker_update, _issue_id, _update}, state), do: {:noreply, state}
 
   def handle_info({:retry_issue, issue_id, retry_token}, state) do
-    result =
-      case pop_retry_attempt_state(state, issue_id, retry_token) do
-        {:ok, attempt, metadata, state} -> handle_retry_issue(state, issue_id, attempt, metadata)
-        :missing -> {:noreply, state}
-      end
+    case pop_retry_attempt_state(state, issue_id, retry_token) do
+      {:ok, attempt, metadata, state} ->
+        orchestrator = self()
 
-    notify_dashboard()
-    result
+        case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
+               result =
+                 try do
+                   Tracker.fetch_candidate_issues()
+                 rescue
+                   exception -> {:error, {:exception, exception, __STACKTRACE__}}
+                 catch
+                   kind, reason -> {:error, {kind, reason}}
+                 end
+
+               send(orchestrator, {:retry_issue_lookup, issue_id, attempt, metadata, result})
+             end) do
+          {:ok, _pid} ->
+            notify_dashboard()
+            {:noreply, state}
+
+          {:error, reason} ->
+            Logger.warning("Failed to start retry lookup for issue_id=#{issue_id}: #{inspect(reason)}")
+
+            next_state =
+              schedule_issue_retry(
+                state,
+                issue_id,
+                attempt + 1,
+                Map.merge(metadata, %{error: "retry lookup task failed: #{inspect(reason)}"})
+              )
+
+            notify_dashboard()
+            {:noreply, next_state}
+        end
+
+      :missing ->
+        {:noreply, state}
+    end
   end
 
   def handle_info({:retry_issue, _issue_id}, state), do: {:noreply, state}
+
+  def handle_info({:retry_issue_lookup, issue_id, attempt, metadata, {:ok, issues}}, state) do
+    next_state =
+      issues
+      |> find_issue_by_id(issue_id)
+      |> handle_retry_issue_lookup(state, issue_id, attempt, metadata)
+
+    notify_dashboard()
+    next_state
+  end
+
+  def handle_info({:retry_issue_lookup, issue_id, attempt, metadata, {:error, reason}}, state) do
+    Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
+
+    next_state =
+      schedule_issue_retry(
+        state,
+        issue_id,
+        attempt + 1,
+        Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
+      )
+
+    notify_dashboard()
+    {:noreply, next_state}
+  end
 
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}
   end
 
-  defp maybe_dispatch(%State{} = state) do
-    state = reconcile_running_issues(state)
+  defp maybe_dispatch(%State{} = state, orchestrator) when is_pid(orchestrator) do
+    state = reconcile_running_issues(state, orchestrator)
 
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
          :ok <- log_candidate_count(issues),
          true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
+      choose_issues(issues, state, orchestrator)
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Linear API token missing in WORKFLOW.md")
@@ -326,8 +433,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp log_candidate_count(_issues), do: :ok
 
-  defp reconcile_running_issues(%State{} = state) do
-    state = reconcile_stalled_running_issues(state)
+  defp reconcile_running_issues(%State{} = state, owner) when is_pid(owner) do
+    state = reconcile_stalled_running_issues(state, owner)
     running_ids = Map.keys(state.running)
 
     if running_ids == [] do
@@ -395,6 +502,12 @@ defmodule SymphonyElixir.Orchestrator do
   @spec reconcile_issue_primitives_for_test(map()) :: :ok | {:error, term()}
   def reconcile_issue_primitives_for_test(%{} = issue) do
     reconcile_issue_primitives(issue)
+  end
+
+  @doc false
+  @spec merge_poll_cycle_state_for_test(State.t(), State.t(), MapSet.t()) :: State.t()
+  def merge_poll_cycle_state_for_test(%State{} = current, %State{} = polled, base_running_ids) do
+    merge_poll_cycle_state(current, polled, base_running_ids)
   end
 
   @doc false
@@ -518,7 +631,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp reconcile_stalled_running_issues(%State{} = state) do
+  defp reconcile_stalled_running_issues(%State{} = state, owner) when is_pid(owner) do
     timeout_ms = Config.settings!().codex.stall_timeout_ms
 
     cond do
@@ -532,12 +645,12 @@ defmodule SymphonyElixir.Orchestrator do
         now = DateTime.utc_now()
 
         Enum.reduce(state.running, state, fn {issue_id, running_entry}, state_acc ->
-          restart_stalled_issue(state_acc, issue_id, running_entry, now, timeout_ms)
+          restart_stalled_issue(state_acc, issue_id, running_entry, now, timeout_ms, owner)
         end)
     end
   end
 
-  defp restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms) do
+  defp restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms, owner) do
     elapsed_ms = stall_elapsed_ms(running_entry, now)
 
     if is_integer(elapsed_ms) and elapsed_ms > timeout_ms do
@@ -550,10 +663,15 @@ defmodule SymphonyElixir.Orchestrator do
 
       state
       |> terminate_running_issue(issue_id, false)
-      |> schedule_issue_retry(issue_id, next_attempt, %{
-        identifier: identifier,
-        error: "stalled for #{elapsed_ms}ms without codex activity"
-      })
+      |> schedule_issue_retry(
+        issue_id,
+        next_attempt,
+        %{
+          identifier: identifier,
+          error: "stalled for #{elapsed_ms}ms without codex activity"
+        },
+        owner
+      )
     else
       state
     end
@@ -589,7 +707,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp terminate_task(_pid), do: :ok
 
-  defp choose_issues(issues, state) do
+  defp choose_issues(issues, state, orchestrator) when is_pid(orchestrator) do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
     planned_slices = SlicePlanner.plan(issues)
@@ -599,7 +717,7 @@ defmodule SymphonyElixir.Orchestrator do
     planned_slices
     |> Enum.reduce(state, fn %{leader: issue}, state_acc ->
       if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
-        dispatch_issue(state_acc, issue, nil, nil, board_context(issues))
+        dispatch_issue(state_acc, issue, nil, nil, board_context(issues), orchestrator)
       else
         state_acc
       end
@@ -786,6 +904,11 @@ defmodule SymphonyElixir.Orchestrator do
     do: dispatch_issue(state, issue, attempt, preferred_worker_host, nil)
 
   defp dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host, board_context) do
+    dispatch_issue(state, issue, attempt, preferred_worker_host, board_context, self())
+  end
+
+  defp dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host, board_context, orchestrator)
+       when is_pid(orchestrator) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %{} = refreshed_issue} ->
         refreshed_issue = preserve_slice_metadata(issue, refreshed_issue)
@@ -793,7 +916,7 @@ defmodule SymphonyElixir.Orchestrator do
         refreshed_issue
         |> reconcile_tracker_primitives_for_dispatch()
         |> then(fn reconciled_issue ->
-          do_dispatch_issue(state, reconciled_issue, attempt, preferred_worker_host, board_context)
+          do_dispatch_issue(state, reconciled_issue, attempt, preferred_worker_host, board_context, orchestrator)
         end)
 
       {:skip, :missing} ->
@@ -811,9 +934,8 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host, board_context) do
-    recipient = self()
-
+  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host, board_context, orchestrator)
+       when is_pid(orchestrator) do
     issue =
       issue
       |> issue_with_desired_project_custom_fields()
@@ -821,11 +943,11 @@ defmodule SymphonyElixir.Orchestrator do
 
     with :ok <- apply_orchestrator_tracker_writes(issue),
          :ok <- reconcile_issue_primitives(issue) do
-      dispatch_on_selected_worker_host(state, issue, attempt, recipient, preferred_worker_host, board_context)
+      dispatch_on_selected_worker_host(state, issue, attempt, orchestrator, preferred_worker_host, board_context)
     else
       {:error, reason} ->
         Logger.warning("Tracker write/reconciliation failed for #{issue_context(issue)}: #{inspect(reason)}; continuing dispatch")
-        dispatch_on_selected_worker_host(state, issue, attempt, recipient, preferred_worker_host, board_context)
+        dispatch_on_selected_worker_host(state, issue, attempt, orchestrator, preferred_worker_host, board_context)
     end
   end
 
@@ -984,34 +1106,16 @@ defmodule SymphonyElixir.Orchestrator do
            )
          end) do
       {:ok, pid} ->
-        ref = Process.monitor(pid)
+        send(recipient, {:worker_started, issue.id, pid, issue, worker_host, slice_member_ids})
 
         Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
 
         running =
-          Map.put(state.running, issue.id, %{
-            pid: pid,
-            ref: ref,
-            identifier: issue.identifier,
-            issue: issue,
-            worker_host: worker_host,
-            workspace_path: nil,
-            session_id: nil,
-            last_codex_message: nil,
-            last_codex_timestamp: nil,
-            last_codex_event: nil,
-            codex_app_server_pid: nil,
-            codex_input_tokens: 0,
-            codex_output_tokens: 0,
-            codex_total_tokens: 0,
-            codex_last_reported_input_tokens: 0,
-            codex_last_reported_output_tokens: 0,
-            codex_last_reported_total_tokens: 0,
-            turn_count: 0,
-            retry_attempt: normalize_retry_attempt(attempt),
-            started_at: DateTime.utc_now(),
-            slice_member_ids: slice_member_ids
-          })
+          Map.put(
+            state.running,
+            issue.id,
+            new_running_entry(pid, nil, issue, worker_host, slice_member_ids, attempt)
+          )
 
         %{
           state
@@ -1024,11 +1128,17 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
         next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
 
-        schedule_issue_retry(state, issue.id, next_attempt, %{
-          identifier: issue.identifier,
-          error: "failed to spawn agent: #{inspect(reason)}",
-          worker_host: worker_host
-        })
+        schedule_issue_retry(
+          state,
+          issue.id,
+          next_attempt,
+          %{
+            identifier: issue.identifier,
+            error: "failed to spawn agent: #{inspect(reason)}",
+            worker_host: worker_host
+          },
+          recipient
+        )
     end
   end
 
@@ -1092,6 +1202,10 @@ defmodule SymphonyElixir.Orchestrator do
   defp preserve_slice_metadata(_original, refreshed), do: refreshed
 
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
+       when is_binary(issue_id) and is_map(metadata),
+       do: schedule_issue_retry(state, issue_id, attempt, metadata, self())
+
+  defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata, owner)
        when is_binary(issue_id) and is_map(metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
     next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
@@ -1108,7 +1222,7 @@ defmodule SymphonyElixir.Orchestrator do
       Process.cancel_timer(old_timer)
     end
 
-    timer_ref = Process.send_after(self(), {:retry_issue, issue_id, retry_token}, delay_ms)
+    timer_ref = Process.send_after(owner, {:retry_issue, issue_id, retry_token}, delay_ms)
 
     error_suffix = if is_binary(error), do: " error=#{error}", else: ""
 
@@ -1146,26 +1260,6 @@ defmodule SymphonyElixir.Orchestrator do
 
       _ ->
         :missing
-    end
-  end
-
-  defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
-    case Tracker.fetch_candidate_issues() do
-      {:ok, issues} ->
-        issues
-        |> find_issue_by_id(issue_id)
-        |> handle_retry_issue_lookup(state, issue_id, attempt, metadata)
-
-      {:error, reason} ->
-        Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
-
-        {:noreply,
-         schedule_issue_retry(
-           state,
-           issue_id,
-           attempt + 1,
-           Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
-         )}
     end
   end
 
@@ -1446,6 +1540,38 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp running_entry_session_id(_running_entry), do: "n/a"
 
+  defp ensure_worker_monitor(%{ref: ref} = entry, _pid) when is_reference(ref), do: {ref, entry}
+
+  defp ensure_worker_monitor(entry, pid) when is_map(entry) and is_pid(pid) do
+    {Process.monitor(pid), entry}
+  end
+
+  defp new_running_entry(pid, ref, issue, worker_host, slice_member_ids, attempt) do
+    %{
+      pid: pid,
+      ref: ref,
+      identifier: issue.identifier,
+      issue: issue,
+      worker_host: worker_host,
+      workspace_path: nil,
+      session_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_app_server_pid: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      turn_count: 0,
+      retry_attempt: normalize_retry_attempt(attempt),
+      started_at: DateTime.utc_now(),
+      slice_member_ids: slice_member_ids
+    }
+  end
+
   defp issue_context(%{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
   end
@@ -1665,6 +1791,50 @@ defmodule SymphonyElixir.Orchestrator do
   defp pop_running_entry(state, issue_id) do
     {Map.get(state.running, issue_id), %{state | running: Map.delete(state.running, issue_id)}}
   end
+
+  defp merge_poll_cycle_state(%State{} = current, %State{} = polled, base_running_entries) do
+    base_running_entries =
+      case base_running_entries do
+        entries when is_map(entries) -> entries
+        %MapSet{} = ids -> Map.new(ids, &{&1, nil})
+        ids when is_list(ids) -> Map.new(ids, &{&1, nil})
+        _ -> %{}
+      end
+
+    base_running_ids = Map.keys(base_running_entries)
+
+    # The GenServer owns worker state. Worker-start messages are the only
+    # authority allowed to add entries: importing new entries from the poll
+    # snapshot could resurrect a worker that already emitted DOWN while the
+    # poll was still in flight.
+    removed_by_poll =
+      MapSet.difference(MapSet.new(base_running_ids), MapSet.new(Map.keys(polled.running)))
+
+    current_running =
+      current.running
+      |> Enum.reject(fn {issue_id, entry} ->
+        MapSet.member?(removed_by_poll, issue_id) and
+          poll_owned_entry?(entry, Map.get(base_running_entries, issue_id))
+      end)
+      |> Map.new()
+
+    %{
+      current
+      | running: current_running,
+        claimed: current.claimed,
+        retry_attempts: Map.merge(polled.retry_attempts, current.retry_attempts),
+        completed: MapSet.union(current.completed, polled.completed),
+        poll_interval_ms: polled.poll_interval_ms,
+        max_concurrent_agents: polled.max_concurrent_agents,
+        codex_rate_limits: current.codex_rate_limits || polled.codex_rate_limits
+    }
+  end
+
+  defp poll_owned_entry?(current_entry, base_entry) when is_map(base_entry) do
+    Map.get(current_entry, :ref) == Map.get(base_entry, :ref)
+  end
+
+  defp poll_owned_entry?(_current_entry, _base_entry), do: false
 
   defp record_session_completion_totals(state, running_entry) when is_map(running_entry) do
     runtime_seconds = running_seconds(running_entry.started_at, DateTime.utc_now())

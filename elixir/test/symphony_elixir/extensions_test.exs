@@ -613,6 +613,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Offline"
     assert html =~ "Copy ID"
     assert html =~ "Codex update"
+    assert html =~ ~s(href="/api/v1/MT-HTTP")
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"
@@ -624,7 +625,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       put_in(snapshot.running, [
         %{
           issue_id: "issue-http",
-          identifier: "MT-HTTP",
+          identifier: "#146",
           state: "In Progress",
           session_id: "thread-http",
           turn_count: 8,
@@ -659,6 +660,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert_eventually(fn ->
       render(view) =~ "agent message content streaming: structured update"
     end)
+
+    assert render(view) =~ ~s(href="/api/v1/%23146")
   end
 
   test "dashboard liveview renders an unavailable state without crashing" do

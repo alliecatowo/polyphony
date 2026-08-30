@@ -32,7 +32,19 @@ workspace:
   root: ~/develop/patches/.polyphony/workspaces
 hooks:
   after_create: |
-    git clone --local --no-hardlinks "$HOME/develop/patches" .
+    issue_id="$(basename "$PWD")"
+    repo_owner="${GITHUB_REPO_OWNER:-alliecatowo}"
+    repo_name="${GITHUB_REPO_NAME:-patches}"
+    repo_url="${GITHUB_REPO_URL:-git@github.com:${repo_owner}/${repo_name}.git}"
+    if [ ! -d .git ]; then
+      git clone --quiet "$repo_url" .
+    else
+      git remote set-url origin "$repo_url"
+    fi
+    git fetch origin main --quiet || true
+    base_ref="origin/main"
+    git rev-parse --verify "$base_ref" >/dev/null 2>&1 || base_ref=HEAD
+    git switch --create "agent/polyphony-${issue_id}" "$base_ref"
   before_run: |
     issue_id="$(basename "$PWD")"
     mkdir -p "docs/issues/${issue_id}/logs" "docs/issues/${issue_id}/evidence" "docs/issues/${issue_id}/decisions" "docs/issues/${issue_id}/spikes"
@@ -119,6 +131,17 @@ Instructions:
 - Do not invent a stack or merge a single PR merely because one issue is complete. If the stack is ambiguous, leave it in review and record the exact blocker.
 
 Work only in the provided repository copy. Do not touch any other path.
+
+## Required delivery
+
+Unless the issue is genuinely blocked by missing external access or is a
+documentation-only investigation with no actionable change, finish by making
+the smallest coherent implementation, committing it on the worker branch,
+and publishing a pull request with `gh pr create` (or updating the existing
+PR for that branch). A successful turn without a committed change or an
+explicit, evidence-backed blocker is not a completed delivery. Keep generated
+workpads under `docs/issues/<issue-id>/` and include the commit/PR or blocker
+in the handoff.
 
 ## Prerequisite: GitHub MCP or `github_graphql` tool is available
 

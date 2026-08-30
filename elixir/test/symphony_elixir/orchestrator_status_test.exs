@@ -1,6 +1,40 @@
 defmodule SymphonyElixir.OrchestratorStatusTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Orchestrator.State
+
+  test "poll completion preserves worker events and never resurrects poll snapshots" do
+    issue = %Issue{id: "issue-1", identifier: "MT-1", title: "Existing", state: "In Progress"}
+    existing_entry = %{issue: issue, last_codex_event: :turn_completed, slice_member_ids: ["issue-1"]}
+
+    current = %State{
+      running: %{"issue-1" => existing_entry},
+      claimed: MapSet.new(["issue-1"]),
+      completed: MapSet.new(),
+      retry_attempts: %{},
+      codex_rate_limits: %{remaining: 9}
+    }
+
+    added_issue = %Issue{id: "issue-2", identifier: "MT-2", title: "Added", state: "Todo"}
+    added_entry = %{issue: added_issue, slice_member_ids: ["issue-2", "slice-2"]}
+
+    polled = %State{
+      running: %{"issue-1" => %{existing_entry | last_codex_event: :stale}, "issue-2" => added_entry},
+      claimed: MapSet.new(["issue-1", "issue-2", "slice-2"]),
+      completed: MapSet.new(["poll-completed"]),
+      retry_attempts: %{},
+      codex_rate_limits: %{remaining: 8}
+    }
+
+    merged = Orchestrator.merge_poll_cycle_state_for_test(current, polled, MapSet.new(["issue-1"]))
+
+    assert merged.running["issue-1"].last_codex_event == :turn_completed
+    refute Map.has_key?(merged.running, "issue-2")
+    assert merged.claimed == MapSet.new(["issue-1"])
+    assert MapSet.member?(merged.completed, "poll-completed")
+    assert merged.codex_rate_limits == %{remaining: 9}
+  end
+
   test "snapshot returns :timeout when snapshot server is unresponsive" do
     server_name = Module.concat(__MODULE__, :UnresponsiveSnapshotServer)
     parent = self()
@@ -99,6 +133,91 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              message: %{method: "some-event"},
              timestamp: now
            }
+  end
+
+  test "dashboard notification is published after worker state is committed" do
+    issue_id = "issue-dashboard-ordering"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "#146",
+      title: "Dashboard ordering test",
+      description: "Ensure LiveView snapshots the new worker state",
+      state: "In Progress",
+      url: "https://example.org/issues/146"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :DashboardOrderingOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    :ok = SymphonyElixirWeb.ObservabilityPubSub.subscribe()
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, {
+      :codex_worker_update,
+      issue_id,
+      %{
+        event: :session_started,
+        session_id: "thread-146-turn-1",
+        timestamp: DateTime.utc_now()
+      }
+    })
+
+    assert_receive :observability_updated, 1_000
+
+    assert %{running: [%{session_id: "thread-146-turn-1", turn_count: 1}]} =
+             GenServer.call(pid, :snapshot)
+
+    send(pid, {
+      :codex_worker_update,
+      issue_id,
+      %{
+        event: :notification,
+        payload: %{
+          "method" => "thread/tokenUsage/updated",
+          "params" => %{
+            "tokenUsage" => %{
+              "total" => %{"inputTokens" => 7, "outputTokens" => 3, "totalTokens" => 10}
+            }
+          }
+        },
+        timestamp: DateTime.utc_now()
+      }
+    })
+
+    assert_receive :observability_updated, 1_000
+
+    assert %{running: [%{codex_input_tokens: 7, codex_output_tokens: 3, codex_total_tokens: 10}]} =
+             GenServer.call(pid, :snapshot)
   end
 
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do

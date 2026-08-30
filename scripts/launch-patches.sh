@@ -44,6 +44,25 @@ set -a
 . ./.env
 set +a
 
+# Use the credential already authenticated in GitHub CLI when available. This
+# keeps the GraphQL project API and gh/git children on the same working token.
+if command -v gh >/dev/null 2>&1; then
+  gh_token="$(gh auth token 2>/dev/null || true)"
+  if [[ -n "$gh_token" ]]; then
+    export GITHUB_TOKEN="$gh_token"
+    export GITHUB_OAUTH_TOKEN="$gh_token"
+    export GH_TOKEN="$gh_token"
+  fi
+fi
+
+# GITHUB_PAT is the verified credential on this workstation. Prefer it for
+# both the tracker client and gh/git child processes when present, because an
+# older GITHUB_TOKEN may still be exported by the user's shell.
+if [[ -n "${GITHUB_PAT:-}" ]]; then
+  export GITHUB_TOKEN="$GITHUB_PAT"
+  export GH_TOKEN="$GITHUB_PAT"
+fi
+
 # Board schema/item maintenance is an explicit bootstrap action, not part of
 # the hot polling path. This keeps candidate discovery responsive.
 export POLYPHONY_SKIP_BOARD_BOOTSTRAP=1
@@ -63,16 +82,68 @@ public_host_args=()
 if [[ -n "${POLYPHONY_PUBLIC_HOST:-}" ]]; then
   public_host_args=(--public-host "$POLYPHONY_PUBLIC_HOST")
 fi
+library_args=()
+if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+  library_args=(--setenv="LD_LIBRARY_PATH=$LD_LIBRARY_PATH")
+fi
+auth_args=()
+if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  auth_args+=(
+    --setenv="GITHUB_TOKEN=$GITHUB_TOKEN"
+    --setenv="GITHUB_OAUTH_TOKEN=${GITHUB_OAUTH_TOKEN:-$GITHUB_TOKEN}"
+    --setenv="GH_TOKEN=${GH_TOKEN:-$GITHUB_TOKEN}"
+  )
+fi
+for config_var in \
+  GITHUB_OAUTH_TOKEN \
+  GITHUB_REPO_OWNER \
+  GITHUB_REPO_NAME \
+  GITHUB_REPO_URL \
+  GITHUB_PROJECT_NUMBER \
+  GITHUB_PROJECT_OWNER_TYPE \
+  GITHUB_PROJECT_OWNER_LOGIN \
+  GITHUB_PROJECT_TITLE \
+  GITHUB_ASSIGNEE; do
+  if [[ -n "${!config_var:-}" ]]; then
+    auth_args+=(--setenv="$config_var=${!config_var}")
+  fi
+done
 
-exec systemd-run --user --scope --quiet --collect \
-  --unit="polyphony-orchestrator" \
-  --property=CPUQuota=800% \
-  --property=MemoryMax=10240M \
-  --property=TasksMax=2048 \
-  --property=OOMPolicy=kill \
-  --property=KillMode=control-group \
-  -- mise exec -- ./bin/symphony \
-  --i-understand-that-this-will-be-running-without-the-usual-guardrails \
-  "${host_args[@]}" \
-  "${public_host_args[@]}" \
+polyphony_args=(
+  --i-understand-that-this-will-be-running-without-the-usual-guardrails
+  "${host_args[@]}"
+  "${public_host_args[@]}"
   "$workflow"
+)
+
+if [[ "${POLYPHONY_FOREGROUND:-0}" == "1" ]]; then
+  exec systemd-run --user --scope --quiet --collect \
+    --working-directory="$elixir_root" \
+    "${library_args[@]}" \
+    "${auth_args[@]}" \
+    --unit="polyphony-orchestrator" \
+    --property=CPUQuota=800% \
+    --property=MemoryMax=10240M \
+    --property=TasksMax=2048 \
+    --property=OOMPolicy=kill \
+    --property=KillMode=control-group \
+    -- bash -lc 'ulimit -n 16384; exec mise exec -- ./bin/symphony "$@"' bash \
+    "${polyphony_args[@]}"
+else
+  # A detached service is required for nohup/background launches: a scope is
+  # owned by its invoking shell and can leave only orphaned children behind.
+  exec systemd-run --user --quiet --collect --no-block \
+    --working-directory="$elixir_root" \
+    "${library_args[@]}" \
+    "${auth_args[@]}" \
+    --unit="polyphony-orchestrator.service" \
+    --property=Restart=on-failure \
+    --property=RestartSec=5s \
+    --property=CPUQuota=800% \
+    --property=MemoryMax=10240M \
+    --property=TasksMax=2048 \
+    --property=OOMPolicy=kill \
+    --property=KillMode=control-group \
+    -- bash -lc 'ulimit -n 16384; exec mise exec -- ./bin/symphony "$@"' bash \
+    "${polyphony_args[@]}"
+fi

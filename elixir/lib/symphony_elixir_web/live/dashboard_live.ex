@@ -57,13 +57,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </div>
 
           <div class="status-stack">
-            <span class="status-badge status-badge-live">
+            <span class={status_badge_class(@payload)}>
               <span class="status-badge-dot"></span>
-              Live
-            </span>
-            <span class="status-badge status-badge-offline">
-              <span class="status-badge-dot"></span>
-              Offline
+              <%= if @payload[:error], do: "Offline", else: "Live" %>
             </span>
             <%= if is_nil(@payload[:error]) and stalled_count(@payload, @now) > 0 do %>
               <span class="status-badge status-badge-offline">
@@ -166,7 +162,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <div class="issue-stack">
                         <span class="issue-id"><%= entry.issue_identifier %></span>
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                        <a class="issue-link" href={issue_api_path(entry.issue_identifier)}>JSON details</a>
                       </div>
                     </td>
                     <td>
@@ -245,7 +241,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <div class="issue-stack">
                         <span class="issue-id"><%= entry.issue_identifier %></span>
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                        <a class="issue-link" href={issue_api_path(entry.issue_identifier)}>JSON details</a>
                       </div>
                     </td>
                     <td><%= entry.attempt %></td>
@@ -265,6 +261,17 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp load_payload do
     Presenter.state_payload(orchestrator(), snapshot_timeout_ms())
   end
+
+  defp issue_api_path(identifier) when is_binary(identifier) do
+    "/api/v1/" <> URI.encode(identifier, &URI.char_unreserved?/1)
+  end
+
+  defp issue_api_path(identifier) do
+    "/api/v1/" <> URI.encode(to_string(identifier), &URI.char_unreserved?/1)
+  end
+
+  defp status_badge_class(%{error: _error}), do: "status-badge status-badge-offline"
+  defp status_badge_class(_payload), do: "status-badge status-badge-live"
 
   defp orchestrator do
     Endpoint.config(:orchestrator) || SymphonyElixir.Orchestrator
