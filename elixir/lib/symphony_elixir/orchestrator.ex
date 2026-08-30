@@ -381,8 +381,7 @@ defmodule SymphonyElixir.Orchestrator do
            {:ok, issues} <- Tracker.fetch_candidate_issues(),
            :ok <- log_candidate_count(issues),
            true <- available_slots(state) > 0 do
-        clear_github_rate_limit(state)
-        |> choose_issues(issues, orchestrator)
+        choose_issues(issues, clear_github_rate_limit(state), orchestrator)
       else
         {:error, :missing_linear_api_token} ->
           Logger.error("Linear API token missing in WORKFLOW.md")
