@@ -59,6 +59,7 @@ agent:
 codex:
   command: codex --config shell_environment_policy.inherit=all app-server
   shared_app_server: true
+  read_timeout_ms: 30000
   models:
     default: gpt-5.6-luna
     review: gpt-5.6-terra

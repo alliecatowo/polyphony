@@ -107,6 +107,19 @@ defmodule SymphonyElixir.GitHub.Client do
   updatedAt
   """
 
+  @issue_state_fields """
+  id
+  number
+  title
+  body
+  state
+  stateReason
+  url
+  labels(first: 10) { nodes { name } }
+  createdAt
+  updatedAt
+  """
+
   @repo_issues_query """
   query SymphonyGitHubRepositoryIssues($owner: String!, $name: String!, $after: String, $first: Int!, $states: [IssueState!]) {
     repository(owner: $owner, name: $name) {
@@ -169,7 +182,7 @@ defmodule SymphonyElixir.GitHub.Client do
   query SymphonyGitHubIssuesById($ids: [ID!]!) {
     nodes(ids: $ids) {
       ... on Issue {
-        #{@issue_fields}
+        #{@issue_state_fields}
       }
     }
   }

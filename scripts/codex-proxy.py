@@ -10,6 +10,21 @@ import struct
 import sys
 
 
+def send_all(sock: socket.socket, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        try:
+            sent = sock.send(view)
+        except BlockingIOError:
+            _, writable, _ = select.select([], [sock], [], 5.0)
+            if not writable:
+                raise TimeoutError("timed out writing to Codex app-server")
+            continue
+        if sent == 0:
+            raise ConnectionError("Codex app-server socket closed while writing")
+        view = view[sent:]
+
+
 def frame(payload: bytes) -> bytes:
     mask = os.urandom(4)
     masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
@@ -102,12 +117,12 @@ def main() -> int:
                 elif opcode == 0x8:
                     return 0
                 elif opcode == 0x9:
-                    sock.sendall(bytes([0x8A, len(payload)]) + payload)
+                    send_all(sock, bytes([0x8A, len(payload)]) + payload)
         if stdin in readable:
             line = stdin.readline()
             if not line:
                 return 0
-            sock.sendall(frame(line.rstrip(b"\n")))
+            send_all(sock, frame(line.rstrip(b"\n")))
 
 
 if __name__ == "__main__":
