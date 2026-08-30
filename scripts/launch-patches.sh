@@ -16,11 +16,15 @@ if ! command -v systemd-run >/dev/null 2>&1; then
   exit 1
 fi
 
+# Raise the inherited descriptor limit before launching the scope. Some user
+# systemd installations reject LimitNOFILE as a transient property.
+ulimit -n 16384
+
 systemd-run --user --scope --quiet --collect \
   --unit="polyphony-preflight-$$" \
-  --property=CPUQuota=250% \
-  --property=MemoryMax=6144M \
-  --property=TasksMax=512 \
+  --property=CPUQuota=800% \
+  --property=MemoryMax=10240M \
+  --property=TasksMax=2048 \
   --property=KillMode=control-group \
   -- true >/dev/null
 
@@ -45,6 +49,12 @@ set +a
 export POLYPHONY_SKIP_BOARD_BOOTSTRAP=1
 export POLYPHONY_SKIP_BOARD_ENRICHMENT=1
 
+# Keep Codex sandboxes and transient files out of shared /tmp pressure, and
+# give the shared app-server enough descriptors for six workers.
+runtime_tmp="$repo_root/.runtime-tmp"
+mkdir -p "$runtime_tmp"
+export TMPDIR="$runtime_tmp"
+
 host_args=()
 if [[ -n "${POLYPHONY_HOST:-}" ]]; then
   host_args=(--host "$POLYPHONY_HOST")
@@ -56,9 +66,9 @@ fi
 
 exec systemd-run --user --scope --quiet --collect \
   --unit="polyphony-orchestrator" \
-  --property=CPUQuota=250% \
-  --property=MemoryMax=6144M \
-  --property=TasksMax=512 \
+  --property=CPUQuota=800% \
+  --property=MemoryMax=10240M \
+  --property=TasksMax=2048 \
   --property=OOMPolicy=kill \
   --property=KillMode=control-group \
   -- mise exec -- ./bin/symphony \

@@ -49,9 +49,9 @@ worker:
   # Hard limits are applied to each Codex process tree with systemd-run --user.
   # Leave headroom on this workstation's 14 GiB RAM / 16 CPU threads while
   # allowing concurrent builds and test suites.
-  cpu_quota_percent: 250
-  memory_max_mb: 6144
-  tasks_max: 512
+  cpu_quota_percent: 800
+  memory_max_mb: 10240
+  tasks_max: 2048
   cgroup_required: true
 agent:
   max_concurrent_agents: 6
