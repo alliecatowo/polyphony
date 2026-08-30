@@ -2056,6 +2056,8 @@ defmodule SymphonyElixir.Orchestrator do
     rate_limits_from_payload(update[:rate_limits]) ||
       rate_limits_from_payload(Map.get(update, "rate_limits")) ||
       rate_limits_from_payload(Map.get(update, :rate_limits)) ||
+      rate_limits_from_payload(Map.get(update, "rateLimits")) ||
+      rate_limits_from_payload(Map.get(update, :rateLimits)) ||
       rate_limits_from_payload(update[:payload]) ||
       rate_limits_from_payload(Map.get(update, "payload")) ||
       rate_limits_from_payload(update)
@@ -2095,7 +2097,11 @@ defmodule SymphonyElixir.Orchestrator do
   defp turn_completed_usage_from_payload(_payload), do: nil
 
   defp rate_limits_from_payload(payload) when is_map(payload) do
-    direct = Map.get(payload, "rate_limits") || Map.get(payload, :rate_limits)
+    direct =
+      Map.get(payload, "rate_limits") ||
+        Map.get(payload, :rate_limits) ||
+        Map.get(payload, "rateLimits") ||
+        Map.get(payload, :rateLimits)
 
     cond do
       rate_limits_map?(direct) ->
