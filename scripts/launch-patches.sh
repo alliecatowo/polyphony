@@ -19,8 +19,8 @@ fi
 systemd-run --user --scope --quiet --collect \
   --unit="polyphony-preflight-$$" \
   --property=CPUQuota=250% \
-  --property=MemoryMax=3072M \
-  --property=TasksMax=384 \
+  --property=MemoryMax=6144M \
+  --property=TasksMax=512 \
   --property=KillMode=control-group \
   -- true >/dev/null
 
@@ -40,6 +40,11 @@ set -a
 . ./.env
 set +a
 
+# Board schema/item maintenance is an explicit bootstrap action, not part of
+# the hot polling path. This keeps candidate discovery responsive.
+export POLYPHONY_SKIP_BOARD_BOOTSTRAP=1
+export POLYPHONY_SKIP_BOARD_ENRICHMENT=1
+
 host_args=()
 if [[ -n "${POLYPHONY_HOST:-}" ]]; then
   host_args=(--host "$POLYPHONY_HOST")
@@ -52,8 +57,8 @@ fi
 exec systemd-run --user --scope --quiet --collect \
   --unit="polyphony-orchestrator" \
   --property=CPUQuota=250% \
-  --property=MemoryMax=3072M \
-  --property=TasksMax=384 \
+  --property=MemoryMax=6144M \
+  --property=TasksMax=512 \
   --property=OOMPolicy=kill \
   --property=KillMode=control-group \
   -- mise exec -- ./bin/symphony \

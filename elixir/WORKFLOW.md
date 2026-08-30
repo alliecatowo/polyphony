@@ -47,10 +47,11 @@ worker:
   ssh_hosts: []
   max_concurrent_agents_per_host: 4
   # Hard limits are applied to each Codex process tree with systemd-run --user.
-  # Keep the aggregate below this workstation's 14 GiB RAM / 16 CPU threads.
+  # Leave headroom on this workstation's 14 GiB RAM / 16 CPU threads while
+  # allowing concurrent builds and test suites.
   cpu_quota_percent: 250
-  memory_max_mb: 3072
-  tasks_max: 384
+  memory_max_mb: 6144
+  tasks_max: 512
   cgroup_required: true
 agent:
   max_concurrent_agents: 6

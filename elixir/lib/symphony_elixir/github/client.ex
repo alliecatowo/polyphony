@@ -143,39 +143,16 @@ defmodule SymphonyElixir.GitHub.Client do
                 state
                 stateReason
                 url
-                assignees(first: 10) { nodes { login } }
                 labels(first: 10) { nodes { name } }
-                milestone { id number title dueOn state description }
-                parent { id number title state url }
-                subIssues(first: 10) { nodes { id number title state url } }
                 repository { id nameWithOwner }
               }
             }
             fieldValues(first: 20) {
               nodes {
                 __typename
-                ... on ProjectV2ItemFieldDateValue {
-                  date
-                  field { ... on ProjectV2FieldCommon { id name } }
-                }
-                ... on ProjectV2ItemFieldIterationValue {
-                  iterationId
-                  title
-                  startDate
-                  duration
-                  field { ... on ProjectV2FieldCommon { id name } }
-                }
-                ... on ProjectV2ItemFieldNumberValue {
-                  number
-                  field { ... on ProjectV2FieldCommon { id name } }
-                }
                 ... on ProjectV2ItemFieldSingleSelectValue {
                   name
                   optionId
-                  field { ... on ProjectV2FieldCommon { id name } }
-                }
-                ... on ProjectV2ItemFieldTextValue {
-                  text
                   field { ... on ProjectV2FieldCommon { id name } }
                 }
               }
@@ -384,10 +361,20 @@ defmodule SymphonyElixir.GitHub.Client do
 
     with :ok <- validate_tracker!(tracker),
          {:ok, project_ctx} <- ensure_project_context(tracker),
-         {:ok, _} <- ensure_project_fields(project_ctx.project_id, tracker.required_project_fields, tracker),
-         {:ok, _} <- ensure_repository_issues_in_project(tracker, project_ctx.project_id),
+         :ok <- maybe_bootstrap_project_for_poll(tracker, project_ctx.project_id),
          {:ok, issues} <- fetch_project_issues(project_ctx.project_id, tracker.repo_owner, tracker.repo_name) do
       {:ok, Enum.filter(issues, &active_candidate_issue?(&1, tracker.active_states, tracker.terminal_states))}
+    end
+  end
+
+  defp maybe_bootstrap_project_for_poll(tracker, project_id) do
+    if System.get_env("POLYPHONY_SKIP_BOARD_BOOTSTRAP") in ["1", "true", "TRUE"] do
+      :ok
+    else
+      with {:ok, _} <- ensure_project_fields(project_id, tracker.required_project_fields, tracker),
+           {:ok, _} <- ensure_repository_issues_in_project(tracker, project_id) do
+        :ok
+      end
     end
   end
 
@@ -1051,7 +1038,7 @@ defmodule SymphonyElixir.GitHub.Client do
       |> Enum.map(&normalize_issue/1)
       |> Enum.reject(&is_nil/1)
 
-    {:ok, enrich_issues_with_relationship_signals(issues), %{has_next_page: has_next_page == true, end_cursor: end_cursor}}
+    {:ok, maybe_enrich_issues_with_relationship_signals(issues), %{has_next_page: has_next_page == true, end_cursor: end_cursor}}
   end
 
   defp decode_repository_page_response(%{"errors" => errors}), do: {:error, {:github_graphql_errors, errors}}
@@ -1098,7 +1085,7 @@ defmodule SymphonyElixir.GitHub.Client do
         end
       end)
 
-    {:ok, enrich_issues_with_relationship_signals(issues), %{has_next_page: has_next_page == true, end_cursor: end_cursor}}
+    {:ok, maybe_enrich_issues_with_relationship_signals(issues), %{has_next_page: has_next_page == true, end_cursor: end_cursor}}
   end
 
   defp decode_project_page_response(%{"errors" => errors}, _repo_owner, _repo_name),
@@ -1513,6 +1500,14 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
+  defp maybe_enrich_issues_with_relationship_signals(issues) when is_list(issues) do
+    if System.get_env("POLYPHONY_SKIP_BOARD_ENRICHMENT") in ["1", "true", "TRUE"] do
+      issues
+    else
+      enrich_issues_with_relationship_signals(issues)
+    end
+  end
+
   defp hydrate_blocker_states(issues) when is_list(issues) do
     blocker_ids =
       issues
@@ -1711,8 +1706,12 @@ defmodule SymphonyElixir.GitHub.Client do
     active_set = normalized_state_set(active_states)
     terminal_set = normalized_state_set(terminal_states)
     effective_state = effective_issue_state(issue)
+    project_states = project_state_values(issue)
+    open_without_project_status? = project_states == [] and normalize_state_name(issue.state) == "open"
 
-    MapSet.member?(active_set, effective_state) and not MapSet.member?(terminal_set, effective_state)
+    (MapSet.member?(active_set, effective_state) or
+       (open_without_project_status? and MapSet.intersection(active_set, MapSet.new(["todo", "in progress"])) != MapSet.new())) and
+      not MapSet.member?(terminal_set, effective_state)
   end
 
   defp active_candidate_issue?(_issue, _active_states, _terminal_states), do: false
@@ -1825,7 +1824,8 @@ defmodule SymphonyElixir.GitHub.Client do
     Req.post(Config.settings!().tracker.endpoint,
       headers: headers,
       json: payload,
-      connect_options: [timeout: 30_000]
+      connect_options: [timeout: 30_000],
+      receive_timeout: 30_000
     )
   end
 

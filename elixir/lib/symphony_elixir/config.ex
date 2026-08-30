@@ -92,7 +92,12 @@ defmodule SymphonyElixir.Config do
     routing = if is_map(worker.routing), do: worker.routing, else: %{}
     labels = issue |> Map.get(:labels, Map.get(issue, "labels", [])) |> normalize_worker_labels()
     state = issue |> Map.get(:state, Map.get(issue, "state", "")) |> normalize_worker_label()
-    pr_lifecycle = get_in(issue, [:tracker_metadata, "pull_request_lifecycle"]) || %{}
+
+    pr_lifecycle =
+      issue
+      |> Map.get(:tracker_metadata, %{})
+      |> Map.get("pull_request_lifecycle", %{})
+
     stack_ready? = Map.get(pr_lifecycle, "ready_for_review", false) == true
     retry_attempt = if is_integer(attempt) and attempt > 0, do: attempt, else: 0
     escalation_after = routing_integer(routing, "escalation_after_attempts", 0)

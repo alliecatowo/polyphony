@@ -75,6 +75,7 @@ defmodule SymphonyElixir.Orchestrator do
   @impl true
   def handle_info({:tick, tick_token}, %{tick_token: tick_token} = state)
       when is_reference(tick_token) do
+    Logger.info("Starting orchestrator poll cycle")
     state = refresh_runtime_config(state)
 
     state = %{
@@ -113,7 +114,20 @@ defmodule SymphonyElixir.Orchestrator do
     orchestrator = self()
 
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           send(orchestrator, {:poll_cycle_complete, maybe_dispatch(state)})
+           polled_state =
+             try do
+               maybe_dispatch(state)
+             rescue
+               exception ->
+                 Logger.error("Poll cycle crashed: #{Exception.format(:error, exception, __STACKTRACE__)}")
+                 state
+             catch
+               kind, reason ->
+                 Logger.error("Poll cycle exited: #{inspect({kind, reason})}")
+                 state
+             end
+
+           send(orchestrator, {:poll_cycle_complete, polled_state})
          end) do
       {:ok, _pid} ->
         {:noreply, state}
@@ -127,6 +141,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info({:poll_cycle_complete, %State{} = polled_state}, _state) do
+    Logger.info("Completed orchestrator poll cycle")
     state = polled_state |> schedule_tick(polled_state.poll_interval_ms) |> Map.put(:poll_check_in_progress, false)
     notify_dashboard()
     {:noreply, state}
@@ -245,6 +260,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
+         :ok <- log_candidate_count(issues),
          true <- available_slots(state) > 0 do
       choose_issues(issues, state)
     else
@@ -302,6 +318,13 @@ defmodule SymphonyElixir.Orchestrator do
         state
     end
   end
+
+  defp log_candidate_count(issues) when is_list(issues) do
+    Logger.info("Tracker candidate fetch returned #{length(issues)} dispatchable issues")
+    :ok
+  end
+
+  defp log_candidate_count(_issues), do: :ok
 
   defp reconcile_running_issues(%State{} = state) do
     state = reconcile_stalled_running_issues(state)
@@ -405,7 +428,7 @@ defmodule SymphonyElixir.Orchestrator do
 
         terminate_running_issue(state, issue.id, false)
 
-      active_issue_state?(issue.state, active_states) ->
+      dispatch_active_issue_state?(issue, issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
 
       true ->
@@ -569,9 +592,11 @@ defmodule SymphonyElixir.Orchestrator do
   defp choose_issues(issues, state) do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
+    planned_slices = SlicePlanner.plan(issues)
 
-    issues
-    |> SlicePlanner.plan()
+    Logger.info("Dispatch evaluation: issues=#{length(issues)} slices=#{length(planned_slices)} candidates=#{Enum.count(issues, &candidate_issue?(&1, active_states, terminal_states))}")
+
+    planned_slices
     |> Enum.reduce(state, fn %{leader: issue}, state_acc ->
       if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
         dispatch_issue(state_acc, issue, nil, nil, board_context(issues))
@@ -650,7 +675,7 @@ defmodule SymphonyElixir.Orchestrator do
        )
        when is_binary(id) and is_binary(identifier) and is_binary(title) and is_binary(state_name) do
     issue_routable_to_worker?(issue) and
-      active_issue_state?(state_name, active_states) and
+      dispatch_active_issue_state?(issue, state_name, active_states) and
       !terminal_issue_state?(state_name, terminal_states)
   end
 
@@ -661,6 +686,27 @@ defmodule SymphonyElixir.Orchestrator do
        do: assigned_to_worker
 
   defp issue_routable_to_worker?(_issue), do: true
+
+  defp dispatch_active_issue_state?(issue, state_name, active_states) do
+    active_issue_state?(state_name, active_states) or
+      (normalize_issue_state(state_name) == "open" and
+         project_status_missing?(issue) and
+         Enum.any?(active_states, &(normalize_issue_state(&1) in ["todo", "in progress"])))
+  end
+
+  defp project_status_missing?(issue) do
+    issue
+    |> Map.get(:tracker_metadata, %{})
+    |> Map.get("project_items", [])
+    |> Enum.all?(fn item ->
+      item
+      |> then(fn item -> if is_map(item), do: Map.get(item, "field_values", []), else: [] end)
+      |> Enum.all?(fn value ->
+        field = if is_map(value), do: Map.get(value, "field"), else: nil
+        !is_map(field) or normalize_issue_state(Map.get(field, "name", "")) != "status"
+      end)
+    end)
+  end
 
   defp active_issue_blocked_by_non_terminal?(
          %{state: issue_state, blocked_by: blockers},
@@ -700,7 +746,11 @@ defmodule SymphonyElixir.Orchestrator do
     |> Enum.sort_by(fn issue -> {priority_rank(Map.get(issue, :priority)), issue_created_at_sort_key(issue)} end)
     |> Enum.take(24)
     |> Enum.map_join("\n", fn issue ->
-      fields = get_in(issue, [:tracker_metadata, "project_fields"]) || %{}
+      fields =
+        issue
+        |> Map.get(:tracker_metadata, %{})
+        |> Map.get("project_fields", %{})
+
       area = get_in(fields, ["area", "name"]) || "unclassified"
       kind = get_in(fields, ["kind", "name"]) || "unclassified"
       priority = priority_label(Map.get(issue, :priority))
