@@ -2464,7 +2464,7 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp poll_owned_entry?(current_entry, base_entry) when is_map(base_entry) do
+  defp poll_owned_entry?(current_entry, base_entry) when is_map(current_entry) and is_map(base_entry) do
     Map.get(current_entry, :ref) == Map.get(base_entry, :ref)
   end
 
