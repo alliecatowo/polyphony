@@ -107,8 +107,7 @@ defmodule SymphonyElixir.CoreTest do
     hooks = Map.get(config, "hooks", %{})
     assert is_map(hooks)
 
-    assert Map.get(hooks, "after_create") =~
-             "git clone --local --no-hardlinks \"$HOME/develop/patches\" ."
+    assert Map.get(hooks, "after_create") =~ "git clone --quiet \"$repo_url\" ."
 
     refute Map.get(hooks, "after_create") =~ "cd elixir"
     assert Map.get(hooks, "before_run") =~ "docs/issues/${issue_id}"

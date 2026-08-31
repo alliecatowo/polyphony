@@ -1792,11 +1792,23 @@ defmodule SymphonyElixir.GitHub.Client do
     terminal_set = normalized_state_set(terminal_states)
     effective_state = effective_issue_state(issue)
 
-    MapSet.member?(active_set, effective_state) and
-      not MapSet.member?(terminal_set, effective_state)
+    project_active_alias? =
+      MapSet.member?(active_set, "open") and effective_state in ["todo", "in progress"]
+
+    (MapSet.member?(active_set, effective_state) or project_active_alias?) and
+      not MapSet.member?(terminal_set, effective_state) and
+      project_status_is_usable?(issue)
   end
 
   defp active_candidate_issue?(_issue, _active_states, _terminal_states), do: false
+
+  defp project_status_is_usable?(%Issue{} = issue) do
+    project_items = get_in(issue.tracker_metadata, ["project_items"])
+
+    project_items == [] or is_binary(project_status_name(project_items))
+  end
+
+  defp project_status_is_usable?(_issue), do: false
 
   defp issue_matches_state_filter?(
          %Issue{} = issue,

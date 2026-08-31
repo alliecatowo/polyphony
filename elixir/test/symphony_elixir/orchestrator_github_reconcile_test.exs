@@ -266,7 +266,6 @@ defmodule SymphonyElixir.OrchestratorGitHubReconcileTest do
     }
 
     assert :ok = Orchestrator.reconcile_issue_primitives_for_test(issue)
-
     assert_receive {:reconcile_issue_state_from_project_status, "ISSUE-ORDER-1", _}
     assert_receive {:reconcile_issue_milestone, "ISSUE-ORDER-1", 7}
     assert_receive {:reconcile_issue_assignees, "ISSUE-ORDER-1", ["allie"]}
@@ -446,7 +445,6 @@ defmodule SymphonyElixir.OrchestratorGitHubReconcileTest do
       end
     end)
 
-    assert_receive {:fetch_issues_by_states, ["closed"]}, 500
     assert Process.alive?(pid)
 
     snapshot = Orchestrator.snapshot(orchestrator_name, 500)

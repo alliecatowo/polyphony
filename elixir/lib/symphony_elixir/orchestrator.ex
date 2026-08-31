@@ -760,7 +760,10 @@ defmodule SymphonyElixir.Orchestrator do
   @doc false
   @spec reconcile_issue_states_for_test([tracker_issue()], term()) :: term()
   def reconcile_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
-    reconcile_running_issue_states(issues, state, active_state_set(), terminal_state_set())
+    running_ids = Map.keys(state.running)
+
+    state = reconcile_running_issue_states(issues, state, active_state_set(), terminal_state_set())
+    reconcile_missing_running_issue_ids(state, running_ids, issues)
   end
 
   def reconcile_issue_states_for_test(issues, state) when is_list(issues) do
@@ -2387,9 +2390,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp merge_poll_cycle_state(%State{} = current, %State{} = polled, base_running_entries) do
     base_running_entries =
       case base_running_entries do
-        entries when is_map(entries) -> entries
         %MapSet{} = ids -> Map.new(ids, &{&1, nil})
         ids when is_list(ids) -> Map.new(ids, &{&1, nil})
+        entries when is_map(entries) -> entries
         _ -> %{}
       end
 
@@ -2410,10 +2413,19 @@ defmodule SymphonyElixir.Orchestrator do
       end)
       |> Map.new()
 
+    removed_claims =
+      removed_by_poll
+      |> Enum.filter(fn issue_id ->
+        current_entry = Map.get(current.running, issue_id)
+        poll_owned_entry?(current_entry, Map.get(base_running_entries, issue_id))
+      end)
+
+    claimed = Enum.reduce(removed_claims, current.claimed, &MapSet.delete(&2, &1))
+
     %{
       current
       | running: current_running,
-        claimed: current.claimed,
+        claimed: claimed,
         retry_attempts: Map.merge(polled.retry_attempts, current.retry_attempts),
         completed: MapSet.union(current.completed, polled.completed),
         poll_interval_ms: polled.poll_interval_ms,

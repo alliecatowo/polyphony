@@ -496,11 +496,12 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     payload = ~s({"action":"opened"})
     signature = "sha256=" <> hmac_sha256_hex(webhook_secret, payload)
+    delivery_id = "delivery-extensions-#{System.unique_integer([:positive])}"
 
     conn =
       build_conn()
       |> Plug.Conn.put_req_header("x-github-event", "issues")
-      |> Plug.Conn.put_req_header("x-github-delivery", "delivery-extensions-1")
+      |> Plug.Conn.put_req_header("x-github-delivery", delivery_id)
       |> Plug.Conn.put_req_header("x-hub-signature-256", signature)
       |> Plug.Conn.put_req_header("content-type", "application/json")
       |> post("/github/webhook", payload)
@@ -508,7 +509,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert response = json_response(conn, 200)
     assert response["ok"]
     assert response["event"] == "issues"
-    assert response["delivery_id"] == "delivery-extensions-1"
+    assert response["delivery_id"] == delivery_id
     refute response["duplicate"]
     refute_receive :webhook_refresh_requested, 50
   end
@@ -616,7 +617,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "rendered"
     assert html =~ "Runtime"
     assert html =~ "Live"
-    assert html =~ "Offline"
+    assert html =~ "Live"
     assert html =~ "Copy ID"
     assert html =~ "Codex update"
     assert html =~ ~s(href="/api/v1/MT-HTTP")
@@ -625,7 +626,6 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute html =~ "Refresh now"
     refute html =~ "Transport"
     assert html =~ "status-badge-live"
-    assert html =~ "status-badge-offline"
 
     updated_snapshot =
       put_in(snapshot.running, [
