@@ -51,8 +51,19 @@ backend_url="http://127.0.0.1:4000"
 
 # The dashboard remains tailnet-only at the root mount. Only the signed
 # webhook path is marked public through Funnel.
-tailscale serve --bg --yes "$backend_url" >/dev/null
-tailscale funnel --bg --yes --set-path=/github/webhook "$backend_url/github/webhook" >/dev/null
+if ! serve_output="$(timeout 15s tailscale serve --bg --yes "$backend_url" 2>&1)"; then
+  echo "Webhook setup refused: Tailscale Serve could not be enabled." >&2
+  echo "$serve_output" >&2
+  echo "Enable Serve for this tailnet, then rerun this script." >&2
+  exit 1
+fi
+
+if ! funnel_output="$(timeout 15s tailscale funnel --bg --yes --set-path=/github/webhook "$backend_url/github/webhook" 2>&1)"; then
+  echo "Webhook setup refused: Tailscale Funnel could not be enabled." >&2
+  echo "$funnel_output" >&2
+  echo "Enable Funnel for this tailnet, then rerun this script." >&2
+  exit 1
+fi
 
 temporary_dir="$(mktemp -d)"
 trap 'rm -rf "$temporary_dir"' EXIT
