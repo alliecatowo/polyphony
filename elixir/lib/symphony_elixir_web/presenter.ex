@@ -150,7 +150,7 @@ defmodule SymphonyElixirWeb.Presenter do
         branch: map_value(delivery, :branch),
         commit_sha: map_value(delivery, :commit_sha),
         attempt: map_value(delivery, :attempt) || 0,
-        failure_reason: map_value(delivery, :failure_reason)
+        failure_reason: presentable_failure_reason(map_value(delivery, :failure_reason))
       }
     end)
     |> Enum.sort_by(&to_string(&1.issue_identifier))
@@ -168,6 +168,10 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp map_value(map, key) when is_map(map), do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
   defp map_value(_map, _key), do: nil
+
+  defp presentable_failure_reason(nil), do: nil
+  defp presentable_failure_reason(reason) when is_binary(reason), do: reason
+  defp presentable_failure_reason(reason), do: inspect(reason, limit: :infinity, printable_limit: :infinity)
 
   defp running_issue_payload(running) do
     %{
