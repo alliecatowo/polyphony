@@ -67,12 +67,21 @@ defmodule SymphonyElixir.PromptBuilder do
         prompt
 
       reason ->
-        encoded = Jason.encode!(reason)
+        encoded = reason |> json_safe() |> Jason.encode!()
 
         prompt <>
           "\n\n## Harness retry context\nThe previous delivery failed after the local handoff. Diagnose and fix the following persisted CI/delivery evidence, then rerun the relevant local validation. Do not poll GitHub or perform delivery yourself.\n\n```json\n#{encoded}\n```"
     end
   end
+
+  defp json_safe(value) when is_map(value) do
+    Map.new(value, fn {key, nested} -> {json_safe(key), json_safe(nested)} end)
+  end
+
+  defp json_safe(value) when is_list(value), do: Enum.map(value, &json_safe/1)
+  defp json_safe(value) when is_tuple(value), do: inspect(value, limit: :infinity, printable_limit: :infinity)
+  defp json_safe(value) when is_atom(value) and value not in [nil, true, false], do: Atom.to_string(value)
+  defp json_safe(value), do: value
 
   defp append_worker_role(prompt, issue) do
     issue_map = if is_struct(issue), do: Map.from_struct(issue), else: issue

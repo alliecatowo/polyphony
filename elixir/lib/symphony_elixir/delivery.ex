@@ -418,7 +418,22 @@ defmodule SymphonyElixir.Delivery do
 
   @doc "Encodes a lifecycle as JSON."
   @spec encode(t()) :: {:ok, binary()} | {:error, term()}
-  def encode(delivery), do: delivery |> serialize() |> Jason.encode()
+  def encode(delivery), do: delivery |> serialize() |> json_safe() |> Jason.encode()
+
+  # Delivery failures are deliberately kept as rich Erlang terms in memory so
+  # retry classification can inspect them. Persisted state is a JSON boundary,
+  # though, and tuples/structs are common in exception and adapter reasons.
+  # Convert those values here instead of allowing a restart or dashboard read
+  # to crash on Jason. This also keeps recovery evidence useful to a fresh
+  # worker without requiring the original process to still be alive.
+  defp json_safe(value) when is_map(value) do
+    Map.new(value, fn {key, nested} -> {json_safe(key), json_safe(nested)} end)
+  end
+
+  defp json_safe(value) when is_list(value), do: Enum.map(value, &json_safe/1)
+  defp json_safe(value) when is_tuple(value), do: inspect(value, limit: :infinity, printable_limit: :infinity)
+  defp json_safe(value) when is_atom(value) and value not in [nil, true, false], do: Atom.to_string(value)
+  defp json_safe(value), do: value
 
   @doc "Decodes JSON produced by `encode/1`."
   @spec decode(binary()) :: {:ok, t()} | {:error, term()}

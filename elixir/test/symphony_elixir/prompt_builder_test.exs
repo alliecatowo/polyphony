@@ -61,6 +61,15 @@ defmodule SymphonyElixir.PromptBuilderTest do
     refute prompt =~ "```json"
   end
 
+  test "renders tuple-shaped retry failures without crashing" do
+    issue = github_issue(%{"delivery_failure_reason" => {:orchestrator_restart, "worker interrupted"}})
+
+    prompt = PromptBuilder.build_prompt(issue, attempt: 2)
+
+    assert prompt =~ "orchestrator_restart"
+    assert prompt =~ "worker interrupted"
+  end
+
   defp github_issue(tracker_metadata \\ %{}) do
     %GitHubIssue{
       id: "issue-node-id",
