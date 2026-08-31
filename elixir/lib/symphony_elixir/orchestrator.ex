@@ -77,7 +77,10 @@ defmodule SymphonyElixir.Orchestrator do
   def init(opts) do
     now_ms = System.monotonic_time(:millisecond)
     config = Config.settings!()
-    deliveries = load_deliveries(opts)
+    deliveries =
+      opts
+      |> load_deliveries()
+      |> recover_interrupted_deliveries(opts)
 
     state = %State{
       poll_interval_ms: config.polling.interval_ms,
@@ -3329,6 +3332,51 @@ defmodule SymphonyElixir.Orchestrator do
           deliveries
       end
     end)
+  end
+
+  defp recover_interrupted_deliveries(deliveries, opts) when is_map(deliveries) do
+    Enum.reduce(deliveries, deliveries, fn
+      {issue_id, %Delivery{state: state} = delivery}, recovered
+      when state in [:setup, :executing, :delivering, :cleaning] ->
+        reason = {:orchestrator_restart, "worker interrupted while delivery was #{state}"}
+
+        recovered_delivery = %{
+          delivery
+          | state: :retry_ready,
+            attempt: delivery.attempt + 1,
+            failure_reason: reason,
+            failures: [%{classification: :code, reason: reason} | delivery.failures],
+            last_event: :orchestrator_restart
+        }
+
+        case persist_loaded_delivery(recovered_delivery, opts) do
+          :ok ->
+            Logger.warning(
+              "Recovered interrupted delivery issue_id=#{issue_id} " <>
+                "previous_state=#{state} as retry_ready"
+            )
+
+          {:error, persist_reason} ->
+            Logger.error(
+              "Unable to persist interrupted delivery recovery issue_id=#{issue_id}: " <>
+                "#{inspect(persist_reason)}"
+            )
+        end
+
+        Map.put(recovered, issue_id, recovered_delivery)
+
+      _, recovered ->
+        recovered
+    end)
+  end
+
+  defp persist_loaded_delivery(%Delivery{} = delivery, opts) do
+    with {:ok, json} <- Delivery.encode(delivery),
+         runtime_dir = delivery_runtime_dir(opts),
+         :ok <- File.mkdir_p(Path.join(runtime_dir, "deliveries")),
+         :ok <- File.write(Path.join(runtime_dir, "deliveries/#{delivery.issue_id}.json"), json) do
+      :ok
+    end
   end
 
   defp pending_delivery_ids(deliveries) do
