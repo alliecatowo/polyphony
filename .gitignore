@@ -1,4 +1,5 @@
 .env
 .runtime-tmp/
 .runtime-launch.log
+erl_crash.dump
 scripts/__pycache__/
