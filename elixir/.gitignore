@@ -12,6 +12,10 @@
 
 # Temporary files, for example, from tests.
 /tmp/
+.tmp/
+
+# Durable local orchestrator state and webhook receipts.
+.polyphony/runtime/
 
 # Generated browser assets.
 /priv/static/assets/
