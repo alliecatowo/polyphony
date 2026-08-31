@@ -184,6 +184,18 @@ The recommended Patches launcher performs the local cgroup preflight first:
 
 It refuses to start if the local user cgroup cannot be created.
 
+For an unattended machine run, install the persistent user services once:
+
+```bash
+/home/allie/develop/polyphony/scripts/install-patches-unattended.sh
+```
+
+This enables user lingering and installs the orchestrator and health watchdog
+under the user systemd manager. The services start with the user manager,
+survive logout, and restart automatically after a process failure or machine
+reboot. The same cgroup limits and GitHub/Codex credential bootstrap used by
+the launcher remain in effect.
+
 Preflight without starting the poller:
 
 ```bash
