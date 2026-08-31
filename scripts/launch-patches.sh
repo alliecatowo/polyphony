@@ -78,6 +78,15 @@ runtime_tmp="$repo_root/.runtime-tmp"
 mkdir -p "$runtime_tmp"
 export TMPDIR="$runtime_tmp"
 
+# The daemon executes the checked-in escript, which loads the compiled
+# application. Always refresh that artifact before a launch so a restart after
+# a source update cannot silently run an older build. Set POLYPHONY_SKIP_BUILD
+# only for an emergency restart where preserving the current artifact is
+# intentional.
+if [[ "${POLYPHONY_SKIP_BUILD:-0}" != "1" ]]; then
+  mise exec -- mix build
+fi
+
 host_args=()
 if [[ -n "${POLYPHONY_HOST:-}" ]]; then
   host_args=(--host "$POLYPHONY_HOST")
@@ -142,6 +151,17 @@ if [[ "${POLYPHONY_FOREGROUND:-0}" == "1" ]]; then
 else
   # A detached service is required for nohup/background launches: a scope is
   # owned by its invoking shell and can leave only orphaned children behind.
+  if ! systemctl --user is-active --quiet polyphony-orchestrator-watchdog.service; then
+    systemd-run --user --quiet --collect --no-block \
+      --unit="polyphony-orchestrator-watchdog.service" \
+      --property=Restart=always \
+      --property=RestartSec=5s \
+      --property=CPUQuota=1% \
+      --property=MemoryMax=64M \
+      --property=TasksMax=32 \
+      -- bash "$repo_root/scripts/watch-patches.sh"
+  fi
+
   exec systemd-run --user --quiet --collect --no-block \
     --working-directory="$elixir_root" \
     "${library_args[@]}" \

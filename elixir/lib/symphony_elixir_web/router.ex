@@ -34,6 +34,7 @@ defmodule SymphonyElixirWeb.Router do
     post("/github/webhook", GitHubWebhookController, :receive)
 
     get("/api/v1/state", ObservabilityApiController, :state)
+    get("/api/v1/health", ObservabilityApiController, :health)
     post("/api/v1/control/pause", ControlApiController, :pause)
     post("/api/v1/control/drain", ControlApiController, :drain)
     post("/api/v1/control/resume", ControlApiController, :resume)
@@ -42,6 +43,7 @@ defmodule SymphonyElixirWeb.Router do
 
     match(:*, "/", ObservabilityApiController, :method_not_allowed)
     match(:*, "/api/v1/state", ObservabilityApiController, :method_not_allowed)
+    match(:*, "/api/v1/health", ObservabilityApiController, :method_not_allowed)
     match(:*, "/api/v1/control/pause", ControlApiController, :method_not_allowed)
     match(:*, "/api/v1/control/drain", ControlApiController, :method_not_allowed)
     match(:*, "/api/v1/control/resume", ControlApiController, :method_not_allowed)
