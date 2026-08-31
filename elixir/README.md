@@ -154,9 +154,11 @@ escalation/audit or retry attempt 2+.
 The profile uses isolated workspace clones under `~/develop/patches/.polyphony/workspaces`, made
 from the local Patches checkout at `~/develop/patches`.
 
-Each worker process tree is launched in a required per-run cgroup on the selected host: 250% CPU,
-3 GiB memory, and 384 tasks. The profile allows six workers total. A local systemd cgroup preflight
-passes on the development machine.
+Each worker process tree is launched in a required per-run cgroup on the selected host: 600% CPU,
+6 GiB memory, and 1536 tasks. The current workstation-safe profile allows two workers total;
+the per-worker limits are deliberately generous for builds and tests while the admission cap
+prevents both workers from exhausting the machine simultaneously. A local systemd cgroup
+preflight passes on the development machine.
 
 The board planner consumes Project v2 Priority, Area, Kind, Status, parent/sub-issue, dependency,
 and linked-PR signals. It sends each worker a compact top-of-board context so workers can preserve
