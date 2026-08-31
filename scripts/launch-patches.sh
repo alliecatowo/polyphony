@@ -135,7 +135,9 @@ polyphony_args=(
   "$workflow"
 )
 
-if [[ "${POLYPHONY_FOREGROUND:-0}" == "1" ]]; then
+if [[ "${POLYPHONY_DIRECT:-0}" == "1" ]]; then
+  exec mise exec -- ./bin/symphony "${polyphony_args[@]}"
+elif [[ "${POLYPHONY_FOREGROUND:-0}" == "1" ]]; then
   exec systemd-run --user --scope --quiet --collect \
     --working-directory="$elixir_root" \
     "${library_args[@]}" \
@@ -151,6 +153,15 @@ if [[ "${POLYPHONY_FOREGROUND:-0}" == "1" ]]; then
 else
   # A detached service is required for nohup/background launches: a scope is
   # owned by its invoking shell and can leave only orphaned children behind.
+  if systemctl --user is-active --quiet polyphony-orchestrator.service; then
+    echo "Polyphony Patches is already running under polyphony-orchestrator.service" >&2
+    exit 0
+  fi
+
+  if systemctl --user is-enabled --quiet polyphony-orchestrator.service 2>/dev/null; then
+    exec systemctl --user start polyphony-orchestrator.service
+  fi
+
   if ! systemctl --user is-active --quiet polyphony-orchestrator-watchdog.service; then
     systemd-run --user --quiet --collect --no-block \
       --unit="polyphony-orchestrator-watchdog.service" \

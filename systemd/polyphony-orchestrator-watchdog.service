@@ -1,0 +1,16 @@
+[Unit]
+Description=Polyphony Patches local health watchdog
+After=polyphony-orchestrator.service
+
+[Service]
+Type=simple
+ExecStart=%h/develop/polyphony/scripts/watch-patches.sh
+Restart=always
+RestartSec=5s
+CPUQuota=1%
+MemoryMax=64M
+TasksMax=32
+KillMode=control-group
+
+[Install]
+WantedBy=default.target
