@@ -9,6 +9,7 @@ defmodule SymphonyElixir.WorkflowStore do
   alias SymphonyElixir.Workflow
 
   @poll_interval_ms 1_000
+  @call_timeout_ms 5_000
 
   defmodule State do
     @moduledoc false
@@ -25,7 +26,7 @@ defmodule SymphonyElixir.WorkflowStore do
   def current do
     case Process.whereis(__MODULE__) do
       pid when is_pid(pid) ->
-        GenServer.call(__MODULE__, :current)
+        safe_call(:current, fn -> Workflow.load() end)
 
       _ ->
         Workflow.load()
@@ -36,7 +37,12 @@ defmodule SymphonyElixir.WorkflowStore do
   def force_reload do
     case Process.whereis(__MODULE__) do
       pid when is_pid(pid) ->
-        GenServer.call(__MODULE__, :force_reload)
+        safe_call(:force_reload, fn ->
+          case Workflow.load() do
+            {:ok, _workflow} -> :ok
+            {:error, reason} -> {:error, reason}
+          end
+        end)
 
       _ ->
         case Workflow.load() do
@@ -149,5 +155,13 @@ defmodule SymphonyElixir.WorkflowStore do
 
   defp log_reload_error(path, reason) do
     Logger.error("Failed to reload workflow path=#{path} reason=#{inspect(reason)}; keeping last known good configuration")
+  end
+
+  defp safe_call(message, fallback) when is_function(fallback, 0) do
+    GenServer.call(__MODULE__, message, @call_timeout_ms)
+  catch
+    :exit, reason ->
+      Logger.warning("WorkflowStore call timed out or exited message=#{inspect(message)} reason=#{inspect(reason)}; loading directly")
+      fallback.()
   end
 end

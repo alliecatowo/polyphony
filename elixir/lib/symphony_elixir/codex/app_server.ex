@@ -843,7 +843,16 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp dynamic_tool_output(%{"contentItems" => [%{"text" => text} | _]}) when is_binary(text), do: text
-  defp dynamic_tool_output(result), do: Jason.encode!(result, pretty: true)
+  defp dynamic_tool_output(result), do: result |> json_safe() |> Jason.encode!(pretty: true)
+
+  defp json_safe(value) when is_map(value) do
+    Map.new(value, fn {key, nested} -> {json_safe(key), json_safe(nested)} end)
+  end
+
+  defp json_safe(value) when is_list(value), do: Enum.map(value, &json_safe/1)
+  defp json_safe(value) when is_tuple(value), do: inspect(value, limit: :infinity, printable_limit: :infinity)
+  defp json_safe(value) when is_atom(value) and value not in [nil, true, false], do: Atom.to_string(value)
+  defp json_safe(value), do: value
 
   defp dynamic_tool_content_items(output) when is_binary(output) do
     [
