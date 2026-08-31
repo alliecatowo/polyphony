@@ -470,16 +470,13 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp resume_thread_id_for_issue(issue, opts) do
-    tracker_metadata = Map.get(issue, :tracker_metadata, %{})
-
-    Keyword.get(opts, :resume_thread_id) ||
-      Map.get(tracker_metadata, "resume_thread_id") ||
-      Map.get(tracker_metadata, :resume_thread_id) ||
-      case DeliveryController.load(delivery_runtime_dir(), issue.id) do
-        {:ok, %Delivery{metadata: metadata}} when is_map(metadata) -> Map.get(metadata, "thread_id")
-        _ -> nil
-      end
+  defp resume_thread_id_for_issue(_issue, opts) do
+    # A new orchestrator admission is a new agent task.  Its workspace and
+    # persisted retry evidence provide continuity; replaying the old Codex
+    # thread would resend the entire conversation on every CI fix attempt and
+    # make input usage grow without bound.  Only an explicit caller request
+    # may resume a thread (for example, an in-process recovery flow).
+    Keyword.get(opts, :resume_thread_id)
   end
 
   defp send_codex_thread_info(recipient, %{id: issue_id}, thread_id)
