@@ -19,7 +19,11 @@ defmodule SymphonyElixir.Orchestrator do
   @failure_retry_base_ms 10_000
   @github_rate_limit_fallback_ms 60_000
   @github_rate_limit_max_backoff_ms 900_000
-  @delivery_reconcile_interval_ms 120_000
+  # Webhooks and targeted refreshes reconcile delivery immediately. This is
+  # only the safety sweep for parked PRs, so keep it aligned with the normal
+  # tracker poll cadence instead of repeatedly spending GitHub API calls while
+  # the queue is idle.
+  @delivery_reconcile_interval_ms 900_000
   @delivery_reconcile_timeout_ms 45_000
   @stall_check_interval_ms 30_000
   # A poll may perform several bounded provider calls, but it must never be
