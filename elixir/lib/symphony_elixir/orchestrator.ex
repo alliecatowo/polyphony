@@ -20,6 +20,7 @@ defmodule SymphonyElixir.Orchestrator do
   @github_rate_limit_fallback_ms 60_000
   @github_rate_limit_max_backoff_ms 900_000
   @delivery_reconcile_interval_ms 120_000
+  @delivery_reconcile_timeout_ms 45_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -49,6 +50,8 @@ defmodule SymphonyElixir.Orchestrator do
       :target_refresh_timer_ref,
       :delivery_reconcile_in_progress,
       :delivery_reconcile_timer_ref,
+      :delivery_reconcile_cursor,
+      delivery_reconcile_cycle_count: 0,
       running: %{},
       deliveries: %{},
       reservations: %{},
@@ -89,6 +92,8 @@ defmodule SymphonyElixir.Orchestrator do
       target_refresh_timer_ref: nil,
       delivery_reconcile_in_progress: false,
       delivery_reconcile_timer_ref: nil,
+      delivery_reconcile_cursor: nil,
+      delivery_reconcile_cycle_count: 0,
       deliveries: deliveries,
       claimed: pending_delivery_ids(deliveries),
       completed: completed_delivery_ids(deliveries),
@@ -581,6 +586,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info(:reconcile_deliveries, %State{} = state) do
+    Logger.debug("Reconciling parked deliveries count=#{map_size(state.deliveries)}")
     state = %{state | delivery_reconcile_timer_ref: nil}
 
     cond do
@@ -591,19 +597,38 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, schedule_delivery_reconcile(state, provider_retry_delay())}
 
       true ->
-        case next_reconcilable_delivery(state.deliveries) do
+        case next_reconcilable_delivery(state.deliveries, state.delivery_reconcile_cursor) do
           nil ->
             {:noreply, schedule_delivery_reconcile(state, @delivery_reconcile_interval_ms)}
 
           {issue_id, delivery} ->
             owner = self()
+            Logger.debug("Starting delivery reconciliation issue_id=#{issue_id} pr=#{delivery.pr_number}")
 
             case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
+                   Logger.debug("Delivery reconciliation worker started issue_id=#{issue_id}")
+                   result_task =
+                     Task.async(fn ->
+                       try do
+                         result = DeliveryAdapter.inspect_pull_request(%{
+                           pr_number: delivery.pr_number,
+                           commit_sha: delivery.commit_sha
+                         })
+                         result
+                       rescue
+                         exception -> {:error, {:delivery_reconcile_exception, exception, __STACKTRACE__}}
+                       catch
+                         kind, reason -> {:error, {:delivery_reconcile_throw, kind, reason}}
+                       end
+                     end)
+
                    result =
-                     DeliveryAdapter.inspect_pull_request(%{
-                       pr_number: delivery.pr_number,
-                       commit_sha: delivery.commit_sha
-                     })
+                     case Task.yield(result_task, @delivery_reconcile_timeout_ms) ||
+                            Task.shutdown(result_task, :brutal_kill) do
+                       {:ok, value} -> value
+                       nil -> {:error, :delivery_reconcile_timeout}
+                       {:exit, reason} -> {:error, {:delivery_reconcile_exit, reason}}
+                     end
 
                    send(owner, {:delivery_reconcile_result, issue_id, result})
                  end) do
@@ -628,17 +653,18 @@ defmodule SymphonyElixir.Orchestrator do
       end
 
     notify_dashboard()
-    {:noreply, schedule_delivery_reconcile(state, next_delivery_reconcile_delay(state))}
+    {:noreply, advance_delivery_reconcile(state, issue_id)}
   end
 
   def handle_info({:delivery_reconcile_result, issue_id, {:error, reason}}, %State{} = state) do
     Logger.warning("Delivery reconciliation failed for issue_id=#{issue_id}: #{inspect(reason)}")
-    delay = if provider_wait_error?(reason), do: provider_retry_delay(), else: @delivery_reconcile_interval_ms
+    state = Map.put(state, :delivery_reconcile_in_progress, false)
 
-    {:noreply,
-     state
-     |> Map.put(:delivery_reconcile_in_progress, false)
-     |> schedule_delivery_reconcile(delay)}
+    if provider_wait_error?(reason) do
+      {:noreply, schedule_delivery_reconcile(state, provider_retry_delay())}
+    else
+      {:noreply, advance_delivery_reconcile(state, issue_id)}
+    end
   end
 
   def handle_info(msg, state) do
@@ -2200,6 +2226,7 @@ defmodule SymphonyElixir.Orchestrator do
     already_due? = is_integer(state.next_poll_due_at_ms) and state.next_poll_due_at_ms <= now_ms
     coalesced = state.poll_check_in_progress == true or already_due?
     state = if coalesced, do: state, else: schedule_tick(state, 0)
+    state = schedule_delivery_reconcile(state, 0)
 
     {:reply,
      %{
@@ -3229,10 +3256,9 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp next_delivery_reconcile_delay(_state), do: @delivery_reconcile_interval_ms
-
-  defp next_reconcilable_delivery(deliveries) when is_map(deliveries) do
-    deliveries
+  defp next_reconcilable_delivery(deliveries, cursor) when is_map(deliveries) do
+    candidates =
+      deliveries
     |> Enum.filter(fn
       {_issue_id, %Delivery{state: state, pr_number: pr_number}}
       when state in [:waiting_ci, :waiting_merge] and is_integer(pr_number) and pr_number > 0 ->
@@ -3242,7 +3268,44 @@ defmodule SymphonyElixir.Orchestrator do
         false
     end)
     |> Enum.sort_by(fn {issue_id, _delivery} -> issue_id end)
-    |> List.first()
+
+    case candidates do
+      [] -> nil
+      candidates when is_nil(cursor) -> List.first(candidates)
+      candidates ->
+        {before, after_cursor} = Enum.split_while(candidates, fn {issue_id, _} -> issue_id != cursor end)
+        case after_cursor do
+          [{^cursor, _} | next] -> List.first(next) || List.first(candidates)
+          _ -> List.first(before) || List.first(candidates)
+        end
+    end
+  end
+
+  defp advance_delivery_reconcile(%State{} = state, issue_id) do
+    candidate_count = reconcilable_delivery_count(state.deliveries)
+    cycle_count = state.delivery_reconcile_cycle_count + 1
+
+    if candidate_count <= 1 or cycle_count >= candidate_count do
+      state
+      |> Map.put(:delivery_reconcile_cursor, nil)
+      |> Map.put(:delivery_reconcile_cycle_count, 0)
+      |> schedule_delivery_reconcile(@delivery_reconcile_interval_ms)
+    else
+      state
+      |> Map.put(:delivery_reconcile_cursor, issue_id)
+      |> Map.put(:delivery_reconcile_cycle_count, cycle_count)
+      |> schedule_delivery_reconcile(stateful_reconcile_delay())
+    end
+  end
+
+  defp stateful_reconcile_delay, do: 0
+
+  defp reconcilable_delivery_count(deliveries) do
+    Enum.count(deliveries, fn
+      {_issue_id, %Delivery{state: state, pr_number: pr_number}}
+      when state in [:waiting_ci, :waiting_merge] and is_integer(pr_number) and pr_number > 0 -> true
+      _ -> false
+    end)
   end
 
   defp load_deliveries(opts) when is_list(opts) do
