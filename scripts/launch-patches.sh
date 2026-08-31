@@ -162,12 +162,15 @@ else
       -- bash "$repo_root/scripts/watch-patches.sh"
   fi
 
+  # Keep an unattended batch alive even if the BEAM exits cleanly after an
+  # unexpected application shutdown. An explicit systemctl stop still
+  # remains a stop and is not restarted by systemd.
   exec systemd-run --user --quiet --collect --no-block \
     --working-directory="$elixir_root" \
     "${library_args[@]}" \
     "${auth_args[@]}" \
     --unit="polyphony-orchestrator.service" \
-    --property=Restart=on-failure \
+    --property=Restart=always \
     --property=RestartSec=5s \
     --property=CPUQuota=800% \
     --property=MemoryMax=10240M \
