@@ -21,6 +21,9 @@ defmodule SymphonyElixir.Orchestrator do
   @github_rate_limit_max_backoff_ms 900_000
   @delivery_reconcile_interval_ms 120_000
   @delivery_reconcile_timeout_ms 45_000
+  # A poll may perform several bounded provider calls, but it must never be
+  # able to wedge admission forever if a provider/client task disappears.
+  @poll_cycle_timeout_ms 180_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -42,6 +45,9 @@ defmodule SymphonyElixir.Orchestrator do
       :max_concurrent_agents,
       :next_poll_due_at_ms,
       :poll_check_in_progress,
+      :poll_task_pid,
+      :poll_task_ref,
+      :poll_timeout_timer_ref,
       :tick_timer_ref,
       :tick_token,
       :control,
@@ -87,6 +93,9 @@ defmodule SymphonyElixir.Orchestrator do
       max_concurrent_agents: config.agent.max_concurrent_agents,
       next_poll_due_at_ms: now_ms,
       poll_check_in_progress: false,
+      poll_task_pid: nil,
+      poll_task_ref: nil,
+      poll_timeout_timer_ref: nil,
       tick_timer_ref: nil,
       tick_token: nil,
       control: load_control_state(opts),
@@ -176,8 +185,11 @@ defmodule SymphonyElixir.Orchestrator do
 
            send(orchestrator, {:poll_cycle_complete, polled_state, base_running_entries})
          end) do
-      {:ok, _pid} ->
-        {:noreply, state}
+      {:ok, pid} ->
+        poll_task_ref = Process.monitor(pid)
+        poll_timeout_timer_ref = Process.send_after(self(), {:poll_cycle_timeout, poll_task_ref}, @poll_cycle_timeout_ms)
+
+        {:noreply, %{state | poll_task_pid: pid, poll_task_ref: poll_task_ref, poll_timeout_timer_ref: poll_timeout_timer_ref}}
 
       {:error, reason} ->
         Logger.warning("Failed to start asynchronous poll cycle: #{inspect(reason)}")
@@ -193,6 +205,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     state =
       state
+      |> clear_poll_cycle_tracking()
       |> merge_poll_cycle_state(polled_state, base_running_ids)
       |> schedule_tick(poll_delay(polled_state))
       |> Map.put(:poll_check_in_progress, false)
@@ -205,6 +218,40 @@ defmodule SymphonyElixir.Orchestrator do
   # rolling restart. Current poll tasks include the base running set.
   def handle_info({:poll_cycle_complete, %State{} = polled_state}, state) do
     handle_info({:poll_cycle_complete, polled_state, %{}}, state)
+  end
+
+  def handle_info({:poll_cycle_timeout, poll_task_ref}, %State{poll_task_ref: poll_task_ref} = state)
+      when is_reference(poll_task_ref) do
+    Logger.error("Orchestrator poll cycle exceeded #{@poll_cycle_timeout_ms}ms; terminating it and scheduling recovery")
+
+    if is_pid(state.poll_task_pid) and Process.alive?(state.poll_task_pid) do
+      Process.exit(state.poll_task_pid, :kill)
+    end
+
+    state =
+      state
+      |> clear_poll_cycle_tracking()
+      |> Map.put(:poll_check_in_progress, false)
+      |> schedule_tick(state.poll_interval_ms)
+
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info({:poll_cycle_timeout, _poll_task_ref}, state), do: {:noreply, state}
+
+  def handle_info({:DOWN, poll_task_ref, :process, _pid, reason}, %State{poll_task_ref: poll_task_ref} = state)
+      when is_reference(poll_task_ref) do
+    Logger.error("Orchestrator poll cycle process exited before completion: #{inspect(reason)}")
+
+    state =
+      state
+      |> clear_poll_cycle_tracking()
+      |> Map.put(:poll_check_in_progress, false)
+      |> schedule_tick(state.poll_interval_ms)
+
+    notify_dashboard()
+    {:noreply, state}
   end
 
   def handle_info(
@@ -610,6 +657,7 @@ defmodule SymphonyElixir.Orchestrator do
 
             case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
                    Logger.debug("Delivery reconciliation worker started issue_id=#{issue_id}")
+
                    result_task =
                      Task.async(fn ->
                        try do
@@ -2407,6 +2455,23 @@ defmodule SymphonyElixir.Orchestrator do
     :ok
   end
 
+  defp clear_poll_cycle_tracking(%State{} = state) do
+    if is_reference(state.poll_timeout_timer_ref) do
+      Process.cancel_timer(state.poll_timeout_timer_ref)
+    end
+
+    if is_reference(state.poll_task_ref) do
+      Process.demonitor(state.poll_task_ref, [:flush])
+    end
+
+    %{
+      state
+      | poll_task_pid: nil,
+        poll_task_ref: nil,
+        poll_timeout_timer_ref: nil
+    }
+  end
+
   defp next_poll_in_ms(nil, _now_ms), do: nil
 
   defp next_poll_in_ms(next_poll_due_at_ms, now_ms) when is_integer(next_poll_due_at_ms) do
@@ -3277,6 +3342,7 @@ defmodule SymphonyElixir.Orchestrator do
       candidates when is_nil(cursor) -> List.first(candidates)
       candidates ->
         {before, after_cursor} = Enum.split_while(candidates, fn {issue_id, _} -> issue_id != cursor end)
+
         case after_cursor do
           [{^cursor, _} | next] -> List.first(next) || List.first(candidates)
           _ -> List.first(before) || List.first(candidates)

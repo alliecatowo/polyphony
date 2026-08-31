@@ -915,6 +915,65 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert %{polling: %{checking?: true, next_poll_in_ms: nil}} = snapshot
   end
 
+  test "a dead poll task clears checking state and schedules recovery" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      poll_interval_ms: 900_000
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :DeadPollOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    poll_task = spawn(fn -> Process.sleep(:infinity) end)
+    poll_task_ref = Process.monitor(poll_task)
+
+    :sys.replace_state(pid, fn state ->
+      %{state | poll_check_in_progress: true, poll_task_pid: poll_task, poll_task_ref: poll_task_ref}
+    end)
+
+    Process.exit(poll_task, :kill)
+
+    assert %{polling: %{checking?: false, next_poll_in_ms: next_poll_in_ms}} =
+             wait_for_snapshot(pid, &match?(%{polling: %{checking?: false}}, &1), 1_000)
+
+    assert is_integer(next_poll_in_ms)
+    assert next_poll_in_ms <= 900_000
+  end
+
+  test "a timed out poll task is terminated and recovery is scheduled" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      poll_interval_ms: 900_000
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :TimedOutPollOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    poll_task = spawn(fn -> Process.sleep(:infinity) end)
+    poll_task_ref = Process.monitor(poll_task)
+
+    :sys.replace_state(pid, fn state ->
+      %{state | poll_check_in_progress: true, poll_task_pid: poll_task, poll_task_ref: poll_task_ref}
+    end)
+
+    send(pid, {:poll_cycle_timeout, poll_task_ref})
+
+    assert %{polling: %{checking?: false, next_poll_in_ms: next_poll_in_ms}} =
+             wait_for_snapshot(pid, &match?(%{polling: %{checking?: false}}, &1), 1_000)
+
+    refute Process.alive?(poll_task)
+    assert is_integer(next_poll_in_ms)
+    assert next_poll_in_ms <= 900_000
+  end
+
   test "orchestrator triggers an immediate poll cycle shortly after startup" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
