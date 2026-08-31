@@ -154,12 +154,16 @@ else
   # A detached service is required for nohup/background launches: a scope is
   # owned by its invoking shell and can leave only orphaned children behind.
   if systemctl --user is-active --quiet polyphony-orchestrator.service; then
+    if ! systemctl --user is-active --quiet polyphony-orchestrator-watchdog.service; then
+      systemctl --user start polyphony-orchestrator-watchdog.service 2>/dev/null || true
+    fi
+
     echo "Polyphony Patches is already running under polyphony-orchestrator.service" >&2
     exit 0
   fi
 
   if systemctl --user is-enabled --quiet polyphony-orchestrator.service 2>/dev/null; then
-    exec systemctl --user start polyphony-orchestrator.service
+    exec systemctl --user start polyphony-orchestrator-watchdog.service polyphony-orchestrator.service
   fi
 
   if ! systemctl --user is-active --quiet polyphony-orchestrator-watchdog.service; then
