@@ -21,6 +21,7 @@ defmodule SymphonyElixir.Orchestrator do
   @github_rate_limit_max_backoff_ms 900_000
   @delivery_reconcile_interval_ms 120_000
   @delivery_reconcile_timeout_ms 45_000
+  @stall_check_interval_ms 30_000
   # A poll may perform several bounded provider calls, but it must never be
   # able to wedge admission forever if a provider/client task disappears.
   @poll_cycle_timeout_ms 180_000
@@ -48,6 +49,7 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_task_pid,
       :poll_task_ref,
       :poll_timeout_timer_ref,
+      :stall_check_timer_ref,
       :tick_timer_ref,
       :tick_token,
       :control,
@@ -96,6 +98,7 @@ defmodule SymphonyElixir.Orchestrator do
       poll_task_pid: nil,
       poll_task_ref: nil,
       poll_timeout_timer_ref: nil,
+      stall_check_timer_ref: nil,
       tick_timer_ref: nil,
       tick_token: nil,
       control: load_control_state(opts),
@@ -122,6 +125,7 @@ defmodule SymphonyElixir.Orchestrator do
       |> schedule_loaded_delivery_retries()
       |> refresh_control_obligations()
       |> schedule_tick(0)
+      |> schedule_stall_check()
       |> schedule_delivery_reconcile(2_000)
 
     {:ok, state}
@@ -239,6 +243,19 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info({:poll_cycle_timeout, _poll_task_ref}, state), do: {:noreply, state}
+
+  def handle_info(:stall_check, %State{} = state) do
+    state = %{state | stall_check_timer_ref: nil}
+
+    state =
+      state
+      |> reconcile_stalled_running_issues(self())
+      |> refresh_control_obligations()
+      |> schedule_stall_check()
+
+    notify_dashboard()
+    {:noreply, state}
+  end
 
   def handle_info({:DOWN, poll_task_ref, :process, _pid, reason}, %State{poll_task_ref: poll_task_ref} = state)
       when is_reference(poll_task_ref) do
@@ -2453,6 +2470,24 @@ defmodule SymphonyElixir.Orchestrator do
   defp schedule_poll_cycle_start do
     :timer.send_after(@poll_transition_render_delay_ms, self(), :run_poll_cycle)
     :ok
+  end
+
+  defp schedule_stall_check(%State{} = state) do
+    if is_reference(state.stall_check_timer_ref) do
+      Process.cancel_timer(state.stall_check_timer_ref)
+    end
+
+    configured_timeout = Config.settings!().codex.stall_timeout_ms
+
+    interval_ms =
+      if is_integer(configured_timeout) and configured_timeout > 0 do
+        min(@stall_check_interval_ms, max(1_000, div(configured_timeout, 4)))
+      else
+        @stall_check_interval_ms
+      end
+
+    timer_ref = Process.send_after(self(), :stall_check, interval_ms)
+    %{state | stall_check_timer_ref: timer_ref}
   end
 
   defp clear_poll_cycle_tracking(%State{} = state) do

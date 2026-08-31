@@ -1119,7 +1119,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
     end)
 
-    send(pid, :tick)
+    # Stall recovery is a local watchdog and must not depend on a GitHub poll.
+    send(pid, :stall_check)
     Process.sleep(100)
     state = :sys.get_state(pid)
 
