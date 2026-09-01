@@ -591,15 +591,19 @@ defmodule SymphonyElixir.Orchestrator do
 
         {_reason, _delivery} ->
           if Map.get(running_entry, :token_budget_exceeded, false) do
-            token_retry_attempt = Map.get(running_entry, :retry_attempt, 0)
+            token_retry_attempt =
+              max(
+                Map.get(running_entry, :retry_attempt, 0),
+                delivery_retry_attempt(delivery)
+              )
 
             if token_retry_attempt >= 1 do
               Logger.error(
-                "Token budget exhausted twice; refusing hot retry for " <>
+                "Token budget exhausted twice; refusing another retry for " <>
                   "issue_id=#{issue_id} issue_identifier=#{running_entry.identifier}"
               )
 
-              complete_issue(state, issue_id)
+              permanently_fail_token_exhausted_delivery(state, issue_id, delivery)
             else
               Logger.warning(
                 "Token budget exhausted; scheduling one bounded model escalation " <>
@@ -2029,6 +2033,30 @@ defmodule SymphonyElixir.Orchestrator do
           Logger.error("Could not persist final escalation for issue_id=#{issue_id}: #{inspect(reason)}; refusing retry")
           complete_issue(state, issue_id)
       end
+    end
+  end
+
+  defp delivery_retry_attempt(%Delivery{attempt: attempt}) when is_integer(attempt) and attempt > 0,
+    do: attempt
+
+  defp delivery_retry_attempt(_delivery), do: 0
+
+  defp permanently_fail_token_exhausted_delivery(state, issue_id, %Delivery{} = delivery) do
+    reason = {:token_budget_exhausted, Config.settings!().codex.max_total_tokens}
+
+    case persist_permanent_delivery_failure(issue_id, delivery, reason) do
+      {:ok, failed_delivery} ->
+        state
+        |> Map.put(:deliveries, Map.put(state.deliveries, issue_id, failed_delivery))
+        |> complete_issue(issue_id)
+
+      {:error, persist_reason} ->
+        Logger.error(
+          "Could not persist token-budget terminal failure for issue_id=#{issue_id}: #{inspect(persist_reason)}; " <>
+            "retaining delivery state"
+        )
+
+        state
     end
   end
 
