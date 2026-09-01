@@ -57,6 +57,15 @@ hooks:
     git switch --create "agent/polyphony-${issue_id}" "$base_ref"
   before_run: |
     issue_id="$(basename "$PWD")"
+    # Older worker attempts injected a temporary .codex/config.toml. Clean up
+    # only that harness-owned path before a retry so Codex never spends a turn
+    # repairing runtime scaffolding. Current workers use the isolated CODEX_HOME
+    # profile and leave the project checkout untouched.
+    if git diff --quiet -- .codex/config.toml; then
+      true
+    else
+      git restore --source=HEAD -- .codex/config.toml
+    fi
     mkdir -p "docs/issues/${issue_id}/logs" "docs/issues/${issue_id}/evidence" "docs/issues/${issue_id}/decisions" "docs/issues/${issue_id}/spikes"
     printf '%s phase=before_run workspace=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" >> "docs/issues/${issue_id}/run-log.md"
   after_run: |

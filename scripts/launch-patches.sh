@@ -108,7 +108,6 @@ export POLYPHONY_SKIP_BOARD_ENRICHMENT=1
 export POLYPHONY_RUNTIME_STATE_DIR="$elixir_root/.polyphony/runtime"
 export POLYPHONY_PROJECT_ID="${POLYPHONY_PROJECT_ID:-patches}"
 export POLYPHONY_PROJECT_CGROUP="${POLYPHONY_PROJECT_CGROUP:-polyphony-patches.service}"
-export POLYPHONY_WORKER_CODEX_CONFIG="$repo_root/scripts/worker-codex-config.toml"
 
 # Keep Codex sandboxes and transient files out of shared /tmp pressure, and
 # give the shared app-server enough descriptors for six workers.
