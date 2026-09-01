@@ -1601,7 +1601,8 @@ defmodule SymphonyElixir.Orchestrator do
        when is_binary(id) and is_binary(identifier) and is_binary(title) and is_binary(state_name) do
     issue_routable_to_worker?(issue) and
       dispatch_active_issue_state?(issue, state_name, active_states) and
-      !terminal_issue_state?(state_name, terminal_states)
+      !terminal_issue_state?(state_name, terminal_states) and
+      !explicitly_blocked_issue?(issue)
   end
 
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
@@ -1611,6 +1612,17 @@ defmodule SymphonyElixir.Orchestrator do
        do: assigned_to_worker
 
   defp issue_routable_to_worker?(_issue), do: true
+
+  defp explicitly_blocked_issue?(%{labels: labels}) when is_list(labels) do
+    Enum.any?(labels, fn
+      label when is_binary(label) -> String.downcase(String.trim(label)) in ["blocked", "wontfix", "won't fix"]
+      %{name: name} when is_binary(name) -> String.downcase(String.trim(name)) in ["blocked", "wontfix", "won't fix"]
+      %{"name" => name} when is_binary(name) -> String.downcase(String.trim(name)) in ["blocked", "wontfix", "won't fix"]
+      _ -> false
+    end)
+  end
+
+  defp explicitly_blocked_issue?(_issue), do: false
 
   defp dispatch_active_issue_state?(_issue, state_name, active_states) do
     active_issue_state?(state_name, active_states)

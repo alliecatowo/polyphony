@@ -4,7 +4,9 @@
 # are replayed into every turn.
 approval_policy = "never"
 sandbox_mode = "workspace-write"
-model_reasoning_effort = "medium"
+# Unattended workers should spend tokens on the requested slice, not open-ended
+# planning. Escalation/review profiles can opt into a stronger setting later.
+model_reasoning_effort = "low"
 include_apps_instructions = false
 include_permissions_instructions = false
 include_environment_context = false

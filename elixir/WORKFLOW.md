@@ -137,7 +137,9 @@ codex:
   # Keep one pathological turn below the Luna context cliff. Retries preserve
   # the workspace and delivery evidence instead of replaying an unbounded
   # transcript.
-  max_total_tokens: 250000
+  # Keep pathological turns cheap enough that the first token-usage event
+  # cannot consume the account allowance before the Elixir guard sees it.
+  max_total_tokens: 160000
 server:
   host: "127.0.0.1"
   port: 4000
