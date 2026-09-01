@@ -940,7 +940,16 @@ defmodule SymphonyElixir.Orchestrator do
                  end) do
               {:ok, pid} ->
                 task_ref = Process.monitor(pid)
-                {:noreply, %{state | delivery_reconcile_in_progress: true, delivery_reconcile_task_pid: pid, delivery_reconcile_task_ref: task_ref}}
+                timeout_ref = Process.send_after(self(), {:delivery_reconcile_timeout, task_ref}, @delivery_reconcile_timeout_ms)
+
+                {:noreply,
+                 %{
+                   state
+                   | delivery_reconcile_in_progress: true,
+                     delivery_reconcile_task_pid: pid,
+                     delivery_reconcile_task_ref: task_ref,
+                     delivery_reconcile_timer_ref: timeout_ref
+                 }}
 
               {:error, reason} ->
                 Logger.warning("Unable to start delivery reconciliation for issue_id=#{issue_id}: #{inspect(reason)}")
@@ -949,6 +958,20 @@ defmodule SymphonyElixir.Orchestrator do
         end
     end
   end
+
+  def handle_info({:delivery_reconcile_timeout, task_ref}, %State{delivery_reconcile_task_ref: task_ref} = state)
+      when is_reference(task_ref) do
+    Logger.warning("Delivery reconciliation exceeded #{@delivery_reconcile_timeout_ms}ms; terminating task")
+
+    if is_pid(state.delivery_reconcile_task_pid) and Process.alive?(state.delivery_reconcile_task_pid) do
+      Process.exit(state.delivery_reconcile_task_pid, :kill)
+    end
+
+    state = clear_delivery_reconcile_tracking(state)
+    {:noreply, schedule_delivery_reconcile(state, provider_retry_delay())}
+  end
+
+  def handle_info({:delivery_reconcile_timeout, _task_ref}, state), do: {:noreply, state}
 
   # A delivery parked for provider recovery has no pull request to reconcile.
   # Once the gateway's circuit is closed, apply the durable provider-available
@@ -2954,11 +2977,21 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp clear_delivery_reconcile_tracking(%State{} = state) do
+    if is_reference(state.delivery_reconcile_timer_ref) do
+      Process.cancel_timer(state.delivery_reconcile_timer_ref)
+    end
+
     if is_reference(state.delivery_reconcile_task_ref) do
       Process.demonitor(state.delivery_reconcile_task_ref, [:flush])
     end
 
-    %{state | delivery_reconcile_in_progress: false, delivery_reconcile_task_pid: nil, delivery_reconcile_task_ref: nil}
+    %{
+      state
+      | delivery_reconcile_in_progress: false,
+        delivery_reconcile_timer_ref: nil,
+        delivery_reconcile_task_pid: nil,
+        delivery_reconcile_task_ref: nil
+    }
   end
 
   defp find_provider_recovery_task(tasks, task_ref)
