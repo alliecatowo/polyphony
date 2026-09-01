@@ -14,10 +14,6 @@ defmodule SymphonyElixir.GitHub.Client do
   alias SymphonyElixir.GitHub.{Auth, Gateway, Issue}
 
   @issue_page_size 20
-  @max_error_body_log_bytes 1_000
-  @api_circuit_table :symphony_github_api_circuit
-  @api_circuit_fallback_ms 300_000
-  @api_circuit_max_backoff_ms 3_600_000
 
   @issue_fields """
   id
@@ -449,35 +445,30 @@ defmodule SymphonyElixir.GitHub.Client do
 
   @spec graphql(String.t(), map()) :: {:ok, map()} | {:error, term()}
   def graphql(query, variables \\ %{}) when is_binary(query) and is_map(variables) do
-    case github_api_circuit() do
-      {:open, until_ms} ->
-        {:error, github_rate_limit_error(until_ms)}
+    payload = %{"query" => query, "variables" => variables}
 
-      :closed ->
-        payload = %{"query" => query, "variables" => variables}
+    with {:ok, headers} <- graphql_headers(),
+         {:ok, %{status: 200, body: body}} <- post_graphql_request(payload, headers),
+         :ok <- ensure_no_graphql_errors(body) do
+      {:ok, body}
+    else
+      {:ok, response} ->
+        Logger.error("GitHub GraphQL request failed status=#{response.status}")
+        {:error, {:github_api_status, response.status}}
 
-        with {:ok, headers} <- graphql_headers(),
-             {:ok, %{status: 200, body: body}} <- post_graphql_request(payload, headers),
-             :ok <- ensure_no_graphql_errors(body) do
-          close_github_api_circuit()
-          {:ok, body}
-        else
-          {:ok, response} ->
-            Logger.error("GitHub GraphQL request failed status=#{response.status} body=#{summarize_error_body(response.body)}")
+      {:error, {:github_graphql_errors, errors}} ->
+        Logger.error("GitHub GraphQL response errors_count=#{length(errors)}")
+        {:error, {:github_graphql_errors, errors}}
 
-            if rate_limit_status?(response.status), do: open_github_api_circuit()
-            {:error, {:github_api_status, response.status}}
+      {:error, {:github_rate_limited, _reset_at, _retry_in_ms} = reason} ->
+        {:error, reason}
 
-          {:error, {:github_graphql_errors, errors}} ->
-            Logger.error("GitHub GraphQL response errors=#{inspect(errors)}")
+      {:error, {:github_provider_unavailable, _metadata} = reason} ->
+        {:error, reason}
 
-            if github_rate_limit_errors?(errors), do: open_github_api_circuit()
-            {:error, {:github_graphql_errors, errors}}
-
-          {:error, reason} ->
-            Logger.error("GitHub GraphQL request failed: #{inspect(reason)}")
-            {:error, {:github_api_request, reason}}
-        end
+      {:error, reason} ->
+        Logger.error("GitHub GraphQL request failed kind=#{error_kind(reason)}")
+        {:error, {:github_api_request, reason}}
     end
   end
 
@@ -498,8 +489,8 @@ defmodule SymphonyElixir.GitHub.Client do
            end) do
       :ok
     else
-      {:ok, %{status: status, body: body}} ->
-        Logger.error("GitHub create comment failed status=#{status} body=#{summarize_error_body(body)}")
+      {:ok, %{status: status}} ->
+        Logger.error("GitHub create comment failed status=#{status}")
         {:error, {:github_api_status, status}}
 
       {:error, reason} ->
@@ -526,8 +517,8 @@ defmodule SymphonyElixir.GitHub.Client do
            end) do
       :ok
     else
-      {:ok, %{status: status, body: body}} ->
-        Logger.error("GitHub update issue state failed status=#{status} body=#{summarize_error_body(body)}")
+      {:ok, %{status: status}} ->
+        Logger.error("GitHub update issue state failed status=#{status}")
         {:error, {:github_api_status, status}}
 
       {:error, reason} ->
@@ -632,8 +623,8 @@ defmodule SymphonyElixir.GitHub.Client do
       :noop ->
         :ok
 
-      {:ok, %{status: status, body: body}} ->
-        Logger.error("GitHub reconcile milestone failed status=#{status} body=#{summarize_error_body(body)}")
+      {:ok, %{status: status}} ->
+        Logger.error("GitHub reconcile milestone failed status=#{status}")
         {:error, {:github_api_status, status}}
 
       {:error, reason} ->
@@ -658,8 +649,8 @@ defmodule SymphonyElixir.GitHub.Client do
       :noop ->
         :ok
 
-      {:ok, %{status: status, body: body}} ->
-        Logger.error("GitHub reconcile assignees failed status=#{status} body=#{summarize_error_body(body)}")
+      {:ok, %{status: status}} ->
+        Logger.error("GitHub reconcile assignees failed status=#{status}")
         {:error, {:github_api_status, status}}
 
       {:error, reason} ->
@@ -683,8 +674,8 @@ defmodule SymphonyElixir.GitHub.Client do
       :noop ->
         :ok
 
-      {:ok, %{status: status, body: body}} ->
-        Logger.error("GitHub reconcile labels failed status=#{status} body=#{summarize_error_body(body)}")
+      {:ok, %{status: status}} ->
+        Logger.error("GitHub reconcile labels failed status=#{status}")
         {:error, {:github_api_status, status}}
 
       {:error, reason} ->
@@ -1927,76 +1918,6 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp rest_request(fun) when is_function(fun, 0), do: Gateway.request(:rest, fun)
 
-  defp github_api_circuit do
-    ensure_api_circuit_table()
-    now_ms = System.monotonic_time(:millisecond)
-
-    case :ets.lookup(@api_circuit_table, :state) do
-      [{:state, until_ms, _backoff_ms}] when is_integer(until_ms) ->
-        if until_ms > now_ms, do: {:open, until_ms}, else: :closed
-
-      _ ->
-        :closed
-    end
-  end
-
-  defp open_github_api_circuit do
-    ensure_api_circuit_table()
-
-    backoff_ms =
-      case :ets.lookup(@api_circuit_table, :state) do
-        [{:state, _until_ms, previous}] when is_integer(previous) ->
-          min(previous * 2, @api_circuit_max_backoff_ms)
-
-        _ ->
-          @api_circuit_fallback_ms
-      end
-
-    until_ms = System.monotonic_time(:millisecond) + backoff_ms
-    :ets.insert(@api_circuit_table, {:state, until_ms, backoff_ms})
-    Logger.error("GitHub API circuit opened for #{backoff_ms}ms")
-    :ok
-  end
-
-  defp close_github_api_circuit do
-    ensure_api_circuit_table()
-    :ets.delete(@api_circuit_table, :state)
-    :ok
-  end
-
-  defp ensure_api_circuit_table do
-    case :ets.whereis(@api_circuit_table) do
-      :undefined ->
-        try do
-          :ets.new(@api_circuit_table, [:named_table, :public, read_concurrency: true])
-        rescue
-          ArgumentError -> @api_circuit_table
-        end
-
-      _tid ->
-        @api_circuit_table
-    end
-  end
-
-  defp github_rate_limit_error(until_ms) do
-    {:github_graphql_errors, [%{"type" => "RATE_LIMIT", "code" => "graphql_rate_limit", "message" => "GitHub API circuit open until #{until_ms}"}]}
-  end
-
-  defp github_rate_limit_errors?(errors) when is_list(errors) do
-    Enum.any?(errors, fn error ->
-      code = Map.get(error, "type") || Map.get(error, :type) || Map.get(error, "code") || Map.get(error, :code)
-      message = Map.get(error, "message") || Map.get(error, :message) || ""
-
-      code in ["RATE_LIMIT", "graphql_rate_limit", :rate_limit] or
-        String.contains?(String.downcase(to_string(message)), "rate limit")
-    end)
-  end
-
-  defp github_rate_limit_errors?(_errors), do: false
-
-  defp rate_limit_status?(status) when status in [403, 429], do: true
-  defp rate_limit_status?(_status), do: false
-
   defp repo_tracker_config do
     repo_tracker_config(Config.settings!().tracker)
   end
@@ -2349,8 +2270,8 @@ defmodule SymphonyElixir.GitHub.Client do
 
         {:ok, blocked_numbers}
 
-      {:ok, %{status: status, body: body}} ->
-        Logger.error("GitHub fetch blocked_by failed status=#{status} body=#{summarize_error_body(body)}")
+      {:ok, %{status: status}} ->
+        Logger.error("GitHub fetch blocked_by failed status=#{status}")
         {:error, {:github_api_status, status}}
 
       {:error, reason} ->
@@ -2397,8 +2318,8 @@ defmodule SymphonyElixir.GitHub.Client do
       {:ok, %{status: status}} when status in [200, 201] ->
         {:cont, :ok}
 
-      {:ok, %{status: status, body: body}} ->
-        Logger.error("GitHub add blocked_by failed status=#{status} body=#{summarize_error_body(body)}")
+      {:ok, %{status: status}} ->
+        Logger.error("GitHub add blocked_by failed status=#{status}")
         {:halt, {:error, {:github_api_status, status}}}
 
       {:error, reason} ->
@@ -2414,8 +2335,8 @@ defmodule SymphonyElixir.GitHub.Client do
       {:ok, %{status: status}} when status in [200, 204] ->
         {:cont, :ok}
 
-      {:ok, %{status: status, body: body}} ->
-        Logger.error("GitHub remove blocked_by failed status=#{status} body=#{summarize_error_body(body)}")
+      {:ok, %{status: status}} ->
+        Logger.error("GitHub remove blocked_by failed status=#{status}")
         {:halt, {:error, {:github_api_status, status}}}
 
       {:error, reason} ->
@@ -2788,25 +2709,8 @@ defmodule SymphonyElixir.GitHub.Client do
     end)
   end
 
-  defp summarize_error_body(body) when is_binary(body) do
-    body
-    |> String.replace(~r/\s+/, " ")
-    |> String.trim()
-    |> truncate_error_body()
-    |> inspect()
-  end
-
-  defp summarize_error_body(body) do
-    body
-    |> inspect(limit: 20, printable_limit: @max_error_body_log_bytes)
-    |> truncate_error_body()
-  end
-
-  defp truncate_error_body(body) when is_binary(body) do
-    if byte_size(body) > @max_error_body_log_bytes do
-      binary_part(body, 0, @max_error_body_log_bytes) <> "...<truncated>"
-    else
-      body
-    end
-  end
+  defp error_kind({:github_provider_unavailable, _}), do: :provider_unavailable
+  defp error_kind({:github_rate_limited, _, _}), do: :rate_limited
+  defp error_kind({:github_graphql_errors, _}), do: :graphql
+  defp error_kind(_reason), do: :request_failed
 end

@@ -15,6 +15,7 @@ defmodule SymphonyElixir.GitHub.Gateway do
   @request_timeout_ms 35_000
 
   defstruct circuit_until_ms: nil,
+            circuit_kind: nil,
             reset_at: nil,
             backoff_ms: @fallback_backoff_ms,
             last_error: nil,
@@ -66,6 +67,7 @@ defmodule SymphonyElixir.GitHub.Gateway do
      %{
        available?: true,
        circuit: if(circuit_open?(state, now_ms), do: :open, else: :closed),
+       circuit_kind: state.circuit_kind,
        retry_in_ms: retry_in_ms(state, now_ms),
        reset_at: state.reset_at,
        last_error: state.last_error,
@@ -77,7 +79,7 @@ defmodule SymphonyElixir.GitHub.Gateway do
     now_ms = System.monotonic_time(:millisecond)
 
     if circuit_open?(state, now_ms) do
-      {:reply, {:error, {:github_rate_limited, state.reset_at, retry_in_ms(state, now_ms)}}, state}
+      {:reply, circuit_error(state, now_ms), state}
     else
       request = %{
         from: from,
@@ -105,6 +107,10 @@ defmodule SymphonyElixir.GitHub.Gateway do
         {:rate_limited, metadata} ->
           state = open_circuit(state, in_flight.resource, metadata)
           {{:error, {:github_rate_limited, state.reset_at, retry_in_ms(state, System.monotonic_time(:millisecond))}}, state}
+
+        {:provider_unavailable, metadata} ->
+          state = open_provider_circuit(state, in_flight.resource, metadata)
+          {circuit_error(state, System.monotonic_time(:millisecond)), state}
 
         :success ->
           {result, close_circuit(state)}
@@ -174,7 +180,7 @@ defmodule SymphonyElixir.GitHub.Gateway do
   end
 
   defp reject_queued(%{queue: queue} = state) do
-    reply = {:error, {:github_rate_limited, state.reset_at, retry_in_ms(state, System.monotonic_time(:millisecond))}}
+    reply = circuit_error(state, System.monotonic_time(:millisecond))
 
     queue
     |> :queue.to_list()
@@ -245,15 +251,52 @@ defmodule SymphonyElixir.GitHub.Gateway do
          retry_after: response_header(response, "retry-after"),
          reset: response_header(response, "x-ratelimit-reset"),
          remaining: remaining,
-         message: body_message
+         message: "rate limited"
        }}
     else
-      :success
+      if status == 408 or status in 500..599 do
+        {:provider_unavailable, %{status: status, message: "provider unavailable"}}
+      else
+        :success
+      end
     end
   end
 
-  defp classify({:error, _reason}), do: :other
+  defp classify({:error, reason}) do
+    {:provider_unavailable, %{kind: :transport, reason: inspect_reason(reason)}}
+  end
+
   defp classify(_result), do: :other
+
+  defp inspect_reason(reason) when is_atom(reason), do: reason
+  defp inspect_reason(%{__struct__: module}) when is_atom(module), do: module
+  defp inspect_reason(_reason), do: :request_failed
+
+  defp open_provider_circuit(state, resource, _metadata) do
+    now_ms = System.monotonic_time(:millisecond)
+    backoff_ms = provider_backoff_ms(state.backoff_ms)
+    reset_at = DateTime.add(DateTime.utc_now(), backoff_ms, :millisecond)
+
+    Logger.error("GitHub provider circuit opened resource=#{resource} kind=unavailable backoff_ms=#{backoff_ms} reset_at=#{DateTime.to_iso8601(reset_at)}")
+
+    %{
+      state
+      | circuit_until_ms: now_ms + backoff_ms,
+        circuit_kind: :provider_unavailable,
+        reset_at: DateTime.to_iso8601(reset_at),
+        backoff_ms: min(max(backoff_ms * 2, @fallback_backoff_ms), @max_backoff_ms),
+        last_error: "provider unavailable"
+    }
+  end
+
+  defp provider_backoff_ms(previous_backoff_ms), do: min(previous_backoff_ms, @max_backoff_ms)
+
+  defp circuit_error(%{circuit_kind: :provider_unavailable, reset_at: reset_at} = state, now_ms) do
+    {:error, {:github_provider_unavailable, %{kind: :circuit_open, reset_at: reset_at, retry_in_ms: retry_in_ms(state, now_ms)}}}
+  end
+
+  defp circuit_error(state, now_ms),
+    do: {:error, {:github_rate_limited, state.reset_at, retry_in_ms(state, now_ms)}}
 
   defp open_circuit(state, resource, metadata) do
     now_ms = System.monotonic_time(:millisecond)
@@ -265,6 +308,7 @@ defmodule SymphonyElixir.GitHub.Gateway do
     %{
       state
       | circuit_until_ms: now_ms + backoff_ms,
+        circuit_kind: :rate_limited,
         reset_at: DateTime.to_iso8601(reset_at),
         backoff_ms: min(max(backoff_ms * 2, @fallback_backoff_ms), @max_backoff_ms),
         last_error: metadata[:message] || "rate limited"
@@ -275,6 +319,7 @@ defmodule SymphonyElixir.GitHub.Gateway do
     %{
       state
       | circuit_until_ms: nil,
+        circuit_kind: nil,
         reset_at: nil,
         backoff_ms: @fallback_backoff_ms,
         last_error: nil

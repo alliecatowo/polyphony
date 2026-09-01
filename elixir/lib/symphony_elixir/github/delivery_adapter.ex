@@ -468,14 +468,13 @@ defmodule SymphonyElixir.GitHub.DeliveryAdapter do
 
   defp authorization_token(tracker, request_fun, gateway_server) do
     auth_request_fun = fn method, url, body, headers ->
-      Gateway.request(
-        :rest,
-        fn -> invoke_request(request_fun, method, url, headers, body) end,
-        server: gateway_server
-      )
+      invoke_request(request_fun, method, url, headers, body)
     end
 
-    case Auth.project_authorization_token(tracker, request_fun: auth_request_fun) do
+    case Auth.project_authorization_token(tracker,
+           request_fun: auth_request_fun,
+           gateway_server: gateway_server
+         ) do
       {:ok, token} -> {:ok, token}
       {:error, :missing_github_api_token} -> {:error, :missing_github_api_token}
       {:error, :missing_github_oauth_token} -> {:error, :missing_github_oauth_token}

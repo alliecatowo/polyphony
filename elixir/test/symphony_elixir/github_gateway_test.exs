@@ -89,6 +89,53 @@ defmodule SymphonyElixir.GitHub.GatewayTest do
     assert Gateway.snapshot(name).circuit == :closed
   end
 
+  test "a provider outage parks queued callers without retrying the provider" do
+    name = Module.concat(__MODULE__, "Unavailable#{System.unique_integer([:positive])}")
+    start_supervised!({Gateway, name: name})
+    counter = :counters.new(1, [])
+    test_pid = self()
+
+    first =
+      Task.async(fn ->
+        Gateway.request(
+          :rest,
+          fn ->
+            send(test_pid, :provider_request_started)
+            :counters.add(counter, 1, 1)
+            {:error, :econnrefused}
+          end,
+          server: name
+        )
+      end)
+
+    assert_receive :provider_request_started
+
+    second =
+      Task.async(fn ->
+        Gateway.request(
+          :rest,
+          fn ->
+            :counters.add(counter, 1, 1)
+            {:ok, %{status: 200, headers: %{}, body: %{}}}
+          end,
+          server: name
+        )
+      end)
+
+    assert {:error, {:github_provider_unavailable, %{kind: :circuit_open, retry_in_ms: retry_in_ms}}} =
+             Task.await(first)
+
+    assert retry_in_ms > 0
+
+    assert {:error, {:github_provider_unavailable, %{kind: :circuit_open, retry_in_ms: retry_in_ms}}} =
+             Task.await(second)
+
+    assert retry_in_ms > 0
+    assert :counters.get(counter, 1) == 1
+    assert Gateway.snapshot(name).circuit == :open
+    assert Gateway.snapshot(name).circuit_kind == :provider_unavailable
+  end
+
   test "requests are serialized so concurrent callers cannot race the circuit" do
     name = Module.concat(__MODULE__, "Serialized#{System.unique_integer([:positive])}")
     start_supervised!({Gateway, name: name})
