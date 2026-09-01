@@ -38,13 +38,18 @@ systemd-run --user --scope --quiet --collect \
 
 cd "$elixir_root"
 
+# systemd user services intentionally have a minimal PATH, which can hide
+# Homebrew even when Erlang was linked against its OpenSSL.  Discover the
+# library directly as a fallback so a daemon restart cannot lose crypto.
+openssl_prefix=""
 if command -v brew >/dev/null 2>&1; then
-  if openssl_prefix="$(brew --prefix openssl@3 2>/dev/null)"; then
-    openssl_lib="$openssl_prefix/lib"
-    if [[ -d "$openssl_lib" ]]; then
-      export LD_LIBRARY_PATH="$openssl_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    fi
-  fi
+  openssl_prefix="$(brew --prefix openssl@3 2>/dev/null || true)"
+fi
+if [[ -z "$openssl_prefix" && -d /home/linuxbrew/.linuxbrew/opt/openssl@3/lib ]]; then
+  openssl_prefix=/home/linuxbrew/.linuxbrew/opt/openssl@3
+fi
+if [[ -n "$openssl_prefix" && -d "$openssl_prefix/lib" ]]; then
+  export LD_LIBRARY_PATH="$openssl_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 
 set -a

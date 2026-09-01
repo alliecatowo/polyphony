@@ -82,6 +82,10 @@ agent:
   # One execution turn owns the slot. The harness then delivers and parks on
   # CI/merge webhooks; a red result resumes the same workspace/session.
   max_turns: 1
+  # Luna gets the first repair, Terra gets the second, Sol gets the final
+  # escalation. Further retries are persisted as failed instead of consuming
+  # the worker pool indefinitely.
+  max_delivery_retry_attempts: 3
 codex:
   command: codex --config shell_environment_policy.inherit=all app-server
   shared_app_server: true
@@ -89,6 +93,8 @@ codex:
   models:
     default: gpt-5.6-luna
     review: gpt-5.6-terra
+    # Premium Sol is selected only by an explicit `escalate: sol` issue
+    # marker or an equivalent explicit runtime signal; retries never select it.
     escalation: gpt-5.6-sol
   approval_policy: never
   thread_sandbox: workspace-write

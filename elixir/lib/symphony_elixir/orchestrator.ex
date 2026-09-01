@@ -276,6 +276,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     state =
       state
+      |> reconcile_dead_running_workers()
       |> reconcile_stalled_running_issues(self())
       |> refresh_control_obligations()
       |> schedule_stall_check()
@@ -369,7 +370,11 @@ defmodule SymphonyElixir.Orchestrator do
           Process.exit(task.pid, :kill)
         end
 
-        state = clear_provider_recovery_task(state, issue_id, task_ref)
+        state =
+          state
+          |> clear_provider_recovery_task(issue_id, task_ref)
+          |> schedule_provider_recovery_retry()
+
         notify_dashboard()
         {:noreply, schedule_delivery_reconcile(state, provider_retry_delay())}
 
@@ -380,10 +385,25 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:DOWN, task_ref, :process, _pid, reason}, %State{} = state)
       when is_reference(task_ref) do
+    case find_issue_id_for_ref(state.running, task_ref) do
+      issue_id when is_binary(issue_id) ->
+        handle_worker_down(state, task_ref, reason)
+
+      nil ->
+        handle_unmatched_down(state, task_ref, reason)
+    end
+  end
+
+  defp handle_unmatched_down(%State{} = state, task_ref, reason) do
     case find_provider_recovery_task(state.provider_recovery_tasks, task_ref) do
       {issue_id, _task} ->
         Logger.warning("Provider recovery task exited before completion issue_id=#{issue_id}: #{inspect(reason)}")
-        state = clear_provider_recovery_task(state, issue_id, task_ref)
+
+        state =
+          state
+          |> clear_provider_recovery_task(issue_id, task_ref)
+          |> schedule_provider_recovery_retry()
+
         notify_dashboard()
         {:noreply, schedule_delivery_reconcile(state, provider_retry_delay())}
 
@@ -509,64 +529,82 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, state}
 
       issue_id ->
-        {running_entry, state} = pop_running_entry(state, issue_id)
-        state = release_running_claims(state, running_entry)
-        state = record_session_completion_totals(state, running_entry)
-        session_id = running_entry_session_id(running_entry)
-        delivery = Map.get(state.deliveries, issue_id)
-        state = if nonterminal_delivery?(delivery), do: claim_issue(state, issue_id), else: state
-
-        state =
-          case {reason, delivery} do
-            {:normal, %Delivery{state: delivery_state}}
-            when delivery_state in [:waiting_ci, :waiting_merge, :waiting_provider, :complete] ->
-              Logger.info(
-                "Agent task parked with harness-owned delivery for issue_id=#{issue_id} " <>
-                  "session_id=#{session_id} delivery_state=#{delivery_state}"
-              )
-
-              complete_issue(state, issue_id)
-
-            {_reason, %Delivery{state: delivery_state} = retry_delivery}
-            when delivery_state in [:retry_ready, :failed] ->
-              schedule_delivery_retry(state, issue_id, running_entry, retry_delivery)
-
-            {:normal, _delivery} ->
-              Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
-
-              state
-              |> complete_issue(issue_id)
-              |> schedule_issue_retry(issue_id, 1, %{
-                identifier: running_entry.identifier,
-                delay_type: :continuation,
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path),
-                resume_thread_id: Map.get(running_entry, :resume_thread_id),
-                slice_metadata: slice_metadata_from_running(running_entry)
-              })
-
-            {_reason, _delivery} ->
-              Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
-
-              next_attempt = next_retry_attempt_from_running(running_entry)
-
-              schedule_issue_retry(state, issue_id, next_attempt, %{
-                identifier: running_entry.identifier,
-                error: "agent exited: #{inspect(reason)}",
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path),
-                resume_thread_id: Map.get(running_entry, :resume_thread_id),
-                slice_metadata: slice_metadata_from_running(running_entry)
-              })
-          end
-
-        state = state |> refresh_control_obligations() |> schedule_targeted_refresh(0)
-
-        Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
-
-        notify_dashboard()
-        {:noreply, state}
+        handle_worker_down(state, ref, reason, issue_id)
     end
+  end
+
+  defp handle_worker_down(%State{} = state, ref, reason) do
+    case find_issue_id_for_ref(state.running, ref) do
+      issue_id when is_binary(issue_id) -> handle_worker_down(state, ref, reason, issue_id)
+      nil -> {:noreply, state}
+    end
+  end
+
+  defp handle_worker_down(%State{} = state, _ref, reason, issue_id) do
+    {running_entry, state} = pop_running_entry(state, issue_id)
+    state = release_running_claims(state, running_entry)
+    state = record_session_completion_totals(state, running_entry)
+    session_id = running_entry_session_id(running_entry)
+    delivery = Map.get(state.deliveries, issue_id)
+    state = if nonterminal_delivery?(delivery), do: claim_issue(state, issue_id), else: state
+
+    state =
+      case {reason, delivery} do
+        {:normal, %Delivery{state: delivery_state}}
+        when delivery_state in [:waiting_ci, :waiting_merge, :waiting_provider, :complete] ->
+          Logger.info(
+            "Agent task parked with harness-owned delivery for issue_id=#{issue_id} " <>
+              "session_id=#{session_id} delivery_state=#{delivery_state}"
+          )
+
+          complete_issue(state, issue_id)
+
+        {_reason, %Delivery{state: :retry_ready} = retry_delivery} ->
+          schedule_delivery_retry(state, issue_id, running_entry, retry_delivery)
+
+        {_reason, %Delivery{state: :failed}} ->
+          Logger.error(
+            "Delivery permanently failed; refusing automatic retry for issue_id=#{issue_id} " <>
+              "issue_identifier=#{running_entry.identifier}"
+          )
+
+          complete_issue(state, issue_id)
+
+        {:normal, _delivery} ->
+          Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+
+          state
+          |> complete_issue(issue_id)
+          |> schedule_issue_retry(issue_id, 1, %{
+            identifier: running_entry.identifier,
+            delay_type: :continuation,
+            worker_host: Map.get(running_entry, :worker_host),
+            workspace_path: Map.get(running_entry, :workspace_path),
+            resume_thread_id: Map.get(running_entry, :resume_thread_id),
+            slice_metadata: slice_metadata_from_running(running_entry)
+          })
+
+        {_reason, _delivery} ->
+          Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
+
+          next_attempt = next_retry_attempt_from_running(running_entry)
+
+          schedule_issue_retry(state, issue_id, next_attempt, %{
+            identifier: running_entry.identifier,
+            error: "agent exited: #{inspect(reason)}",
+            worker_host: Map.get(running_entry, :worker_host),
+            workspace_path: Map.get(running_entry, :workspace_path),
+            resume_thread_id: Map.get(running_entry, :resume_thread_id),
+            slice_metadata: slice_metadata_from_running(running_entry)
+          })
+      end
+
+    state = state |> refresh_control_obligations() |> schedule_targeted_refresh(0)
+
+    Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
+
+    notify_dashboard()
+    {:noreply, state}
   end
 
   def handle_info({:worker_runtime_info, issue_id, runtime_info}, %{running: running} = state)
@@ -1266,6 +1304,31 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  # A worker can exit before its monitor is installed (the worker-start
+  # announcement and the process exit are delivered independently).  In that
+  # race the normal DOWN handler never receives a matching monitor event and
+  # the dashboard can retain a phantom running entry indefinitely.  Re-emit a
+  # synthetic DOWN for dead pids so the single normal cleanup path releases
+  # claims, records delivery state, and schedules any required retry.
+  defp reconcile_dead_running_workers(%State{} = state) do
+    Enum.each(state.running, fn
+      {issue_id, %{pid: pid, ref: ref}} when is_pid(pid) and is_reference(ref) ->
+        unless Process.alive?(pid) do
+          Logger.warning(
+            "Detected dead worker without cleanup issue_id=#{issue_id} " <>
+              "pid=#{inspect(pid)}; scheduling DOWN reconciliation"
+          )
+
+          send(self(), {:DOWN, ref, :process, pid, :noproc})
+        end
+
+      _ ->
+        :ok
+    end)
+
+    state
+  end
+
   defp restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms, owner) do
     elapsed_ms = stall_elapsed_ms(running_entry, now)
 
@@ -1829,21 +1892,105 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp schedule_delivery_retry(state, issue_id, running_entry, %Delivery{} = delivery) do
-    failure = List.first(delivery.failures) || %{}
-    classification = Map.get(failure, :classification) || Map.get(failure, "classification")
-    next_attempt = max(delivery.attempt, next_retry_attempt_from_running(running_entry))
+    retry_limit = Config.max_delivery_retry_attempts()
 
-    schedule_issue_retry(state, issue_id, next_attempt, %{
-      identifier: running_entry.identifier,
-      error: "delivery #{delivery.state}: #{inspect(delivery.failure_reason)}",
-      delay_type: :failure,
-      failure_class: classification,
-      failure_attempt: delivery.attempt,
-      worker_host: Map.get(running_entry, :worker_host),
-      workspace_path: Map.get(running_entry, :workspace_path),
-      resume_thread_id: Map.get(running_entry, :resume_thread_id),
-      slice_metadata: slice_metadata_from_running(running_entry)
-    })
+    if delivery_retry_budget_exhausted?(delivery, retry_limit) do
+      reason = {:delivery_retry_budget_exhausted, retry_limit, delivery.failure_reason}
+
+      case persist_permanent_delivery_failure(issue_id, delivery, reason) do
+        {:ok, failed_delivery} ->
+          Logger.error(
+            "Delivery retry budget exhausted for issue_id=#{issue_id} " <>
+              "issue_identifier=#{running_entry.identifier} attempts=#{delivery.attempt} limit=#{retry_limit}; " <>
+              "parking for manual escalation"
+          )
+
+          state
+          |> Map.put(:deliveries, Map.put(state.deliveries, issue_id, failed_delivery))
+          |> complete_issue(issue_id)
+
+        {:error, persist_reason} ->
+          Logger.error("Could not persist exhausted delivery for issue_id=#{issue_id}: #{inspect(persist_reason)}; refusing retry")
+
+          complete_issue(state, issue_id)
+      end
+    else
+      case mark_final_escalation_if_needed(issue_id, delivery, retry_limit) do
+        {:ok, delivery} ->
+          failure = List.first(delivery.failures) || %{}
+          classification = Map.get(failure, :classification) || Map.get(failure, "classification")
+          next_attempt = max(delivery.attempt, next_retry_attempt_from_running(running_entry))
+
+          state
+          |> Map.put(:deliveries, Map.put(state.deliveries, issue_id, delivery))
+          |> schedule_issue_retry(issue_id, next_attempt, %{
+            identifier: running_entry.identifier,
+            error: "delivery #{delivery.state}: #{inspect(delivery.failure_reason)}",
+            delay_type: :failure,
+            failure_class: classification,
+            failure_attempt: delivery.attempt,
+            worker_host: Map.get(running_entry, :worker_host),
+            workspace_path: Map.get(running_entry, :workspace_path),
+            resume_thread_id: Map.get(running_entry, :resume_thread_id),
+            slice_metadata: slice_metadata_from_running(running_entry)
+          })
+
+        {:error, reason} ->
+          Logger.error("Could not persist final escalation for issue_id=#{issue_id}: #{inspect(reason)}; refusing retry")
+          complete_issue(state, issue_id)
+      end
+    end
+  end
+
+  defp delivery_retry_budget_exhausted?(%Delivery{} = delivery, retry_limit) do
+    delivery.attempt > retry_limit and delivery.escalation > 0
+  end
+
+  defp mark_final_escalation_if_needed(issue_id, %Delivery{} = delivery, retry_limit) do
+    if delivery.attempt >= retry_limit and delivery.escalation == 0 do
+      persist_final_escalation(issue_id, delivery)
+    else
+      {:ok, delivery}
+    end
+  end
+
+  defp persist_final_escalation(issue_id, %Delivery{} = delivery) do
+    with {:ok, controller} <-
+           DeliveryController.start_link(
+             delivery_id: issue_id,
+             delivery: delivery,
+             runtime_dir: delivery_runtime_dir(),
+             github_adapter: DeliveryAdapter
+           ),
+         {:ok, escalated_delivery} <-
+           DeliveryController.handle_event(
+             controller,
+             %Delivery.Event.Escalated{classification: :code, reason: :final_sol_delivery_retry}
+           ) do
+      if Process.alive?(controller), do: GenServer.stop(controller)
+      {:ok, escalated_delivery}
+    else
+      {:error, reason, _delivery} -> {:error, reason}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp persist_permanent_delivery_failure(issue_id, %Delivery{} = delivery, reason) do
+    with {:ok, controller} <-
+           DeliveryController.start_link(
+             delivery_id: issue_id,
+             delivery: delivery,
+             runtime_dir: delivery_runtime_dir(),
+             github_adapter: DeliveryAdapter
+           ),
+         {:ok, failed_delivery} <-
+           DeliveryController.handle_event(controller, %Delivery.Event.PermanentFailure{reason: reason}) do
+      if Process.alive?(controller), do: GenServer.stop(controller)
+      {:ok, failed_delivery}
+    else
+      {:error, reason, _delivery} -> {:error, reason}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   defp preserve_slice_metadata(original, refreshed) when is_map(original) and is_map(refreshed) do
@@ -2179,19 +2326,14 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  # Only typed transient failures may park the scheduler. In particular, do
+  # not infer an outage from a GitHub API message: 4xx validation and
+  # permission failures must consume the normal delivery retry path instead.
   defp provider_wait_error?({:github_rate_limited, _reset_at, _retry_in_ms}), do: true
   defp provider_wait_error?({:github_provider_unavailable, _details}), do: true
-
-  defp provider_wait_error?(reason) when is_tuple(reason) do
-    reason
-    |> Tuple.to_list()
-    |> Enum.any?(&provider_wait_error?/1)
-  end
-
-  defp provider_wait_error?(reason) when is_binary(reason) do
-    normalized = String.downcase(reason)
-    String.contains?(normalized, "rate limit") or String.contains?(normalized, "provider circuit")
-  end
+  defp provider_wait_error?({:provider_unavailable, reason}), do: provider_wait_error?(reason)
+  defp provider_wait_error?({:github, reason}), do: provider_wait_error?(reason)
+  defp provider_wait_error?({:error, reason}), do: provider_wait_error?(reason)
 
   defp provider_wait_error?(_reason), do: false
 
@@ -2845,6 +2987,18 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  # A recovery task can be killed after its controller has durably moved from
+  # :waiting_provider to :delivering. Re-read that durable state on the next
+  # recovery pass and resume it, rather than leaving the claim stranded until
+  # a process restart or a future webhook happens to arrive.
+  defp schedule_provider_recovery_retry(%State{} = state) do
+    if github_gateway_ready?() do
+      Process.send_after(self(), :provider_available, provider_retry_delay())
+    end
+
+    state
+  end
+
   defp next_poll_in_ms(nil, _now_ms), do: nil
 
   defp next_poll_in_ms(next_poll_due_at_ms, now_ms) when is_integer(next_poll_due_at_ms) do
@@ -3319,60 +3473,65 @@ defmodule SymphonyElixir.Orchestrator do
   defp integer_like(_value), do: nil
 
   defp handle_retry_timer(issue_id, retry_token, state) do
-    if github_gateway_open?() do
-      {:noreply, park_retry_for_provider(state, issue_id, retry_token)}
+    if Map.has_key?(state.running, issue_id) or Map.has_key?(state.reservations, issue_id) do
+      Logger.info("Discarding retry for already-running issue_id=#{issue_id}")
+      {:noreply, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
     else
-      case pop_retry_attempt_state(state, issue_id, retry_token) do
-        {:ok, attempt, metadata, state} ->
-          orchestrator = self()
+      if github_gateway_open?() do
+        {:noreply, park_retry_for_provider(state, issue_id, retry_token)}
+      else
+        case pop_retry_attempt_state(state, issue_id, retry_token) do
+          {:ok, attempt, metadata, state} ->
+            orchestrator = self()
 
-          case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-                 result =
-                   try do
-                     Tracker.fetch_issue_states_by_ids([issue_id])
-                   rescue
-                     exception -> {:error, {:exception, exception, __STACKTRACE__}}
-                   catch
-                     kind, reason -> {:error, {kind, reason}}
-                   end
+            case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
+                   result =
+                     try do
+                       Tracker.fetch_issue_states_by_ids([issue_id])
+                     rescue
+                       exception -> {:error, {:exception, exception, __STACKTRACE__}}
+                     catch
+                       kind, reason -> {:error, {kind, reason}}
+                     end
 
-                 send(orchestrator, {:retry_issue_lookup, issue_id, attempt, metadata, result})
-               end) do
-            {:ok, pid} ->
-              task_ref = Process.monitor(pid)
-              timeout_timer_ref = Process.send_after(self(), {:retry_lookup_timeout, issue_id, attempt, task_ref}, @retry_lookup_timeout_ms)
+                   send(orchestrator, {:retry_issue_lookup, issue_id, attempt, metadata, result})
+                 end) do
+              {:ok, pid} ->
+                task_ref = Process.monitor(pid)
+                timeout_timer_ref = Process.send_after(self(), {:retry_lookup_timeout, issue_id, attempt, task_ref}, @retry_lookup_timeout_ms)
 
-              retry_entry = %{
-                attempt: attempt,
-                timer_ref: nil,
-                retry_token: make_ref(),
-                due_at_ms: System.monotonic_time(:millisecond),
-                lookup_task_pid: pid,
-                lookup_task_ref: task_ref,
-                lookup_timeout_timer_ref: timeout_timer_ref
-              }
+                retry_entry = %{
+                  attempt: attempt,
+                  timer_ref: nil,
+                  retry_token: make_ref(),
+                  due_at_ms: System.monotonic_time(:millisecond),
+                  lookup_task_pid: pid,
+                  lookup_task_ref: task_ref,
+                  lookup_timeout_timer_ref: timeout_timer_ref
+                }
 
-              state = %{state | retry_attempts: Map.put(state.retry_attempts, issue_id, Map.merge(retry_entry, metadata))}
-              notify_dashboard()
-              {:noreply, state}
+                state = %{state | retry_attempts: Map.put(state.retry_attempts, issue_id, Map.merge(retry_entry, metadata))}
+                notify_dashboard()
+                {:noreply, state}
 
-            {:error, reason} ->
-              Logger.warning("Failed to start retry lookup for issue_id=#{issue_id}: #{inspect(reason)}")
+              {:error, reason} ->
+                Logger.warning("Failed to start retry lookup for issue_id=#{issue_id}: #{inspect(reason)}")
 
-              next_state =
-                schedule_issue_retry(
-                  state,
-                  issue_id,
-                  attempt + 1,
-                  Map.merge(metadata, %{error: "retry lookup task failed: #{inspect(reason)}"})
-                )
+                next_state =
+                  schedule_issue_retry(
+                    state,
+                    issue_id,
+                    attempt + 1,
+                    Map.merge(metadata, %{error: "retry lookup task failed: #{inspect(reason)}"})
+                  )
 
-              notify_dashboard()
-              {:noreply, next_state}
-          end
+                notify_dashboard()
+                {:noreply, next_state}
+            end
 
-        :missing ->
-          {:noreply, state}
+          :missing ->
+            {:noreply, state}
+        end
       end
     end
   end
@@ -3670,22 +3829,53 @@ defmodule SymphonyElixir.Orchestrator do
   defp apply_reconcile_summary(_controller, delivery, _summary), do: {:ok, delivery}
 
   defp apply_reconciled_delivery_state(state, issue_id, %Delivery{state: :retry_ready} = delivery) do
-    failure = List.first(delivery.failures) || %{}
-    classification = Map.get(failure, :classification) || Map.get(failure, "classification")
+    retry_limit = Config.max_delivery_retry_attempts()
 
-    state
-    |> Map.put(:completed, MapSet.delete(state.completed, issue_id))
-    |> schedule_issue_retry(issue_id, max(delivery.attempt, 1), %{
-      identifier: Map.get(delivery.metadata, "identifier") || issue_id,
-      error: "delivery retry required: #{inspect(delivery.failure_reason)}",
-      delay_type: :failure,
-      failure_class: classification,
-      failure_attempt: delivery.attempt,
-      workspace_path: delivery.workspace,
-      resume_thread_id: Map.get(delivery.metadata, "thread_id"),
-      delivery_retry: true,
-      delivery_failure_reason: delivery.failure_reason
-    })
+    if delivery_retry_budget_exhausted?(delivery, retry_limit) do
+      reason = {:delivery_retry_budget_exhausted, retry_limit, delivery.failure_reason}
+
+      case persist_permanent_delivery_failure(issue_id, delivery, reason) do
+        {:ok, failed_delivery} ->
+          Logger.error(
+            "Persisted delivery retry budget exhausted for issue_id=#{issue_id} " <>
+              "attempts=#{delivery.attempt} limit=#{retry_limit}; parking for manual escalation"
+          )
+
+          state
+          |> Map.put(:deliveries, Map.put(state.deliveries, issue_id, failed_delivery))
+          |> complete_issue(issue_id)
+
+        {:error, persist_reason} ->
+          Logger.error("Could not persist exhausted reconciled delivery for issue_id=#{issue_id}: #{inspect(persist_reason)}; refusing retry")
+
+          complete_issue(state, issue_id)
+      end
+    else
+      case mark_final_escalation_if_needed(issue_id, delivery, retry_limit) do
+        {:ok, delivery} ->
+          failure = List.first(delivery.failures) || %{}
+          classification = Map.get(failure, :classification) || Map.get(failure, "classification")
+
+          state
+          |> Map.put(:deliveries, Map.put(state.deliveries, issue_id, delivery))
+          |> Map.put(:completed, MapSet.delete(state.completed, issue_id))
+          |> schedule_issue_retry(issue_id, max(delivery.attempt, 1), %{
+            identifier: Map.get(delivery.metadata, "identifier") || issue_id,
+            error: "delivery retry required: #{inspect(delivery.failure_reason)}",
+            delay_type: :failure,
+            failure_class: classification,
+            failure_attempt: delivery.attempt,
+            workspace_path: delivery.workspace,
+            resume_thread_id: Map.get(delivery.metadata, "thread_id"),
+            delivery_retry: true,
+            delivery_failure_reason: delivery.failure_reason
+          })
+
+        {:error, reason} ->
+          Logger.error("Could not persist final reconciled escalation for issue_id=#{issue_id}: #{inspect(reason)}; refusing retry")
+          complete_issue(state, issue_id)
+      end
+    end
   end
 
   defp apply_reconciled_delivery_state(state, issue_id, %Delivery{state: :complete}) do
@@ -3788,6 +3978,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp resume_provider_delivery(%Delivery{} = delivery, runtime_dir) when is_binary(runtime_dir) do
+    delivery = load_durable_provider_delivery(delivery, runtime_dir)
+
     case DeliveryController.start_link(
            delivery_id: delivery.issue_id,
            delivery: delivery,
@@ -3797,12 +3989,17 @@ defmodule SymphonyElixir.Orchestrator do
          ) do
       {:ok, controller} ->
         try do
-          with {:ok, %Delivery{} = resumed} <- DeliveryController.provider_available(controller) do
-            if resumed.state == :delivering do
+          case delivery.state do
+            :waiting_provider ->
+              with {:ok, %Delivery{} = resumed} <- DeliveryController.provider_available(controller) do
+                resume_provider_delivery_operation(controller, resumed)
+              end
+
+            :delivering ->
               DeliveryController.resume_delivery(controller)
-            else
-              {:ok, resumed}
-            end
+
+            _ ->
+              {:ok, delivery}
           end
         after
           if Process.alive?(controller), do: GenServer.stop(controller)
@@ -3815,6 +4012,18 @@ defmodule SymphonyElixir.Orchestrator do
         {:error, reason}
     end
   end
+
+  defp load_durable_provider_delivery(%Delivery{} = delivery, runtime_dir) do
+    case DeliveryController.load(runtime_dir, delivery.issue_id) do
+      {:ok, %Delivery{} = persisted} -> persisted
+      {:error, _reason} -> delivery
+    end
+  end
+
+  defp resume_provider_delivery_operation(controller, %Delivery{state: :delivering}),
+    do: DeliveryController.resume_delivery(controller)
+
+  defp resume_provider_delivery_operation(_controller, %Delivery{} = delivery), do: {:ok, delivery}
 
   defp github_gateway_ready? do
     case GitHubGateway.snapshot() do

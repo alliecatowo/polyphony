@@ -62,6 +62,10 @@ defmodule SymphonyElixir.Config do
 
   def max_concurrent_agents_for_state(_state_name), do: settings!().agent.max_concurrent_agents
 
+  @doc "Returns the maximum counted repair turns for one persisted delivery."
+  @spec max_delivery_retry_attempts() :: pos_integer()
+  def max_delivery_retry_attempts, do: settings!().agent.max_delivery_retry_attempts
+
   @doc "Selects a Codex model profile for an issue."
   @spec codex_model_for_issue(map(), keyword()) :: String.t() | nil
   def codex_model_for_issue(issue, opts \\ []) do
@@ -71,12 +75,14 @@ defmodule SymphonyElixir.Config do
     failure_attempt = Keyword.get(opts, :failure_attempt) || Map.get(metadata, "failure_attempt", 0)
     failure_class = Keyword.get(opts, :failure_class) || Map.get(metadata, "failure_class")
     escalatable_failure? = failure_class in [:code, :ci, :merge_conflict, "code", "ci", "merge_conflict"]
+    explicit_sol? = explicit_sol_escalation?(labels, metadata, opts)
 
     profile =
       cond do
+        explicit_sol? -> "escalation"
         escalatable_failure? and is_integer(failure_attempt) and failure_attempt >= 3 -> "escalation"
         escalatable_failure? and is_integer(failure_attempt) and failure_attempt >= 2 -> "review"
-        Enum.any?(labels, &(&1 in ["audit", "escalate", "escalation", "sol"])) -> "escalation"
+        Enum.any?(labels, &(&1 in ["audit", "escalate", "escalation", "sol"])) -> "review"
         Enum.any?(labels, &(&1 in ["review", "stack", "stacked-pr", "stack-reconcile", "stack/reconcile"])) -> "review"
         true -> "default"
       end
@@ -104,12 +110,11 @@ defmodule SymphonyElixir.Config do
 
     stack_ready? = Map.get(pr_lifecycle, "ready_for_review", false) == true
     retry_attempt = if is_integer(attempt) and attempt > 0, do: attempt, else: 0
-    escalation_after = routing_integer(routing, "escalation_after_attempts", 0)
+    explicit_sol? = explicit_sol_escalation?(labels, Map.get(issue, :tracker_metadata, %{}), [])
 
     pool_name =
       cond do
-        retry_attempt >= escalation_after and escalation_after > 0 -> "escalation"
-        Enum.any?(labels, &(&1 in ["audit", "escalate", "escalation", "sol"])) -> "escalation"
+        explicit_sol? -> "escalation"
         stack_ready? -> "review"
         Enum.any?(labels, &(&1 in ["review", "stack", "stacked-pr", "stack-reconcile", "stack/reconcile"])) -> "review"
         String.contains?(state, "review") -> "review"
@@ -187,6 +192,21 @@ defmodule SymphonyElixir.Config do
 
   defp normalize_worker_labels(label) when is_binary(label), do: [String.downcase(String.trim(label))]
   defp normalize_worker_labels(_labels), do: []
+
+  # Sol is intentionally premium and must not be selected merely because an
+  # issue has failed repeatedly or has a broad audit/escalation label. The
+  # explicit marker can be set either on the issue metadata or by the caller.
+  defp explicit_sol_escalation?(labels, metadata, opts) when is_list(labels) and is_map(metadata) do
+    explicit_marker?(Keyword.get(opts, :escalate)) or
+      explicit_marker?(Map.get(metadata, "escalate") || Map.get(metadata, :escalate)) or
+      Enum.any?(labels, &(&1 in ["escalate: sol", "escalate:sol"]))
+  end
+
+  defp explicit_sol_escalation?(_labels, _metadata, _opts), do: false
+
+  defp explicit_marker?(value) when value in [:sol, "sol"], do: true
+  defp explicit_marker?(value) when is_binary(value), do: String.downcase(String.trim(value)) == "sol"
+  defp explicit_marker?(_value), do: false
 
   defp normalize_worker_label(value) when is_binary(value), do: String.downcase(String.trim(value))
   defp normalize_worker_label(value), do: value |> to_string() |> normalize_worker_label()

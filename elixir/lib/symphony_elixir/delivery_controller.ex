@@ -38,9 +38,9 @@ defmodule SymphonyElixir.DeliveryController do
 
       if Enum.all?(argv, &is_binary/1) and is_integer(timeout_ms) and timeout_ms > 0 do
         try do
+          # Use the portable seconds form: this host's timeout accepts
+          # fractional seconds but rejects the millisecond suffix here.
           {output, status} =
-            # Use the portable seconds form: this host's timeout accepts
-            # fractional seconds but rejects the millisecond suffix here.
             System.cmd("timeout", ["--signal=TERM", "--kill-after=0.1s", timeout_duration(timeout_ms), "git" | argv],
               cd: cwd,
               stderr_to_stdout: true,
@@ -923,12 +923,20 @@ defmodule SymphonyElixir.DeliveryController do
   defp provider_error?({:github, reason}), do: provider_error?(reason)
   defp provider_error?({:provider, _reason}), do: true
   defp provider_error?({:rate_limited, _reason}), do: true
+  defp provider_error?({:command, _argv, reason}), do: provider_error?(reason)
   defp provider_error?({:github_rate_limited, _reset_at, _retry_after}), do: true
   defp provider_error?({:github_provider_unavailable, _details}), do: true
 
   defp provider_error?(reason) when is_map(reason) do
-    value(reason, :provider_error) == true or value(reason, :rate_limited) == true
+    status = value(reason, :status)
+
+    value(reason, :provider_error) == true or
+      value(reason, :rate_limited) == true or
+      status in [408, 429]
   end
+
+  defp provider_error?(:rate_limited), do: true
+  defp provider_error?(:timeout), do: true
 
   defp provider_error?(_reason), do: false
 end

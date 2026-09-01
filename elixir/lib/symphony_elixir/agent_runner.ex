@@ -45,7 +45,8 @@ defmodule SymphonyElixir.AgentRunner do
 
         case existing_delivery_retry(issue, workspace) do
           {:ok, delivery} ->
-            retry_existing_delivery(delivery, issue, worker_host, codex_update_recipient, opts)
+            retry_opts = Keyword.put(opts, :model, delivery_retry_model(issue, delivery))
+            retry_existing_delivery(delivery, issue, worker_host, codex_update_recipient, retry_opts)
 
           :none ->
             with :ok <- prepare_delivery_for_model_retry(issue, workspace, worker_host, codex_update_recipient, opts),
@@ -410,12 +411,22 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp existing_delivery_retry(issue, workspace) do
     case DeliveryController.load(delivery_runtime_dir(), issue.id) do
-      {:ok, %Delivery{state: :retry_ready, last_event: :delivery_failed, workspace: ^workspace} = delivery} ->
+      {:ok, %Delivery{state: :retry_ready, workspace: ^workspace} = delivery} ->
         {:ok, delivery}
 
       _ ->
         :none
     end
+  end
+
+  defp delivery_retry_model(issue, %Delivery{} = delivery) do
+    failure = List.first(delivery.failures) || %{}
+    failure_class = Map.get(failure, :classification) || Map.get(failure, "classification")
+
+    Config.codex_model_for_issue(issue,
+      failure_attempt: delivery.attempt,
+      failure_class: failure_class
+    )
   end
 
   defp prepare_delivery_for_model_retry(issue, workspace, worker_host, recipient, opts) do

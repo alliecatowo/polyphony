@@ -137,6 +137,30 @@ defmodule SymphonyElixir.DeliveryControllerTest do
     assert restored.state == :delivering
   end
 
+  test "deterministic GitHub API errors become counted delivery failures, not provider waits", %{runtime_dir: runtime_dir} do
+    github = %{
+      find_or_create_pull_request: fn _ -> {:error, {:github_api_error, %{status: 400, kind: :api_error}}} end,
+      enable_auto_merge: fn _, _ -> flunk("auto merge must not run") end
+    }
+
+    {:ok, pid} =
+      start_controller(
+        runtime_dir,
+        "/work/issue-github-api",
+        "agent/issue-github-api",
+        command_adapter(self(), "/work/issue-github-api", "agent/issue-github-api", []),
+        github,
+        fn _ -> :ok end
+      )
+
+    assert {:error, {:github, {:github_api_error, %{status: 400}}}, delivery} =
+             DeliveryController.codex_turn_completed(pid)
+
+    assert delivery.state == :retry_ready
+    assert delivery.attempt == 1
+    refute delivery.state == :waiting_provider
+  end
+
   test "provider recovery resumes the interrupted delivery protocol", %{runtime_dir: runtime_dir} do
     calls = Agent.start_link(fn -> 0 end) |> elem(1)
     workspace = "/work/issue-provider-resume"
