@@ -25,6 +25,7 @@ defmodule SymphonyElixirWeb.Presenter do
 
         payload
         |> maybe_put_snapshot(snapshot, :deliveries, &delivery_payloads/1)
+        |> maybe_put_snapshot(snapshot, :capacity)
         |> maybe_put_snapshot(snapshot, :github_api)
         |> maybe_put_snapshot(snapshot, :github_events)
         |> maybe_put_snapshot(snapshot, :polling)
@@ -60,6 +61,7 @@ defmodule SymphonyElixirWeb.Presenter do
 
     payload
     |> maybe_put_snapshot(snapshot, :deliveries, &delivery_payloads/1)
+    |> maybe_put_snapshot(snapshot, :capacity)
     |> maybe_put_snapshot(snapshot, :github_api)
     |> maybe_put_snapshot(snapshot, :github_events)
     |> maybe_put_snapshot(snapshot, :polling)

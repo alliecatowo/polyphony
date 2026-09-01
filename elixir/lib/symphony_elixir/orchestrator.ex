@@ -1506,9 +1506,25 @@ defmodule SymphonyElixir.Orchestrator do
       if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
         dispatch_issue(state_acc, issue, nil, nil, board_context(issues), orchestrator)
       else
+        Logger.debug("Skipping dispatch: #{issue_context(issue)} reason=#{dispatch_skip_reason(issue, state_acc, active_states, terminal_states)}")
         state_acc
       end
     end)
+  end
+
+  defp dispatch_skip_reason(issue, state, active_states, terminal_states) do
+    cond do
+      not control_admits?(state, :worker) -> "control_state"
+      not candidate_issue?(issue, active_states, terminal_states) -> "not_candidate"
+      active_issue_blocked_by_non_terminal?(issue, active_states, terminal_states) -> "blocked_by_dependency"
+      MapSet.member?(state.claimed, issue.id) -> "claimed"
+      Delivery.terminal?(get_in(state.deliveries, [issue.id, Access.key(:state)])) -> "terminal_delivery"
+      Map.has_key?(state.running, issue.id) -> "already_running"
+      available_slots(state) == 0 -> "agent_capacity"
+      not state_slots_available?(issue, state.running) -> "state_capacity"
+      not worker_slots_available?(state) -> "worker_capacity"
+      true -> "unknown"
+    end
   end
 
   defp sort_issues_for_dispatch(issues) when is_list(issues) do
@@ -2828,6 +2844,14 @@ defmodule SymphonyElixir.Orchestrator do
     snapshot = %{
        running: running,
        retrying: retrying,
+       capacity: %{
+         max_concurrent_agents: state.max_concurrent_agents || Config.settings!().agent.max_concurrent_agents,
+         running: map_size(state.running),
+         reservations: map_size(state.reservations),
+         claimed: MapSet.size(state.claimed),
+         available_slots: available_slots(state),
+         worker_slots_available?: worker_slots_available?(state)
+       },
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        github_api:
