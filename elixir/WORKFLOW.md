@@ -188,6 +188,7 @@ Instructions:
   harness restores it after the turn.
 - The worker owns investigation, implementation, local validation, and concise handoff notes only.
 - Polyphony's harness owns `git commit`, `git push`, pull-request creation/update, auto-merge, CI observation, retries, escalation, and workspace cleanup. Never perform those harness operations from this turn.
+- Never invoke `gh`, curl, a browser login, or any other remote GitHub write/read workflow from the worker. The harness supplies the issue context and owns all tracker mutations; a temporary GitHub outage must not consume the turn. Record any remote blocker in the local workpad and continue with local work when possible.
 - Never wait for or poll CI, deployments, reviews, mergeability, or a human decision. Query remote state once when needed for context; after local validation, return control immediately so the token-free harness can observe events.
 - If an issue already has a PR and there is actionable feedback, make and validate the required local correction. If it is merely waiting for CI/review/merge or its branch is not the provided workspace branch, record that state and return immediately without repeated remote queries.
 - One turn should complete one coherent local slice. An active tracker state is not a reason to keep the model alive after the slice is locally validated or externally blocked.
@@ -196,6 +197,9 @@ Instructions:
   process, or a sandbox/project-boundary error, do not retry the same command.
   Record the exact error as a harness/environment blocker, perform at most one
   alternate read-only probe from the current directory, and return control.
+- If the issue is broad, lacks actionable acceptance criteria, or is explicitly
+  blocked by a product/design decision, write a concise local handoff and stop;
+  do not spend the turn inventing a design or implementing an entire subsystem.
 - Keep one turn bounded to six tool calls total and three GitHub requests total.
   Use focused commands rather than exploratory dumps. Once the acceptance
   criteria and required local validation are green, stop immediately with the
