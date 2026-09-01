@@ -207,7 +207,19 @@ defmodule SymphonyElixir.ControlState do
         {:ok, current}
 
       :stopping ->
-        {:error, :stop_in_progress}
+        # A hard stop terminates execution immediately, but it deliberately
+        # preserves delivery records so PR/CI progress can be reconciled on
+        # the next run. Do not make those durable delivery obligations turn a
+        # recoverable runtime into a permanent stop.
+        if current.stop_mode == :hard and current.obligations.execution == 0 do
+          {:ok,
+           current
+           |> Map.put(:recovery_target, :running)
+           |> Map.put(:recovery_reason, Keyword.get(opts, :reason, :resume_after_hard_stop))
+           |> move_to(:recovering, opts)}
+        else
+          {:error, :stop_in_progress}
+        end
     end
   end
 

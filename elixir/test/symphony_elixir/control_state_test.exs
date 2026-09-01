@@ -166,6 +166,26 @@ defmodule SymphonyElixir.ControlStateTest do
     refute action.os_kill_performed?
   end
 
+  test "resume after a hard stop enters recovery without dropping delivery obligations" do
+    state =
+      ControlState.new(
+        obligations: %{execution: 0, delivery: 3, cleanup: 0},
+        now_ms: 71
+      )
+
+    assert {:ok, stopping, _action} =
+             ControlState.hard_stop(
+               state,
+               %{project: "patches", cgroup: "user.slice/polyphony-patches"},
+               now_ms: 72
+             )
+
+    assert {:ok, recovering} = ControlState.resume(stopping, now_ms: 73)
+    assert recovering.state == :recovering
+    assert recovering.recovery_target == :running
+    assert recovering.obligations == %{execution: 0, delivery: 3, cleanup: 0}
+  end
+
   test "hard stop refuses an unscoped target and unknown admissions" do
     state = ControlState.new()
 
