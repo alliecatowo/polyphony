@@ -67,7 +67,7 @@ hooks:
 worker:
   # Model profiles are selected per Codex thread below. Polyphony itself runs locally.
   ssh_hosts: []
-  max_concurrent_agents_per_host: 2
+  max_concurrent_agents_per_host: 3
   # Hard limits are applied to each Codex process tree with systemd-run --user.
   # Leave headroom on this workstation's 14 GiB RAM / 16 CPU threads while
   # allowing concurrent builds and test suites.
@@ -76,9 +76,9 @@ worker:
   tasks_max: 1536
   cgroup_required: true
 agent:
-  # Keep the acceptance pool at one until issue -> PR -> CI -> merge -> cleanup
-  # and provider-budget invariants have passed end to end.
-  max_concurrent_agents: 2
+  # Three workers are enabled after the first end-to-end issue -> PR -> CI ->
+  # merge proof passed. The systemd/cgroup limits remain the hard safety bound.
+  max_concurrent_agents: 3
   # One execution turn owns the slot. The harness then delivers and parks on
   # CI/merge webhooks; a red result resumes the same workspace/session.
   max_turns: 1
