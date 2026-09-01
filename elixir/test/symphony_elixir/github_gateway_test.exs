@@ -3,7 +3,7 @@ defmodule SymphonyElixir.GitHub.GatewayTest do
 
   alias SymphonyElixir.GitHub.Gateway
 
-  test "executes the request closure in the requesting process" do
+  test "executes the request closure in an isolated process" do
     name = Module.concat(__MODULE__, "Caller#{System.unique_integer([:positive])}")
     start_supervised!({Gateway, name: name})
     caller = self()
@@ -18,7 +18,8 @@ defmodule SymphonyElixir.GitHub.GatewayTest do
                server: name
              )
 
-    assert_receive {:closure_process, ^caller}
+    assert_receive {:closure_process, closure_pid}
+    refute closure_pid == caller
   end
 
   test "one rate-limit response prevents every queued caller from reaching GitHub" do
@@ -160,5 +161,98 @@ defmodule SymphonyElixir.GitHub.GatewayTest do
 
     assert :counters.get(active, 2) == 1
     assert Gateway.snapshot(name).request_count == 20
+  end
+
+  test "an execution timeout opens the provider circuit and rejects queued work" do
+    name = Module.concat(__MODULE__, "ExecutionTimeout#{System.unique_integer([:positive])}")
+    start_supervised!({Gateway, name: name})
+    caller = self()
+    counter = :counters.new(1, [])
+
+    first =
+      Task.async(fn ->
+        Gateway.request(
+          :rest,
+          fn ->
+            send(caller, :hung_request_started)
+
+            receive do
+              :never -> :ok
+            end
+          end,
+          server: name,
+          timeout_ms: 20
+        )
+      end)
+
+    assert_receive :hung_request_started
+
+    second =
+      Task.async(fn ->
+        Gateway.request(
+          :rest,
+          fn ->
+            :counters.add(counter, 1, 1)
+            {:ok, %{status: 200, headers: %{}, body: %{}}}
+          end,
+          server: name,
+          timeout_ms: 20
+        )
+      end)
+
+    assert {:error, {:github_provider_unavailable, %{kind: :circuit_open, retry_in_ms: retry_in_ms}}} =
+             Task.await(first)
+
+    assert retry_in_ms > 0
+
+    assert {:error, {:github_provider_unavailable, %{kind: :circuit_open, retry_in_ms: retry_in_ms}}} =
+             Task.await(second)
+
+    assert retry_in_ms > 0
+    assert :counters.get(counter, 1) == 0
+    assert Gateway.snapshot(name).circuit == :open
+    assert Gateway.snapshot(name).circuit_kind == :provider_unavailable
+  end
+
+  test "a queued caller receives a provider-wait error when acquisition expires" do
+    name = Module.concat(__MODULE__, "QueueTimeout#{System.unique_integer([:positive])}")
+    start_supervised!({Gateway, name: name})
+    caller = self()
+
+    first =
+      Task.async(fn ->
+        Gateway.request(
+          :rest,
+          fn ->
+            send(caller, {:slow_request_started, self()})
+
+            receive do
+              :finish_slow_request -> {:ok, %{status: 200, headers: %{}, body: %{}}}
+            end
+          end,
+          server: name,
+          timeout_ms: 100
+        )
+      end)
+
+    assert_receive {:slow_request_started, slow_request_pid}
+
+    queued =
+      Task.async(fn ->
+        Gateway.request(
+          :rest,
+          fn -> {:ok, %{status: 200, headers: %{}, body: %{}}} end,
+          server: name,
+          timeout_ms: 10,
+          queue_timeout_ms: 10
+        )
+      end)
+
+    assert {:error, {:github_provider_unavailable, %{kind: :queue_timeout, timeout_ms: 10}}} =
+             Task.await(queued)
+
+    send(slow_request_pid, :finish_slow_request)
+    assert {:ok, %{status: 200}} = Task.await(first)
+    assert Gateway.snapshot(name).circuit == :closed
   end
 end

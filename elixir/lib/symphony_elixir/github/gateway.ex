@@ -34,12 +34,13 @@ defmodule SymphonyElixir.GitHub.Gateway do
   def request(resource, fun, opts \\ []) when resource in [:graphql, :rest] and is_function(fun, 0) do
     server = Keyword.get(opts, :server, __MODULE__)
     timeout_ms = Keyword.get(opts, :timeout_ms, @request_timeout_ms)
+    queue_timeout_ms = Keyword.get(opts, :queue_timeout_ms, timeout_ms + 5_000)
     request_id = make_ref()
 
     with :ok <- ensure_started(server) do
-      case acquire(server, resource, request_id, timeout_ms + 5_000) do
+      case acquire(server, resource, request_id, queue_timeout_ms) do
         {:ok, ^request_id} ->
-          result = invoke(fun)
+          result = invoke(fun, timeout_ms)
           GenServer.call(server, {:complete, self(), request_id, result}, timeout_ms + 5_000)
 
         result ->
@@ -155,7 +156,7 @@ defmodule SymphonyElixir.GitHub.Gateway do
     catch
       :exit, {:timeout, _} ->
         GenServer.cast(server, {:cancel, self(), request_id})
-        {:error, {:github_gateway_timeout, timeout_ms}}
+        {:error, {:github_provider_unavailable, %{kind: :queue_timeout, timeout_ms: timeout_ms}}}
     end
   end
 
@@ -228,7 +229,39 @@ defmodule SymphonyElixir.GitHub.Gateway do
 
   defp ensure_started(_server), do: :ok
 
-  defp invoke(fun) do
+  # The request must run outside the caller so a hung transport can be killed
+  # without losing the caller before it reports completion to the gateway.
+  defp invoke(fun, timeout_ms) do
+    parent = self()
+    result_ref = make_ref()
+
+    {pid, monitor_ref} =
+      spawn_monitor(fn ->
+        send(parent, {result_ref, invoke_request(fun)})
+      end)
+
+    receive do
+      {^result_ref, result} ->
+        Process.demonitor(monitor_ref, [:flush])
+        result
+
+      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+        {:error, {:github_request_exit, :exit, inspect_reason(reason)}}
+    after
+      timeout_ms ->
+        Process.exit(pid, :kill)
+
+        receive do
+          {:DOWN, ^monitor_ref, :process, ^pid, _reason} -> :ok
+        after
+          0 -> :ok
+        end
+
+        {:error, {:github_gateway_execution_timeout, timeout_ms}}
+    end
+  end
+
+  defp invoke_request(fun) do
     fun.()
   rescue
     exception -> {:error, {:github_request_exception, exception, __STACKTRACE__}}
@@ -260,6 +293,10 @@ defmodule SymphonyElixir.GitHub.Gateway do
         :success
       end
     end
+  end
+
+  defp classify({:error, {:github_gateway_execution_timeout, timeout_ms}}) do
+    {:provider_unavailable, %{kind: :execution_timeout, timeout_ms: timeout_ms}}
   end
 
   defp classify({:error, reason}) do
