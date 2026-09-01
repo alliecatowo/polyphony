@@ -429,6 +429,28 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
     assert Enum.map(issues, & &1.id) == ["I1", "I2", "I3"]
   end
 
+  test "summarizes GraphQL errors without returning response details" do
+    sensitive_value = "ghs_graphql_response_secret"
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      Req.Test.json(conn, %{
+        "errors" => [
+          %{
+            "message" => "Forbidden request containing #{sensitive_value}",
+            "extensions" => %{"code" => "FORBIDDEN", "requestId" => sensitive_value},
+            "path" => ["viewer", sensitive_value]
+          },
+          %{"message" => "API rate limit exceeded for #{sensitive_value}"}
+        ]
+      })
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+
+    assert {:error, {:github_graphql_errors, [%{"type" => "FORBIDDEN"}, %{"type" => "RATE_LIMIT"}]}} =
+             Client.fetch_issue_states_by_ids(["I-ERROR"])
+  end
+
   test "fetch_issue_states_by_ids materializes project Status for dispatch revalidation" do
     Req.Test.stub(__MODULE__, fn conn ->
       Req.Test.json(conn, %{

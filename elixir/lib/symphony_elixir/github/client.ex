@@ -872,11 +872,7 @@ defmodule SymphonyElixir.GitHub.Client do
   defp find_owner_project_by_number(_owner_login, _owner_type, _number), do: {:error, :github_project_not_found}
 
   defp create_project_permission_error?(errors) when is_list(errors) do
-    Enum.any?(errors, fn error ->
-      message = to_string(Map.get(error, "message", ""))
-      type = to_string(Map.get(error, "type", ""))
-      type == "FORBIDDEN" and String.contains?(String.downcase(message), "does not have permission to create projects")
-    end)
+    Enum.any?(errors, &(Map.get(&1, "project_create_forbidden") == true))
   end
 
   defp ensure_project_fields(project_id, required_project_fields, tracker) do
@@ -1080,7 +1076,7 @@ defmodule SymphonyElixir.GitHub.Client do
     {:ok, maybe_enrich_issues_with_relationship_signals(issues), %{has_next_page: has_next_page == true, end_cursor: end_cursor}}
   end
 
-  defp decode_repository_page_response(%{"errors" => errors}), do: {:error, {:github_graphql_errors, errors}}
+  defp decode_repository_page_response(%{"errors" => errors}), do: graphql_errors(errors)
   defp decode_repository_page_response(_payload), do: {:error, :github_unknown_payload}
 
   defp decode_project_page_response(
@@ -1128,8 +1124,7 @@ defmodule SymphonyElixir.GitHub.Client do
     {:ok, maybe_enrich_issues_with_relationship_signals(issues), %{has_next_page: has_next_page == true, end_cursor: end_cursor}}
   end
 
-  defp decode_project_page_response(%{"errors" => errors}, _repo_owner, _repo_name),
-    do: {:error, {:github_graphql_errors, errors}}
+  defp decode_project_page_response(%{"errors" => errors}, _repo_owner, _repo_name), do: graphql_errors(errors)
 
   defp decode_project_page_response(_payload, _repo_owner, _repo_name), do: {:error, :github_unknown_payload}
 
@@ -1144,7 +1139,7 @@ defmodule SymphonyElixir.GitHub.Client do
     |> then(&{:ok, &1})
   end
 
-  defp decode_nodes_response(%{"errors" => errors}), do: {:error, {:github_graphql_errors, errors}}
+  defp decode_nodes_response(%{"errors" => errors}), do: graphql_errors(errors)
   defp decode_nodes_response(_payload), do: {:error, :github_unknown_payload}
 
   defp next_page_cursor(%{has_next_page: true, end_cursor: end_cursor})
@@ -1737,7 +1732,7 @@ defmodule SymphonyElixir.GitHub.Client do
 
       {:ok, states}
     else
-      %{"errors" => errors} when is_list(errors) -> {:error, {:github_graphql_errors, errors}}
+      %{"errors" => errors} when is_list(errors) -> graphql_errors(errors)
       {:error, reason} -> {:error, reason}
       _ -> {:error, :github_unknown_payload}
     end
@@ -2180,7 +2175,7 @@ defmodule SymphonyElixir.GitHub.Client do
           {:ok, body}
 
         errors when is_list(errors) ->
-          {:error, {:github_graphql_errors, errors}}
+          graphql_errors(errors)
       end
     end
   end
@@ -2445,10 +2440,81 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp ensure_no_graphql_errors(%{"errors" => errors}) when is_list(errors) and errors != [] do
-    {:error, {:github_graphql_errors, errors}}
+    graphql_errors(errors)
   end
 
   defp ensure_no_graphql_errors(_body), do: :ok
+
+  # GitHub's GraphQL errors can include arbitrary request context. Keep only a
+  # small, closed set of classifications because these terms reach scheduler logs.
+  defp graphql_errors(errors), do: {:error, {:github_graphql_errors, summarize_graphql_errors(errors)}}
+
+  defp summarize_graphql_errors(errors) when is_list(errors), do: Enum.map(errors, &summarize_graphql_error/1)
+  defp summarize_graphql_errors(_errors), do: [%{"type" => "UNKNOWN"}]
+
+  defp summarize_graphql_error(error) when is_map(error) do
+    type = graphql_error_type(error)
+
+    %{"type" => type}
+    |> maybe_mark_project_create_forbidden(error, type)
+  end
+
+  defp summarize_graphql_error(_error), do: %{"type" => "UNKNOWN"}
+
+  defp graphql_error_type(error) do
+    values = [
+      Map.get(error, "type") || Map.get(error, :type),
+      get_in(error, ["extensions", "code"]) || get_in(error, [:extensions, :code]),
+      Map.get(error, "code") || Map.get(error, :code)
+    ]
+
+    cond do
+      Enum.any?(values, &(normalize_graphql_error_value(&1) in ["RATE_LIMIT", "RATE_LIMITED", "GRAPHQL_RATE_LIMIT"])) ->
+        "RATE_LIMIT"
+
+      Enum.any?(values, &(normalize_graphql_error_value(&1) == "FORBIDDEN")) ->
+        "FORBIDDEN"
+
+      Enum.any?(values, &(normalize_graphql_error_value(&1) == "UNAUTHORIZED")) ->
+        "UNAUTHORIZED"
+
+      Enum.any?(values, &(normalize_graphql_error_value(&1) == "NOT_FOUND")) ->
+        "NOT_FOUND"
+
+      Enum.any?(values, &(normalize_graphql_error_value(&1) == "BAD_USER_INPUT")) ->
+        "BAD_USER_INPUT"
+
+      graphql_rate_limit_message?(Map.get(error, "message") || Map.get(error, :message)) ->
+        "RATE_LIMIT"
+
+      true ->
+        "UNKNOWN"
+    end
+  end
+
+  defp maybe_mark_project_create_forbidden(summary, error, "FORBIDDEN") do
+    if project_create_forbidden_message?(Map.get(error, "message") || Map.get(error, :message)) do
+      Map.put(summary, "project_create_forbidden", true)
+    else
+      summary
+    end
+  end
+
+  defp maybe_mark_project_create_forbidden(summary, _error, _type), do: summary
+
+  defp normalize_graphql_error_value(value) when is_atom(value), do: value |> Atom.to_string() |> normalize_graphql_error_value()
+  defp normalize_graphql_error_value(value) when is_binary(value), do: value |> String.trim() |> String.upcase()
+  defp normalize_graphql_error_value(_value), do: ""
+
+  defp graphql_rate_limit_message?(message) when is_binary(message),
+    do: String.contains?(String.downcase(message), "rate limit")
+
+  defp graphql_rate_limit_message?(_message), do: false
+
+  defp project_create_forbidden_message?(message) when is_binary(message),
+    do: String.contains?(String.downcase(message), "does not have permission to create projects")
+
+  defp project_create_forbidden_message?(_message), do: false
 
   defp required_project_field_specs(required_project_fields, _tracker)
        when is_map(required_project_fields) and map_size(required_project_fields) > 0,
