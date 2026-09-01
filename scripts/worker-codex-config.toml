@@ -1,0 +1,9 @@
+# Minimal project-local Codex profile for unattended Polyphony workers.
+# Polyphony exposes the bounded GitHub tool directly; project MCP servers are
+# intentionally not inherited into workers because their schemas and outputs
+# are replayed into every turn.
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+model_reasoning_effort = "medium"
+
+[mcp_servers]

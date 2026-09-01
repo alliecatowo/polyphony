@@ -55,8 +55,16 @@ hooks:
     base_ref="origin/main"
     git rev-parse --verify "$base_ref" >/dev/null 2>&1 || base_ref=HEAD
     git switch --create "agent/polyphony-${issue_id}" "$base_ref"
+    if [ -n "${POLYPHONY_WORKER_CODEX_CONFIG:-}" ] && [ -f "$POLYPHONY_WORKER_CODEX_CONFIG" ]; then
+      mkdir -p .codex
+      cp "$POLYPHONY_WORKER_CODEX_CONFIG" .codex/config.toml
+    fi
   before_run: |
     issue_id="$(basename "$PWD")"
+    if [ -n "${POLYPHONY_WORKER_CODEX_CONFIG:-}" ] && [ -f "$POLYPHONY_WORKER_CODEX_CONFIG" ]; then
+      mkdir -p .codex
+      cp "$POLYPHONY_WORKER_CODEX_CONFIG" .codex/config.toml
+    fi
     mkdir -p "docs/issues/${issue_id}/logs" "docs/issues/${issue_id}/evidence" "docs/issues/${issue_id}/decisions" "docs/issues/${issue_id}/spikes"
     printf '%s phase=before_run workspace=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" >> "docs/issues/${issue_id}/run-log.md"
   after_run: |
