@@ -2569,7 +2569,7 @@ defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, wor
 
   defp restore_retry_metadata(issue, _metadata), do: issue
 
-  defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
+  defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt >= 0 and is_map(metadata) do
     case metadata[:delay_type] do
       :continuation when attempt == 1 -> @continuation_retry_delay_ms
       :provider -> provider_retry_delay()
@@ -4430,7 +4430,7 @@ defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, wor
       deliveries
       |> Enum.filter(fn
         {_issue_id, %Delivery{state: state, pr_number: pr_number}}
-        when state in [:waiting_ci, :waiting_merge] and is_integer(pr_number) and pr_number > 0 ->
+        when state in [:waiting_ci, :waiting_merge, :retry_ready] and is_integer(pr_number) and pr_number > 0 ->
           true
 
         _ ->
