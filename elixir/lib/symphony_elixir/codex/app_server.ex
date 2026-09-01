@@ -10,6 +10,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @thread_start_id 2
   @thread_resume_id 2
   @turn_start_id 3
+  @turn_interrupt_id 4
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
@@ -139,7 +140,10 @@ defmodule SymphonyElixir.Codex.AppServer do
                on_message,
                tool_executor,
                auto_approve_requests,
-               Keyword.get(opts, :provider_retry_attempt, 0)
+               Keyword.get(opts, :provider_retry_attempt, 0),
+               thread_id,
+               turn_id,
+               Config.settings!().codex.max_total_tokens
              ) do
           {:ok, result} ->
             Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
@@ -444,7 +448,18 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests, retry_attempt) do
+  defp await_turn_completion(
+         port,
+         on_message,
+         tool_executor,
+         auto_approve_requests,
+         retry_attempt,
+         thread_id,
+         turn_id,
+         token_limit
+       ) do
+    Process.delete(:symphony_codex_token_budget_exceeded)
+
     receive_loop(
       port,
       on_message,
@@ -452,15 +467,31 @@ defmodule SymphonyElixir.Codex.AppServer do
       "",
       tool_executor,
       auto_approve_requests,
-      retry_attempt
+      retry_attempt,
+      thread_id,
+      turn_id,
+      token_limit,
+      false
     )
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, retry_attempt) do
+  defp receive_loop(
+         port,
+         on_message,
+         timeout_ms,
+         pending_line,
+         tool_executor,
+         auto_approve_requests,
+         retry_attempt,
+         thread_id,
+         turn_id,
+         token_limit,
+         interrupt_sent?
+       ) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests, retry_attempt)
+        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests, retry_attempt, thread_id, turn_id, token_limit, interrupt_sent?)
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
@@ -470,7 +501,11 @@ defmodule SymphonyElixir.Codex.AppServer do
           pending_line <> to_string(chunk),
           tool_executor,
           auto_approve_requests,
-          retry_attempt
+          retry_attempt,
+          thread_id,
+          turn_id,
+          token_limit,
+          interrupt_sent?
         )
 
       {^port, {:exit_status, status}} ->
@@ -481,13 +516,18 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests, retry_attempt) do
+  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests, retry_attempt, thread_id, turn_id, token_limit, interrupt_sent?) do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
         emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-        {:ok, :turn_completed}
+
+        if Process.get(:symphony_codex_token_budget_exceeded, false) do
+          {:error, {:token_budget_exhausted, token_limit}}
+        else
+          {:ok, :turn_completed}
+        end
 
       {:ok, %{"method" => "turn/failed", "params" => params} = payload} ->
         emit_turn_event(
@@ -523,11 +563,13 @@ defmodule SymphonyElixir.Codex.AppServer do
 
           :none ->
             emit_message(on_message, :notification, %{payload: payload, raw: payload_string}, metadata)
-            receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, retry_attempt)
+            receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, retry_attempt, thread_id, turn_id, token_limit, interrupt_sent?)
         end
 
       {:ok, %{"method" => method} = payload}
       when is_binary(method) ->
+        interrupt_sent? = maybe_interrupt_for_token_budget(port, payload, thread_id, turn_id, token_limit, interrupt_sent?)
+
         handle_turn_method(
           port,
           on_message,
@@ -537,7 +579,11 @@ defmodule SymphonyElixir.Codex.AppServer do
           timeout_ms,
           tool_executor,
           auto_approve_requests,
-          retry_attempt
+          retry_attempt,
+          thread_id,
+          turn_id,
+          token_limit,
+          interrupt_sent?
         )
 
       {:ok, payload} ->
@@ -551,7 +597,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata_from_message(port, payload)
         )
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, retry_attempt)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, retry_attempt, thread_id, turn_id, token_limit, interrupt_sent?)
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -568,7 +614,58 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
         end
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, retry_attempt)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, retry_attempt, thread_id, turn_id, token_limit, interrupt_sent?)
+    end
+  end
+
+  defp maybe_interrupt_for_token_budget(_port, _payload, _thread_id, _turn_id, limit, sent?)
+       when not is_integer(limit) or limit <= 0 or sent?,
+       do: sent?
+
+  defp maybe_interrupt_for_token_budget(port, payload, thread_id, turn_id, limit, false) do
+    case total_tokens_from_payload(payload) do
+      total when is_integer(total) and total >= limit ->
+        Logger.warning(
+          "Interrupting Codex turn at token budget thread_id=#{thread_id} turn_id=#{turn_id} " <>
+            "total_tokens=#{total} limit=#{limit}"
+        )
+
+        send_message(port, %{
+          "method" => "turn/interrupt",
+          "id" => @turn_interrupt_id,
+          "params" => %{"threadId" => thread_id, "turnId" => turn_id}
+        })
+
+        Process.put(:symphony_codex_token_budget_exceeded, true)
+        true
+
+      _ ->
+        false
+    end
+  end
+
+  defp total_tokens_from_payload(payload) when is_map(payload) do
+    [
+      ["params", "tokenUsage", "total"],
+      ["params", "msg", "payload", "info", "total_token_usage"],
+      ["tokenUsage", "total"],
+      ["totalTokens"]
+    ]
+    |> Enum.find_value(fn path ->
+      case get_in(payload, path) do
+        value when is_integer(value) -> value
+        value when is_binary(value) -> parse_integer(value)
+        _ -> nil
+      end
+    end)
+  end
+
+  defp total_tokens_from_payload(_payload), do: nil
+
+  defp parse_integer(value) do
+    case Integer.parse(value) do
+      {integer, ""} -> integer
+      _ -> nil
     end
   end
 
@@ -594,7 +691,11 @@ defmodule SymphonyElixir.Codex.AppServer do
          timeout_ms,
          tool_executor,
          auto_approve_requests,
-         retry_attempt
+         retry_attempt,
+         thread_id,
+         turn_id,
+         token_limit,
+         interrupt_sent?
        ) do
     metadata = metadata_from_message(port, payload)
 
@@ -619,7 +720,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_input_required, payload}}
 
       :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, retry_attempt)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, retry_attempt, thread_id, turn_id, token_limit, interrupt_sent?)
 
       :approval_required ->
         emit_message(
@@ -653,7 +754,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
 
           Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, retry_attempt)
+          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, retry_attempt, thread_id, turn_id, token_limit, interrupt_sent?)
         end
     end
   end

@@ -708,11 +708,6 @@ defmodule SymphonyElixir.Orchestrator do
 
       running_entry = Map.put(running_entry, :token_budget_exceeded, true)
 
-      case Map.get(running_entry, :pid) do
-        pid when is_pid(pid) -> terminate_task(pid)
-        _ -> :ok
-      end
-
       running_entry
     else
       running_entry
