@@ -2355,6 +2355,16 @@ defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, wor
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
         cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
+
+        state =
+          case Map.get(state.deliveries, issue_id) do
+            %Delivery{state: :retry_ready} = delivery ->
+              terminalize_closed_delivery(state, issue_id, delivery, issue.state)
+
+            _ ->
+              state
+          end
+
         {:noreply, release_issue_claim(state, issue_id)}
 
       retry_candidate_issue?(issue, terminal_states) or delivery_retry? ->
@@ -2379,6 +2389,30 @@ defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, wor
   end
 
   defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok
+
+  defp terminalize_closed_delivery(%State{} = state, issue_id, %Delivery{} = delivery, issue_state) do
+    reason = {:issue_terminal, issue_state}
+
+    case persist_permanent_delivery_failure(issue_id, delivery, reason) do
+      {:ok, failed_delivery} ->
+        Logger.info(
+          "Marked retry-ready delivery terminal because issue is no longer active " <>
+            "issue_id=#{issue_id} state=#{issue_state}"
+        )
+
+        state
+        |> Map.put(:deliveries, Map.put(state.deliveries, issue_id, failed_delivery))
+        |> complete_issue(issue_id)
+
+      {:error, persist_reason} ->
+        Logger.error(
+          "Unable to terminalize closed issue delivery issue_id=#{issue_id}: " <>
+            "#{inspect(persist_reason)}; clearing retry without redispatch"
+        )
+
+        complete_issue(state, issue_id)
+    end
+  end
 
   defp run_terminal_workspace_cleanup(deliveries) do
     terminal_delivery_identifiers(deliveries)
@@ -3826,6 +3860,20 @@ defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, wor
         send(self(), :complete_control_recovery)
         control
 
+      {:ok, %ControlState{state: :stopping} = control} ->
+        # A scoped hard stop can leave durable delivery records waiting on CI
+        # or merge state after all execution workers have been terminated.
+        # Recover that state on daemon restart instead of preserving a
+        # permanently non-resumable stopping state.
+        case ControlState.resume(control, reason: :restart_after_hard_stop) do
+          {:ok, recovering} ->
+            send(self(), :complete_control_recovery)
+            recovering
+
+          {:error, _reason} ->
+            control
+        end
+
       {:ok, %ControlState{} = control} ->
         control
 
@@ -4046,6 +4094,18 @@ defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, wor
   defp apply_delivery_reconcile(state, issue_id, delivery, summary) do
     delivery = refresh_delivery_head(delivery, summary)
 
+    case {delivery.state, Map.get(summary, :status), Map.get(summary, :reason)} do
+      {:retry_ready, :failed, :pull_request_closed} ->
+        state
+        |> terminalize_closed_delivery(issue_id, delivery, :pull_request_closed)
+        |> refresh_control_obligations()
+
+      _ ->
+        apply_delivery_reconcile_result(state, issue_id, delivery, summary)
+    end
+  end
+
+  defp apply_delivery_reconcile_result(state, issue_id, delivery, summary) do
     case reconcile_delivery(delivery, summary) do
       {:ok, %Delivery{} = reconciled} ->
         state
@@ -4117,6 +4177,34 @@ defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, wor
   defp apply_reconciled_delivery_state(state, issue_id, %Delivery{state: :retry_ready} = delivery) do
     retry_limit = Config.max_delivery_retry_attempts()
 
+    if pull_request_closed_failure?(delivery.failure_reason) do
+      reason = {:pull_request_closed, delivery.failure_reason}
+
+      case persist_permanent_delivery_failure(issue_id, delivery, reason) do
+        {:ok, failed_delivery} ->
+          Logger.info(
+            "Marked closed pull request delivery terminal; refusing redispatch " <>
+              "issue_id=#{issue_id} pr_number=#{inspect(delivery.pr_number)}"
+          )
+
+          state
+          |> Map.put(:deliveries, Map.put(state.deliveries, issue_id, failed_delivery))
+          |> complete_issue(issue_id)
+
+        {:error, persist_reason} ->
+          Logger.error(
+            "Could not persist closed pull request delivery issue_id=#{issue_id}: " <>
+              "#{inspect(persist_reason)}; refusing retry"
+          )
+
+          complete_issue(state, issue_id)
+      end
+    else
+      apply_retry_ready_delivery(state, issue_id, delivery, retry_limit)
+    end
+  end
+
+  defp apply_retry_ready_delivery(state, issue_id, %Delivery{} = delivery, retry_limit) do
     if delivery_retry_budget_exhausted?(delivery, retry_limit) do
       reason = {:delivery_retry_budget_exhausted, retry_limit, delivery.failure_reason}
 
@@ -4176,6 +4264,11 @@ defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, wor
   defp apply_reconciled_delivery_state(state, issue_id, %Delivery{}) do
     %{state | claimed: MapSet.put(state.claimed, issue_id)}
   end
+
+  defp pull_request_closed_failure?(%{reason: :pull_request_closed}), do: true
+  defp pull_request_closed_failure?(%{"reason" => "pull_request_closed"}), do: true
+  defp pull_request_closed_failure?({:pull_request_closed, _details}), do: true
+  defp pull_request_closed_failure?(_reason), do: false
 
   defp resume_provider_waits(%State{} = state), do: resume_provider_waits(state, github_gateway_ready?())
 
@@ -4384,7 +4477,7 @@ defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, wor
   defp reconcilable_delivery_count(deliveries) do
     Enum.count(deliveries, fn
       {_issue_id, %Delivery{state: state, pr_number: pr_number}}
-      when state in [:waiting_ci, :waiting_merge] and is_integer(pr_number) and pr_number > 0 ->
+      when state in [:waiting_ci, :waiting_merge, :retry_ready] and is_integer(pr_number) and pr_number > 0 ->
         true
 
       _ ->
@@ -4476,6 +4569,13 @@ defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, wor
 
   defp schedule_loaded_delivery_retries(%State{} = state) do
     Enum.reduce(state.deliveries, state, fn
+      {_issue_id, %Delivery{state: :retry_ready, pr_number: pr_number}}, state
+      when is_integer(pr_number) and pr_number > 0 ->
+        # Reconcile an existing PR before retry admission. A restart can
+        # recover an executing delivery as retry_ready while its PR has since
+        # been closed; scheduling here would redispatch stale work first.
+        state
+
       {issue_id, %Delivery{state: :retry_ready} = delivery}, state ->
         apply_reconciled_delivery_state(state, issue_id, delivery)
 
