@@ -18,6 +18,7 @@ defmodule SymphonyElixir.Orchestrator do
   @type tracker_issue :: GitHubIssue.t() | LinearIssue.t()
 
   @continuation_retry_delay_ms 1_000
+  @admission_retry_delay_ms 5_000
   @failure_retry_base_ms 10_000
   @github_rate_limit_fallback_ms 60_000
   @github_rate_limit_max_backoff_ms 900_000
@@ -1958,6 +1959,21 @@ defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, wor
         Logger.debug("Owner rejected worker reservation for #{issue_context(issue)}: issue or slice already claimed")
         state
 
+      {:error, {:owner_unavailable, reason}} ->
+        Logger.warning("Owner unavailable while reserving #{issue_context(issue)}; preserving dispatch for retry: #{inspect(reason)}")
+
+        schedule_issue_retry(
+          state,
+          issue.id,
+          normalize_retry_attempt(attempt),
+          %{
+            identifier: issue.identifier,
+            error: "worker admission unavailable: #{inspect(reason)}",
+            worker_host: worker_host,
+            delay_type: :admission
+          }
+        )
+
       {:error, reason} ->
         Logger.warning("Owner rejected worker reservation for #{issue_context(issue)}: #{inspect(reason)}")
         state
@@ -2524,6 +2540,7 @@ defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, wor
       :continuation when attempt == 1 -> @continuation_retry_delay_ms
       :provider -> provider_retry_delay()
       :control -> 900_000
+      :admission -> @admission_retry_delay_ms
       _ -> failure_retry_delay(attempt)
     end
   end
