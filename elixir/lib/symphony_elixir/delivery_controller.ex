@@ -385,7 +385,17 @@ defmodule SymphonyElixir.DeliveryController do
   defp maybe_commit(_state, status), do: {:error, {:git_diff_failed, status}}
 
   defp push(state) do
-    git_ok(state, ["push", "--set-upstream", "origin", expected_branch(state)])
+    branch = expected_branch(state)
+
+    # Agent branches are owned by this delivery, but a resumed delivery may
+    # find a ref left by an earlier attempt. Refresh the remote tracking ref
+    # first, then use a lease-protected overwrite so stale local history cannot
+    # make an otherwise valid delivery retry forever. The lease still rejects
+    # a concurrent external update that happens after this fetch.
+    with :ok <- git_ok(state, ["fetch", "origin", "--prune"]),
+         :ok <- git_ok(state, ["push", "--force-with-lease", "--set-upstream", "origin", branch]) do
+      :ok
+    end
   end
 
   defp find_or_create_pr(state, commit_sha) do

@@ -389,7 +389,8 @@ defmodule SymphonyElixir.DeliveryControllerTest do
         ["diff", "--cached", "--quiet"] -> if(status == [], do: {:ok, "", 0}, else: {:ok, "", 1})
         ["commit", "-m", _message] -> {:ok, "[branch commit]\n", 0}
         ["rev-parse", "HEAD"] -> {:ok, "commit-42\n", 0}
-        ["push", "--set-upstream", "origin", ^branch] -> {:ok, "pushed\n", 0}
+        ["fetch", "origin", "--prune"] -> {:ok, "fetched\n", 0}
+        ["push", "--force-with-lease", "--set-upstream", "origin", ^branch] -> {:ok, "pushed\n", 0}
         _ -> flunk("unexpected argv: #{inspect(argv)}")
       end
     end
