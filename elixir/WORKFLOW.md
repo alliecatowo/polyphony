@@ -87,7 +87,10 @@ agent:
   # the worker pool indefinitely.
   max_delivery_retry_attempts: 3
 codex:
-  command: codex --config shell_environment_policy.inherit=all app-server
+  # Browser MCP is opt-in for interactive work; unattended issue workers use
+  # the lightweight shared app-server profile unless a future worker role
+  # explicitly provisions browser access.
+  command: codex --config mcp_servers.playwright.enabled=false --config shell_environment_policy.inherit=all app-server
   shared_app_server: true
   read_timeout_ms: 30000
   models:
@@ -103,7 +106,10 @@ codex:
   # Bound one model turn so a pathological context/tool loop cannot consume
   # the whole account allowance. The harness preserves the workspace and
   # retries/escalates after the worker exits.
-  max_total_tokens: 750000
+  # Keep one pathological turn below the Luna context cliff. Retries preserve
+  # the workspace and delivery evidence instead of replaying an unbounded
+  # transcript.
+  max_total_tokens: 250000
 server:
   host: "127.0.0.1"
   port: 4000

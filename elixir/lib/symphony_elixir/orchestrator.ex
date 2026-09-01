@@ -1655,7 +1655,7 @@ defmodule SymphonyElixir.Orchestrator do
     issues
     |> Enum.filter(&is_map/1)
     |> Enum.sort_by(fn issue -> {priority_rank(Map.get(issue, :priority)), issue_created_at_sort_key(issue)} end)
-    |> Enum.take(24)
+    |> Enum.take(12)
     |> Enum.map_join("\n", fn issue ->
       fields =
         issue

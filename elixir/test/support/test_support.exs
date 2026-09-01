@@ -120,7 +120,7 @@ defmodule SymphonyElixir.TestSupport do
           codex_turn_timeout_ms: 3_600_000,
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
-          codex_max_total_tokens: 750_000,
+          codex_max_total_tokens: 250_000,
           hook_after_create: nil,
           hook_before_run: nil,
           hook_after_run: nil,
