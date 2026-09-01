@@ -1,0 +1,6 @@
+# Minimal unattended profile for Polyphony's shared local app-server.
+# Authentication is linked by launch-patches.sh from the user's normal Codex
+# home; no API key or copied credential is stored here.
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+model_reasoning_effort = "medium"

@@ -3,3 +3,5 @@
 .runtime-launch.log
 erl_crash.dump
 scripts/__pycache__/
+.runtime-codex/
+.runtime-tmp/

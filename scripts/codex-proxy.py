@@ -72,7 +72,14 @@ def parse_frame(buffer: bytearray):
 
 
 def main() -> int:
-    socket_path = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/.codex/app-server-control/app-server-control.sock")
+    socket_path = sys.argv[1] if len(sys.argv) > 1 else os.environ.get(
+        "CODEX_APP_SERVER_SOCKET",
+        os.path.join(
+            os.environ.get("CODEX_HOME", os.path.expanduser("~/.codex")),
+            "app-server-control",
+            "app-server-control.sock",
+        ),
+    )
     key = base64.b64encode(os.urandom(16)).decode("ascii")
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect(socket_path)

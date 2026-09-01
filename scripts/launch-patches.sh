@@ -14,6 +14,24 @@ if [[ -n "$user_home" ]]; then
   export PATH="$user_home/.local/bin:$user_home/.codex/packages/standalone/releases/0.151.0-x86_64-unknown-linux-musl/codex-path:$PATH"
 fi
 
+# Keep the Polyphony app-server isolated from the user's interactive Codex
+# profile. The desktop profile can contain browser/plugin/MCP registrations
+# that are useful interactively but add startup and context overhead to every
+# unattended worker. Reuse the authenticated account without copying tokens
+# into the repository.
+polyphony_codex_home="$repo_root/.runtime-codex"
+mkdir -p "$polyphony_codex_home"
+chmod 700 "$polyphony_codex_home"
+if [[ ! -e "$polyphony_codex_home/auth.json" && -f "$user_home/.codex/auth.json" ]]; then
+  ln -s "$user_home/.codex/auth.json" "$polyphony_codex_home/auth.json"
+fi
+if [[ ! -e "$polyphony_codex_home/packages" && -d "$user_home/.codex/packages" ]]; then
+  ln -s "$user_home/.codex/packages" "$polyphony_codex_home/packages"
+fi
+cp "$repo_root/scripts/polyphony-codex-config.toml" "$polyphony_codex_home/config.toml"
+export CODEX_HOME="$polyphony_codex_home"
+export CODEX_APP_SERVER_SOCKET="$polyphony_codex_home/app-server-control/app-server-control.sock"
+
 if [[ ! -f "$elixir_root/.env" ]]; then
   echo "Polyphony Patches launch refused: $elixir_root/.env is missing" >&2
   exit 1
