@@ -193,15 +193,16 @@ defmodule SymphonyElixir.GitHub.DeliveryAdapter do
 
   defp summarize_pull_request(pull_request, checks_response, commit_sha) do
     check_runs = value(checks_response, :check_runs) || []
+    gate_check_runs = required_gate_check_runs(check_runs)
     merged? = truthy?(value(pull_request, :merged))
     merge_sha = value(pull_request, :merge_commit_sha)
     state = value(pull_request, :state)
     mergeable_state = value(pull_request, :mergeable_state)
 
-    pending = Enum.filter(check_runs, &(value(&1, :status) != "completed"))
+    pending = Enum.filter(gate_check_runs, &(value(&1, :status) != "completed"))
 
     failed =
-      Enum.filter(check_runs, fn check ->
+      Enum.filter(gate_check_runs, fn check ->
         value(check, :status) == "completed" and
           value(check, :conclusion) in [
             "action_required",
@@ -233,6 +234,20 @@ defmodule SymphonyElixir.GitHub.DeliveryAdapter do
       failed != [] -> {:ok, Map.merge(summary, %{status: :failed, reason: :checks_failed})}
       pending != [] or check_runs == [] -> {:ok, Map.put(summary, :status, :pending)}
       true -> {:ok, Map.put(summary, :status, :passed)}
+    end
+  end
+
+  # Repositories may expose many informational checks (preview deploys,
+  # Storybook, performance probes, etc.) alongside the branch-protection gate.
+  # When the repository publishes the conventional aggregate `ci-ok` check,
+  # it is the authoritative required result. Waiting on every check can strand
+  # a deliverable forever when an optional workflow is queued or orphaned.
+  # Repositories without an aggregate gate retain the conservative legacy
+  # behavior and require every check run to settle.
+  defp required_gate_check_runs(check_runs) do
+    case Enum.filter(check_runs, &(value(&1, :name) == "ci-ok")) do
+      [] -> check_runs
+      ci_ok_runs -> ci_ok_runs
     end
   end
 
