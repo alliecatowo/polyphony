@@ -193,6 +193,18 @@ defmodule SymphonyElixir.GitHub.DeliveryAdapterTest do
              DeliveryAdapter.find_or_create_pull_request(attrs(gateway, rate_request, branch: "agent/limited"))
   end
 
+  test "redacts non-success response bodies from API errors", %{gateway: gateway} do
+    secret = "sensitive-provider-response"
+    request = fn :get, _url, _headers, nil -> {:ok, response(400, %{"message" => secret, "token" => secret})} end
+
+    assert {:error, {:github_api_error, metadata}} =
+             DeliveryAdapter.find_or_create_pull_request(attrs(gateway, request, branch: "agent/bad-request"))
+
+    refute Map.has_key?(metadata, :body)
+    refute Map.has_key?(metadata, :message)
+    refute inspect(metadata) =~ secret
+  end
+
   test "classifies a GraphQL permission error without mistaking it for success", %{gateway: gateway} do
     request = fn :post, _url, _headers, _body ->
       {:ok, response(200, %{"data" => nil, "errors" => [%{"type" => "FORBIDDEN", "message" => "permission denied"}]})}

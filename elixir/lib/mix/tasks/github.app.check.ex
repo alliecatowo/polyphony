@@ -1,6 +1,8 @@
 defmodule Mix.Tasks.Github.App.Check do
   use Mix.Task
 
+  alias SymphonyElixir.GitHub.Gateway
+
   @shortdoc "Verify GitHub App auth and installation for configured repo"
 
   @moduledoc """
@@ -69,15 +71,15 @@ defmodule Mix.Tasks.Github.App.Check do
   end
 
   defp fetch_app_info(headers) do
-    case Req.get("https://api.github.com/app", headers: headers) do
+    case github_request("https://api.github.com/app", headers) do
       {:ok, %{status: 200, body: body}} when is_map(body) -> {:ok, body}
-      {:ok, %{status: status, body: body}} -> {:error, "GitHub App auth failed (GET /app status=#{status}) #{error_message(body)}"}
-      {:error, reason} -> {:error, "GitHub App auth request failed: #{inspect(reason)}"}
+      {:ok, %{status: status}} -> {:error, "GitHub App auth failed (GET /app status=#{status})"}
+      {:error, _reason} -> {:error, "GitHub App auth request failed"}
     end
   end
 
   defp ensure_has_installations(headers, app_info) do
-    case Req.get("https://api.github.com/app/installations", headers: headers) do
+    case github_request("https://api.github.com/app/installations", headers) do
       {:ok, %{status: 200, body: body}} when is_list(body) ->
         if body == [] do
           slug = app_info["slug"] || "your-app"
@@ -86,18 +88,18 @@ defmodule Mix.Tasks.Github.App.Check do
           :ok
         end
 
-      {:ok, %{status: status, body: body}} ->
-        {:error, "Failed to list app installations (status=#{status}) #{error_message(body)}"}
+      {:ok, %{status: status}} ->
+        {:error, "Failed to list app installations (status=#{status})"}
 
-      {:error, reason} ->
-        {:error, "Failed to list app installations: #{inspect(reason)}"}
+      {:error, _reason} ->
+        {:error, "Failed to list app installations"}
     end
   end
 
   defp ensure_repo_installation(headers, owner, repo, app_info) do
     url = "https://api.github.com/repos/#{owner}/#{repo}/installation"
 
-    case Req.get(url, headers: headers) do
+    case github_request(url, headers) do
       {:ok, %{status: 200}} ->
         :ok
 
@@ -108,12 +110,16 @@ defmodule Mix.Tasks.Github.App.Check do
          "App is not installed on #{owner}/#{repo}. Install and grant access to this repository: " <>
            "https://github.com/apps/#{slug}/installations/new"}
 
-      {:ok, %{status: status, body: body}} ->
-        {:error, "Repo installation lookup failed for #{owner}/#{repo} (status=#{status}) #{error_message(body)}"}
+      {:ok, %{status: status}} ->
+        {:error, "Repo installation lookup failed for #{owner}/#{repo} (status=#{status})"}
 
-      {:error, reason} ->
-        {:error, "Repo installation lookup failed for #{owner}/#{repo}: #{inspect(reason)}"}
+      {:error, _reason} ->
+        {:error, "Repo installation lookup failed for #{owner}/#{repo}"}
     end
+  end
+
+  defp github_request(url, headers) do
+    Gateway.request(:rest, fn -> Req.get(url, headers: headers) end)
   end
 
   defp github_headers(jwt) do
@@ -123,15 +129,6 @@ defmodule Mix.Tasks.Github.App.Check do
       {"X-GitHub-Api-Version", "2022-11-28"}
     ]
   end
-
-  defp error_message(body) when is_map(body) do
-    case body["message"] do
-      message when is_binary(message) -> "message=#{message}"
-      _ -> ""
-    end
-  end
-
-  defp error_message(_), do: ""
 
   defp base64url_json(map) when is_map(map) do
     map |> Jason.encode!() |> base64url()

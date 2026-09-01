@@ -133,13 +133,13 @@ defmodule SymphonyElixir.GitHub.DeliveryAdapter do
 
     cond do
       not positive_integer?(number) ->
-        {:error, {:invalid_pull_request_proof, %{reason: :missing_number, response: pr}}}
+        {:error, {:invalid_pull_request_proof, %{reason: :missing_number}}}
 
       not is_binary(head) or String.trim(head) == "" ->
-        {:error, {:invalid_pull_request_proof, %{reason: :missing_head, response: pr}}}
+        {:error, {:invalid_pull_request_proof, %{reason: :missing_head}}}
 
       not is_binary(node_id) or String.trim(node_id) == "" ->
-        {:error, {:invalid_pull_request_proof, %{reason: :missing_node_id, response: pr}}}
+        {:error, {:invalid_pull_request_proof, %{reason: :missing_node_id}}}
 
       true ->
         repository =
@@ -265,8 +265,8 @@ defmodule SymphonyElixir.GitHub.DeliveryAdapter do
             pull_request -> {:ok, pull_request}
           end
 
-        {:ok, body} ->
-          {:error, {:github_api_error, %{kind: :invalid_pull_request_list, body: body}}}
+        {:ok, _body} ->
+          {:error, {:github_api_error, %{kind: :invalid_pull_request_list}}}
 
         {:error, reason} ->
           {:error, reason}
@@ -303,8 +303,8 @@ defmodule SymphonyElixir.GitHub.DeliveryAdapter do
           {:error, reason} -> {:error, reason}
         end
 
-      {:ok, body} ->
-        {:error, {:github_api_error, %{kind: :invalid_pull_request_response, body: body}}}
+      {:ok, _body} ->
+        {:error, {:github_api_error, %{kind: :invalid_pull_request_response}}}
 
       {:error, reason} ->
         {:error, reason}
@@ -324,7 +324,7 @@ defmodule SymphonyElixir.GitHub.DeliveryAdapter do
 
       case rest_request(context, :patch, "/repos/#{context.owner}/#{context.repo}/pulls/#{number}", desired) do
         {:ok, updated} when is_map(updated) -> {:ok, updated}
-        {:ok, body} -> {:error, {:github_api_error, %{kind: :invalid_pull_request_update, body: body}}}
+        {:ok, _body} -> {:error, {:github_api_error, %{kind: :invalid_pull_request_update}}}
         {:error, reason} -> {:error, reason}
       end
     end
@@ -387,14 +387,14 @@ defmodule SymphonyElixir.GitHub.DeliveryAdapter do
 
   defp normalize_http_result({:error, {:github_rate_limited, _reset, _retry} = error}, _method, _url), do: {:error, error}
 
-  defp normalize_http_result({:error, {:github_gateway_unavailable, _reason} = error}, _method, _url),
-    do: {:error, {:github_provider_unavailable, error}}
+  defp normalize_http_result({:error, {:github_gateway_unavailable, _reason}}, method, url),
+    do: {:error, {:github_provider_unavailable, %{kind: :gateway_unavailable, method: method, url: url}}}
 
-  defp normalize_http_result({:error, reason}, method, url),
-    do: {:error, {:github_provider_unavailable, %{reason: reason, method: method, url: url}}}
+  defp normalize_http_result({:error, _reason}, method, url),
+    do: {:error, {:github_provider_unavailable, %{kind: :transport, method: method, url: url}}}
 
-  defp normalize_http_result(other, method, url),
-    do: {:error, {:github_provider_unavailable, %{reason: {:invalid_response, other}, method: method, url: url}}}
+  defp normalize_http_result(_other, method, url),
+    do: {:error, {:github_provider_unavailable, %{kind: :invalid_response, method: method, url: url}}}
 
   defp graphql_field(body, field) when is_map(body) do
     case Map.get(body, "data") || Map.get(body, :data) do
@@ -417,7 +417,7 @@ defmodule SymphonyElixir.GitHub.DeliveryAdapter do
 
     cond do
       Enum.any?(errors, &already_enabled_error?/1) or String.contains?(downcased, "already enabled") ->
-        {:ok, %{"enabled" => true, "already_enabled" => true, "errors" => errors}}
+        {:ok, %{"enabled" => true, "already_enabled" => true}}
 
       Enum.any?(errors, &rate_limit_error?/1) ->
         {:error, {:github_rate_limited, nil, nil}}
@@ -425,10 +425,10 @@ defmodule SymphonyElixir.GitHub.DeliveryAdapter do
       String.contains?(downcased, "forbidden") or
         String.contains?(downcased, "permission") or
           String.contains?(downcased, "resource not accessible") ->
-        {:error, {:github_permission_denied, %{status: 200, message: message}}}
+        {:error, {:github_permission_denied, %{status: 200, kind: :graphql_permission_denied}}}
 
       true ->
-        {:error, {:github_api_error, %{kind: :graphql, message: message, errors: errors}}}
+        {:error, {:github_api_error, %{kind: :graphql}}}
     end
   end
 
@@ -552,7 +552,7 @@ defmodule SymphonyElixir.GitHub.DeliveryAdapter do
   defp pull_request_node_id(pr) do
     case pull_request_node_id_value(pr) do
       node_id when is_binary(node_id) and node_id != "" -> {:ok, node_id}
-      _ -> {:error, {:invalid_pull_request_proof, %{reason: :missing_node_id, pull_request: pr}}}
+      _ -> {:error, {:invalid_pull_request_proof, %{reason: :missing_node_id}}}
     end
   end
 
@@ -605,14 +605,14 @@ defmodule SymphonyElixir.GitHub.DeliveryAdapter do
     end
   end
 
-  defp permission_error(status, response, method, url),
-    do: {:github_permission_denied, %{status: status, message: response_message(response), method: method, url: url}}
+  defp permission_error(status, _response, method, url),
+    do: {:github_permission_denied, %{status: status, kind: :permission_denied, method: method, url: url}}
 
-  defp provider_error(status, response, method, url),
-    do: {:github_provider_unavailable, %{status: status, message: response_message(response), method: method, url: url}}
+  defp provider_error(status, _response, method, url),
+    do: {:github_provider_unavailable, %{status: status, kind: :provider_unavailable, method: method, url: url}}
 
-  defp api_error(status, response, method, url),
-    do: {:github_api_error, %{status: status, message: response_message(response), body: Map.get(response, :body), method: method, url: url}}
+  defp api_error(status, _response, method, url),
+    do: {:github_api_error, %{status: status, kind: :api_error, method: method, url: url}}
 
   defp rate_limit_error(response),
     do: {:github_rate_limited, response_header(response, "x-ratelimit-reset"), response_header(response, "retry-after")}
