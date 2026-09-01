@@ -612,29 +612,15 @@ defmodule SymphonyElixir.Orchestrator do
                 delivery_retry_attempt(delivery)
               )
 
-            if token_retry_attempt >= 1 do
-              Logger.error(
-                "Token budget exhausted twice; refusing another retry for " <>
-                  "issue_id=#{issue_id} issue_identifier=#{running_entry.identifier}"
-              )
+            Logger.error(
+              "Token budget exhausted; refusing automatic redispatch " <>
+                "for issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} " <>
+                "prior_attempt=#{token_retry_attempt}"
+            )
 
-              permanently_fail_token_exhausted_delivery(state, issue_id, delivery)
-            else
-              Logger.warning(
-                "Token budget exhausted; scheduling one bounded model escalation " <>
-                  "for issue_id=#{issue_id}"
-              )
-
-              schedule_issue_retry(state, issue_id, 1, %{
-                identifier: running_entry.identifier,
-                error: "worker exceeded #{Config.settings!().codex.max_total_tokens} tokens",
-                failure_class: :code,
-                failure_attempt: 2,
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path),
-                resume_thread_id: Map.get(running_entry, :resume_thread_id),
-                slice_metadata: slice_metadata_from_running(running_entry)
-              })
+            case delivery do
+              %Delivery{} = delivery -> permanently_fail_token_exhausted_delivery(state, issue_id, delivery)
+              _ -> complete_issue(state, issue_id)
             end
           else
             Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
