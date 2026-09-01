@@ -178,6 +178,11 @@ Instructions:
   process, or a sandbox/project-boundary error, do not retry the same command.
   Record the exact error as a harness/environment blocker, perform at most one
   alternate read-only probe from the current directory, and return control.
+- Keep one turn bounded to six tool calls total and three GitHub requests total.
+  Use focused commands rather than exploratory dumps. Once the acceptance
+  criteria and required local validation are green, stop immediately with the
+  handoff; do not spend additional calls editing comments, re-reading the
+  board, or polishing the final message.
 - Do not use a browser login or other interactive external-auth flow. Record the exact access blocker and return control.
 
 ## Slice and stacked-PR policy
