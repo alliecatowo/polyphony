@@ -11,6 +11,7 @@ worker_root="$base_home/worker-homes"
 worker_home="$worker_root/worker-$$"
 
 mkdir -p "$worker_home"
+mkdir -p "$worker_home/app-server-control"
 cp "$repo_root/scripts/worker-codex-config.toml" "$worker_home/config.toml"
 
 for shared_name in auth.json packages sessions; do
@@ -25,4 +26,5 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 export CODEX_HOME="$worker_home"
+export CODEX_APP_SERVER_SOCKET="$worker_home/app-server-control/app-server-control.sock"
 codex "$@"

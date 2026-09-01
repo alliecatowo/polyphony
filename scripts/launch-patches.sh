@@ -31,7 +31,10 @@ fi
 cp "$repo_root/scripts/polyphony-codex-config.toml" "$polyphony_codex_home/config.toml"
 export CODEX_HOME="$polyphony_codex_home"
 export POLYPHONY_WORKER_CODEX_CONFIG="$repo_root/scripts/worker-codex-config.toml"
-export CODEX_APP_SERVER_SOCKET="$polyphony_codex_home/app-server-control/app-server-control.sock"
+# Do not pin workers to one daemon-owned app-server socket. The worker wrapper
+# assigns each Codex process its own socket so its process tree stays inside
+# its transient systemd/cgroup scope.
+unset CODEX_APP_SERVER_SOCKET
 # Never let an interactive Codex/desktop session identity or browser runtime
 # leak into the unattended daemon. These variables can cause app-managed MCP
 # surfaces to be injected even when the Polyphony config declares none.
