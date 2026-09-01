@@ -6,6 +6,14 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 elixir_root="$repo_root/elixir"
 workflow="$elixir_root/WORKFLOW.md"
 
+# systemd user services intentionally start with a minimal PATH. Resolve the
+# user's installed Codex CLI explicitly so workers cannot be marked running
+# while failing before their first model turn with `codex: not found`.
+user_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+if [[ -n "$user_home" ]]; then
+  export PATH="$user_home/.local/bin:$user_home/.codex/packages/standalone/releases/0.151.0-x86_64-unknown-linux-musl/codex-path:$PATH"
+fi
+
 if [[ ! -f "$elixir_root/.env" ]]; then
   echo "Polyphony Patches launch refused: $elixir_root/.env is missing" >&2
   exit 1

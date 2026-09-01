@@ -7,6 +7,9 @@ After=network-online.target
 Type=simple
 WorkingDirectory=%h/develop/polyphony/elixir
 Environment=POLYPHONY_DIRECT=1
+# User services do not inherit the interactive shell PATH. Codex is installed
+# as the user's CLI, so make the executable discoverable for unattended runs.
+Environment=PATH=%h/.local/bin:%h/.codex/packages/standalone/releases/0.151.0-x86_64-unknown-linux-musl/codex-path:/usr/local/bin:/usr/bin
 ExecStart=%h/develop/polyphony/scripts/launch-patches.sh
 Restart=always
 RestartSec=5s
