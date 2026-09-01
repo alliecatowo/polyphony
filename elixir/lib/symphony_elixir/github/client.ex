@@ -2046,16 +2046,23 @@ defmodule SymphonyElixir.GitHub.Client do
     project_item
     |> Map.get("field_values", [])
     |> Enum.reduce(%{}, fn value, acc ->
-      field_name =
-        value
-        |> Map.get("field", %{})
-        |> Map.get("name")
-        |> normalize_state_name()
+      case value do
+        %{} = value ->
+          field_name =
+            value
+            |> Map.get("field", %{})
+            |> then(fn field -> if is_map(field), do: field, else: %{} end)
+            |> Map.get("name")
+            |> normalize_state_name()
 
-      if field_name == "" do
-        acc
-      else
-        Map.put(acc, field_name, value)
+          if field_name == "" do
+            acc
+          else
+            Map.put(acc, field_name, value)
+          end
+
+        _ ->
+          acc
       end
     end)
   end
