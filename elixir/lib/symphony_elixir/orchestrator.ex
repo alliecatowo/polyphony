@@ -437,7 +437,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info(
-        {:worker_started, issue_id, pid, issue, worker_host, slice_member_ids},
+        {:worker_started, issue_id, pid, issue, worker_host, slice_member_ids, attempt},
         %State{} = state
       )
       when is_binary(issue_id) and is_pid(pid) and is_map(issue) and is_list(slice_member_ids) do
@@ -447,7 +447,10 @@ defmodule SymphonyElixir.Orchestrator do
         # announcement reached the GenServer. Attach the monitor here; the
         # poll task must never own worker monitors.
         {ref, running_entry} = ensure_worker_monitor(running_entry, pid)
-        running_entry = Map.merge(running_entry, %{ref: ref, worker_host: worker_host, issue: issue})
+        running_entry =
+          running_entry
+          |> Map.merge(%{ref: ref, worker_host: worker_host, issue: issue})
+          |> maybe_put_retry_attempt(attempt)
 
         next_state =
           clear_retry_schedule(state, issue_id)
@@ -507,6 +510,17 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.warning("Ignoring worker-start announcement for already-running issue_id=#{issue_id} pid=#{inspect(pid)}")
         {:noreply, state}
     end
+  end
+
+  # Keep compatibility with callers that emit the pre-attempt event shape.
+  def handle_info(
+        {:worker_started, issue_id, pid, issue, worker_host, slice_member_ids},
+        state
+      ) do
+    handle_info(
+      {:worker_started, issue_id, pid, issue, worker_host, slice_member_ids, nil},
+      state
+    )
   end
 
   def handle_info(
@@ -1881,7 +1895,7 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, reservation_token} ->
         case start_agent_child(issue, recipient, attempt, worker_host, board_context) do
           {:ok, pid} ->
-            send(recipient, {:worker_started, issue.id, pid, issue, worker_host, slice_member_ids})
+            send(recipient, {:worker_started, issue.id, pid, issue, worker_host, slice_member_ids, attempt})
 
             Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
 
@@ -2545,6 +2559,13 @@ defmodule SymphonyElixir.Orchestrator do
   defp maybe_put_runtime_value(running_entry, key, value) when is_map(running_entry) do
     Map.put(running_entry, key, value)
   end
+
+  defp maybe_put_retry_attempt(running_entry, attempt)
+       when is_integer(attempt) and attempt >= 0 do
+    Map.put(running_entry, :retry_attempt, attempt)
+  end
+
+  defp maybe_put_retry_attempt(running_entry, _attempt), do: running_entry
 
   defp select_worker_host(%State{} = state, preferred_worker_host) do
     select_worker_host(state, preferred_worker_host, Config.settings!().worker.ssh_hosts)
