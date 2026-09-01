@@ -2425,7 +2425,10 @@ defmodule SymphonyElixir.Orchestrator do
          schedule_issue_retry(
            state,
            issue.id,
-           attempt + 1,
+           # Capacity waits are not execution failures. Preserve the same
+           # attempt so a busy pool cannot consume retry budget (or trigger
+           # escalation) before the retry has actually started.
+           attempt,
            Map.merge(metadata, %{
              identifier: issue.identifier,
              error: "no available orchestrator slots"
