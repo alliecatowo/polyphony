@@ -225,9 +225,13 @@ defmodule SymphonyElixir.GitHub.DeliveryAdapter do
     cond do
       merged? and is_binary(merge_sha) and merge_sha != "" -> {:ok, Map.put(summary, :status, :merged)}
       state == "closed" -> {:ok, Map.merge(summary, %{status: :failed, reason: :pull_request_closed})}
+      # A dirty PR is actionable even when GitHub has not created any check
+      # runs. Check the merge conflict before the empty/pending-check case so
+      # conflicted deliveries are requeued for repair instead of parked
+      # forever as if CI were merely waiting to start.
+      mergeable_state == "dirty" -> {:ok, Map.merge(summary, %{status: :conflict, reason: :merge_conflict})}
       pending != [] or check_runs == [] -> {:ok, Map.put(summary, :status, :pending)}
       failed != [] -> {:ok, Map.merge(summary, %{status: :failed, reason: :checks_failed})}
-      mergeable_state == "dirty" -> {:ok, Map.merge(summary, %{status: :conflict, reason: :merge_conflict})}
       true -> {:ok, Map.put(summary, :status, :passed)}
     end
   end

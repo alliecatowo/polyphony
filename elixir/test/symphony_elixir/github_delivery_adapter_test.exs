@@ -294,6 +294,28 @@ defmodule SymphonyElixir.GitHub.DeliveryAdapterTest do
              DeliveryAdapter.inspect_pull_request(attrs(gateway, request, pr_number: 429, commit_sha: "commit-429"))
   end
 
+  test "merge conflicts are actionable even when no checks exist", %{gateway: gateway} do
+    request = fn :get, url, _headers, nil ->
+      cond do
+        String.ends_with?(url, "/pulls/430") ->
+          {:ok,
+           response(200, %{
+             "number" => 430,
+             "state" => "open",
+             "merged" => false,
+             "mergeable_state" => "dirty",
+             "head" => %{"sha" => "commit-430"}
+           })}
+
+        String.contains?(url, "/commits/commit-430/check-runs?") ->
+          {:ok, response(200, %{"check_runs" => []})}
+      end
+    end
+
+    assert {:ok, %{status: :conflict, reason: :merge_conflict, check_count: 0}} =
+             DeliveryAdapter.inspect_pull_request(attrs(gateway, request, pr_number: 430, commit_sha: "commit-430"))
+  end
+
   defp attrs(gateway, request, overrides \\ []) do
     Map.merge(
       %{
