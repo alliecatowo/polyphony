@@ -741,6 +741,8 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, schedule_delivery_reconcile(state, provider_retry_delay())}
 
       true ->
+        state = resume_provider_waits(state)
+
         case next_reconcilable_delivery(state.deliveries, state.delivery_reconcile_cursor) do
           nil ->
             {:noreply, schedule_delivery_reconcile(state, @delivery_reconcile_interval_ms)}
@@ -789,6 +791,21 @@ defmodule SymphonyElixir.Orchestrator do
             end
         end
     end
+  end
+
+  # A delivery parked for provider recovery has no pull request to reconcile.
+  # Once the gateway's circuit is closed, apply the durable provider-available
+  # event locally. The delivery's transition is idempotent because this filter
+  # only selects the waiting state, and the transition itself preserves its
+  # attempt counter and all orchestrator claims.
+  def handle_info(:provider_available, %State{} = state) do
+    state = resume_provider_waits(state, true)
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info(:provider_recovered, %State{} = state) do
+    handle_info(:provider_available, state)
   end
 
   def handle_info({:delivery_reconcile_result, issue_id, {:ok, summary}}, %State{} = state) do
@@ -3520,6 +3537,57 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp apply_reconciled_delivery_state(state, issue_id, %Delivery{}) do
     %{state | claimed: MapSet.put(state.claimed, issue_id)}
+  end
+
+  defp resume_provider_waits(%State{} = state), do: resume_provider_waits(state, github_gateway_ready?())
+
+  defp resume_provider_waits(%State{} = state, false), do: state
+
+  defp resume_provider_waits(%State{} = state, true) do
+    Enum.reduce(state.deliveries, state, fn
+      {issue_id, %Delivery{state: :waiting_provider} = delivery}, state ->
+        case resume_provider_delivery(delivery) do
+          {:ok, %Delivery{} = resumed} ->
+            Logger.info(
+              "Provider recovered; resumed parked delivery issue_id=#{issue_id} " <>
+                "state=#{resumed.state} attempt=#{resumed.attempt}"
+            )
+
+            %{state | deliveries: Map.put(state.deliveries, issue_id, resumed)}
+
+          {:error, reason} ->
+            Logger.warning("Unable to resume parked delivery issue_id=#{issue_id}: #{inspect(reason)}")
+            state
+        end
+
+      _entry, state ->
+        state
+    end)
+  end
+
+  defp resume_provider_delivery(%Delivery{} = delivery) do
+    with {:ok, controller} <-
+           DeliveryController.start_link(
+             delivery_id: delivery.issue_id,
+             delivery: delivery,
+             runtime_dir: delivery_runtime_dir(),
+             github_adapter: DeliveryAdapter,
+             cleanup_adapter: DeliveryController.SystemCommandAdapter
+           ),
+         {:ok, %Delivery{} = resumed} <- DeliveryController.provider_available(controller) do
+      if Process.alive?(controller), do: GenServer.stop(controller)
+      {:ok, resumed}
+    else
+      {:error, reason, %Delivery{}} -> {:error, reason}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp github_gateway_ready? do
+    case GitHubGateway.snapshot() do
+      %{available?: true, circuit: :closed} -> true
+      _ -> false
+    end
   end
 
   defp schedule_delivery_reconcile(%State{} = state, delay_ms)

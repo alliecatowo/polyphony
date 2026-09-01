@@ -2,6 +2,64 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.Orchestrator.State
+  alias SymphonyElixir.Delivery
+
+  test "provider recovery resumes a parked delivery once without changing claims or attempts" do
+    runtime_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-provider-recovery-#{System.unique_integer([:positive])}"
+      )
+
+    orchestrator_name = Module.concat(__MODULE__, :ProviderRecoveryOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name, runtime_state_dir: runtime_dir)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      File.rm_rf(runtime_dir)
+    end)
+
+    issue_id = "issue-provider-recovery"
+
+    parked =
+      Delivery.new(
+        issue_id: issue_id,
+        workspace: "/work/#{issue_id}",
+        branch: "agent/#{issue_id}",
+        state: :waiting_provider,
+        resume_state: :delivering,
+        provider_error: :rate_limited,
+        provider_retry_at: 123,
+        attempt: 4,
+        metadata: %{"identifier" => "MT-PROVIDER"}
+      )
+
+    initial_state = :sys.get_state(pid)
+    retry_entry = %{attempt: 4, retry_token: make_ref(), due_at_ms: 999}
+
+    :sys.replace_state(pid, fn _ ->
+      %{
+        initial_state
+        | deliveries: %{issue_id => parked},
+          claimed: MapSet.new([issue_id]),
+          completed: MapSet.new([issue_id]),
+          retry_attempts: %{issue_id => retry_entry}
+      }
+    end)
+
+    send(pid, :provider_available)
+    wait_until(fn -> :sys.get_state(pid).deliveries[issue_id].state == :delivering end)
+
+    recovered = :sys.get_state(pid)
+    assert recovered.deliveries[issue_id].last_event == :provider_available
+    assert recovered.deliveries[issue_id].attempt == 4
+    assert recovered.claimed == MapSet.new([issue_id])
+    assert recovered.retry_attempts == %{issue_id => retry_entry}
+
+    send(pid, :provider_available)
+    Process.sleep(25)
+    assert :sys.get_state(pid).deliveries[issue_id] == recovered.deliveries[issue_id]
+  end
 
   test "poll completion preserves worker events and never resurrects poll snapshots" do
     issue = %Issue{id: "issue-1", identifier: "MT-1", title: "Existing", state: "In Progress"}
@@ -1780,4 +1838,17 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     end)
     |> elem(1)
   end
+
+  defp wait_until(predicate, attempts \\ 100)
+
+  defp wait_until(predicate, attempts) when attempts > 0 do
+    if predicate.() do
+      :ok
+    else
+      Process.sleep(10)
+      wait_until(predicate, attempts - 1)
+    end
+  end
+
+  defp wait_until(_predicate, 0), do: flunk("condition did not become true")
 end
