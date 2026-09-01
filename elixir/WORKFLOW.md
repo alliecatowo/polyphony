@@ -101,7 +101,7 @@ codex:
   # overrides here: malformed project MCP entries make Codex exit before a
   # worker can start. Browser MCP is disabled by the worker workspace config
   # when it is not needed.
-  command: codex --disable apps --config shell_environment_policy.inherit=all app-server
+  command: /home/allie/develop/polyphony/scripts/codex-worker-app-server.sh --disable apps --config shell_environment_policy.inherit=all app-server
   # Do not attach workers to the user's interactive app-server daemon. That
   # daemon can carry the active VS Code/Codex conversation into every thread,
   # multiplying input tokens and leaking unrelated instructions. Each worker
