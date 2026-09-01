@@ -145,7 +145,7 @@ defmodule SymphonyElixir.Orchestrator do
       github_rate_limit_backoff_ms: @github_rate_limit_fallback_ms
     }
 
-    start_terminal_workspace_cleanup()
+    start_terminal_workspace_cleanup(deliveries)
 
     state =
       state
@@ -2194,8 +2194,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok
 
-  defp run_terminal_workspace_cleanup do
-    fetch_terminal_issues_for_cleanup()
+  defp run_terminal_workspace_cleanup(deliveries) do
+    terminal_delivery_identifiers(deliveries)
+    |> Kernel.++(fetch_terminal_issues_for_cleanup())
+    |> Enum.uniq_by(& &1.identifier)
     |> Enum.each(fn
       %{identifier: identifier} when is_binary(identifier) ->
         cleanup_issue_workspace(identifier)
@@ -2205,13 +2207,31 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
-  defp start_terminal_workspace_cleanup do
-    if Config.settings!().tracker.kind != "github" do
-      Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn -> run_terminal_workspace_cleanup() end)
-    end
+  defp start_terminal_workspace_cleanup(deliveries) when is_map(deliveries) do
+    Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn -> run_terminal_workspace_cleanup(deliveries) end)
 
     :ok
   end
+
+  defp terminal_delivery_identifiers(deliveries) when is_map(deliveries) do
+    deliveries
+    |> Enum.flat_map(fn
+      {_issue_id, %Delivery{state: state, metadata: metadata}}
+      when state in [:complete, :failed] and is_map(metadata) ->
+        identifier = Map.get(metadata, "identifier") || Map.get(metadata, :identifier)
+
+        if is_binary(identifier) and identifier != "" do
+          [%{identifier: identifier}]
+        else
+          []
+        end
+
+      _ ->
+        []
+    end)
+  end
+
+  defp terminal_delivery_identifiers(_deliveries), do: []
 
   defp fetch_terminal_issues_for_cleanup do
     terminal_states =
