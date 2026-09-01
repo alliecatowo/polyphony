@@ -1115,7 +1115,14 @@ defmodule SymphonyElixir.GitHub.Client do
             |> Map.put("project_items", [item_payload])
             |> Map.put("project_fields", project_field_snapshot([item_payload]))
 
-          [issue |> Map.put(:tracker_metadata, metadata) |> materialize_project_state()]
+          project_fields = Map.get(metadata, "project_fields", %{})
+
+          [
+            issue
+            |> Map.put(:tracker_metadata, metadata)
+            |> Map.put(:priority, project_priority(project_fields))
+            |> materialize_project_state()
+          ]
         else
           _ -> []
         end
