@@ -55,6 +55,10 @@ hooks:
     base_ref="origin/main"
     git rev-parse --verify "$base_ref" >/dev/null 2>&1 || base_ref=HEAD
     git switch --create "agent/polyphony-${issue_id}" "$base_ref"
+    if [ -n "${POLYPHONY_WORKER_CODEX_CONFIG:-}" ] && [ -f "$POLYPHONY_WORKER_CODEX_CONFIG" ]; then
+      mkdir -p .codex
+      cp "$POLYPHONY_WORKER_CODEX_CONFIG" .codex/config.toml
+    fi
   before_run: |
     issue_id="$(basename "$PWD")"
     # Older worker attempts injected a temporary .codex/config.toml. Clean up
@@ -66,11 +70,20 @@ hooks:
     else
       git restore --source=HEAD -- .codex/config.toml
     fi
+    if [ -n "${POLYPHONY_WORKER_CODEX_CONFIG:-}" ] && [ -f "$POLYPHONY_WORKER_CODEX_CONFIG" ]; then
+      mkdir -p .codex
+      cp "$POLYPHONY_WORKER_CODEX_CONFIG" .codex/config.toml
+    fi
     mkdir -p "docs/issues/${issue_id}/logs" "docs/issues/${issue_id}/evidence" "docs/issues/${issue_id}/decisions" "docs/issues/${issue_id}/spikes"
     printf '%s phase=before_run workspace=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" >> "docs/issues/${issue_id}/run-log.md"
   after_run: |
     issue_id="$(basename "$PWD")"
     printf '%s phase=after_run workspace=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" >> "docs/issues/${issue_id}/run-log.md"
+    if git diff --quiet -- .codex/config.toml; then
+      true
+    else
+      git restore --source=HEAD -- .codex/config.toml
+    fi
   before_remove: |
     true
 worker:
@@ -168,6 +181,9 @@ Instructions:
 
 ## Worker/harness ownership boundary (highest priority)
 
+- `.codex/config.toml` is temporary harness scaffolding installed to suppress
+  project MCP startup. Never edit, restore, stage, or validate that file; the
+  harness restores it after the turn.
 - The worker owns investigation, implementation, local validation, and concise handoff notes only.
 - Polyphony's harness owns `git commit`, `git push`, pull-request creation/update, auto-merge, CI observation, retries, escalation, and workspace cleanup. Never perform those harness operations from this turn.
 - Never wait for or poll CI, deployments, reviews, mergeability, or a human decision. Query remote state once when needed for context; after local validation, return control immediately so the token-free harness can observe events.
