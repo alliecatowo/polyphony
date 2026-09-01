@@ -230,8 +230,8 @@ defmodule SymphonyElixir.GitHub.DeliveryAdapter do
       # conflicted deliveries are requeued for repair instead of parked
       # forever as if CI were merely waiting to start.
       mergeable_state == "dirty" -> {:ok, Map.merge(summary, %{status: :conflict, reason: :merge_conflict})}
-      pending != [] or check_runs == [] -> {:ok, Map.put(summary, :status, :pending)}
       failed != [] -> {:ok, Map.merge(summary, %{status: :failed, reason: :checks_failed})}
+      pending != [] or check_runs == [] -> {:ok, Map.put(summary, :status, :pending)}
       true -> {:ok, Map.put(summary, :status, :passed)}
     end
   end

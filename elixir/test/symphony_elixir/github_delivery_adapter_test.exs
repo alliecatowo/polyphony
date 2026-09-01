@@ -274,6 +274,36 @@ defmodule SymphonyElixir.GitHub.DeliveryAdapterTest do
     assert [%{name: "quality", conclusion: "failure"}] = summary.failed_checks
   end
 
+  test "failed checks take precedence over still-running checks", %{gateway: gateway} do
+    request = fn :get, url, _headers, nil ->
+      cond do
+        String.ends_with?(url, "/pulls/430") ->
+          {:ok,
+           response(200, %{
+             "number" => 430,
+             "state" => "open",
+             "merged" => false,
+             "mergeable_state" => "blocked",
+             "head" => %{"sha" => "commit-430"}
+           })}
+
+        String.contains?(url, "/commits/commit-430/check-runs?") ->
+          {:ok,
+           response(200, %{
+             "check_runs" => [
+               %{"id" => 1, "name" => "build-test", "status" => "completed", "conclusion" => "failure"},
+               %{"id" => 2, "name" => "deploy", "status" => "in_progress", "conclusion" => nil}
+             ]
+           })}
+      end
+    end
+
+    assert {:ok, %{status: :failed, reason: :checks_failed} = summary} =
+             DeliveryAdapter.inspect_pull_request(attrs(gateway, request, pr_number: 430, commit_sha: "commit-430"))
+
+    assert [%{name: "build-test"}] = summary.failed_checks
+  end
+
   test "merge proof wins over stale check results", %{gateway: gateway} do
     request = fn :get, url, _headers, nil ->
       if String.ends_with?(url, "/pulls/429") do
