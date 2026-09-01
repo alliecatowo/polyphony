@@ -1,0 +1,17 @@
+# Minimal unattended profile for Polyphony's shared local app-server.
+# Authentication is linked by launch-patches.sh from the user's normal Codex
+# home; no API key or copied credential is stored here.
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+model_reasoning_effort = "medium"
+# The unattended worker already receives a compact task packet and one
+# explicit GitHub tool from Polyphony. Do not spend a context window replaying
+# desktop/plugin/permission/environment guidance or app catalogs on every turn.
+include_apps_instructions = false
+include_permissions_instructions = false
+include_environment_context = false
+include_collaboration_mode_instructions = false
+
+[features]
+apps = false
+enable_mcp_apps = false

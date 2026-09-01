@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.GitHub.Auth do
   @moduledoc false
 
+  alias SymphonyElixir.GitHub.Gateway
+
   @cache_table :symphony_github_app_auth_cache
   @token_expiry_buffer_seconds 60
   @jwt_backdate_seconds 60
@@ -111,6 +113,12 @@ defmodule SymphonyElixir.GitHub.Auth do
       {:ok, %{status: status}} ->
         {:error, {:github_api_status, status}}
 
+      {:error, {:github_rate_limited, _reset_at, _retry_in_ms} = error} ->
+        {:error, error}
+
+      {:error, {:github_provider_unavailable, _metadata} = error} ->
+        {:error, error}
+
       {:error, reason} ->
         {:error, {:github_api_request, reason}}
 
@@ -142,6 +150,12 @@ defmodule SymphonyElixir.GitHub.Auth do
 
       {:ok, %{status: status}} ->
         {:error, {:github_api_status, status}}
+
+      {:error, {:github_rate_limited, _reset_at, _retry_in_ms} = error} ->
+        {:error, error}
+
+      {:error, {:github_provider_unavailable, _metadata} = error} ->
+        {:error, error}
 
       {:error, reason} ->
         {:error, {:github_api_request, reason}}
@@ -221,8 +235,22 @@ defmodule SymphonyElixir.GitHub.Auth do
 
   defp request(method, url, body, headers, opts) do
     request_fun = Keyword.get(opts, :request_fun, &default_request/4)
-    request_fun.(method, url, body, headers)
+    gateway_server = Keyword.get(opts, :gateway_server, Gateway)
+
+    Gateway.request(
+      :rest,
+      fn -> invoke_request(request_fun, method, url, body, headers) end,
+      server: gateway_server
+    )
   end
+
+  defp invoke_request(fun, method, url, body, headers) when is_function(fun, 4),
+    do: fun.(method, url, body, headers)
+
+  defp invoke_request(fun, method, url, body, headers) when is_function(fun, 3),
+    do: fun.(method, url, %{headers: headers, body: body})
+
+  defp invoke_request(_fun, _method, _url, _body, _headers), do: {:error, :invalid_request_function}
 
   defp default_request(:get, url, _body, headers), do: Req.get(url, headers: headers)
 

@@ -9,17 +9,14 @@ tracker:
   project_owner_login: "$GITHUB_PROJECT_OWNER_LOGIN"
   project_title: "$GITHUB_PROJECT_TITLE"
   active_states:
-    - OPEN
-    - In Progress
     - Todo
+    - In Progress
     - Rework
     - Merging
   terminal_states:
-    - Closed
-    - Cancelled
-    - Canceled
-    - Duplicate
     - Done
+    - Closed
+    - Canceled
   status_map:
     Todo:
       state: open
@@ -34,55 +31,107 @@ tracker:
     Done:
       state: closed
       state_reason: completed
-    Cancelled:
+    Canceled:
       state: closed
       state_reason: not_planned
-  required_project_fields:
-    Status:
-      type: single_select
-      options:
-        - Todo
-        - In Progress
-        - Human Review
-        - Rework
-        - Merging
-        - Done
-        - Cancelled
-    Points:
-      type: number
-    Progress:
-      type: number
-    Target Date:
-      type: date
-    Iteration:
-      type: iteration
-    Notes:
-      type: text
 polling:
-  interval_ms: 5000
+  # Webhooks and targeted completion refreshes are the normal event path.
+  # This is only a missed-event safety sweep.
+  interval_ms: 900000
 workspace:
-  root: ~/code/polyphony-workspaces
+  root: ~/develop/patches/.polyphony/workspaces
 hooks:
   after_create: |
-    git clone --depth 1 https://github.com/$GITHUB_REPO_OWNER/$GITHUB_REPO_NAME .
-    if command -v mise >/dev/null 2>&1; then
-      cd elixir && mise trust && mise exec -- mix deps.get
+    issue_id="$(basename "$PWD")"
+    repo_owner="${GITHUB_REPO_OWNER:-alliecatowo}"
+    repo_name="${GITHUB_REPO_NAME:-patches}"
+    repo_url="${GITHUB_REPO_URL:-git@github.com:${repo_owner}/${repo_name}.git}"
+    if [ ! -d .git ]; then
+      git clone --quiet "$repo_url" .
+    else
+      git remote set-url origin "$repo_url"
     fi
+    git fetch origin main --quiet || true
+    base_ref="origin/main"
+    git rev-parse --verify "$base_ref" >/dev/null 2>&1 || base_ref=HEAD
+    git switch --create "agent/polyphony-${issue_id}" "$base_ref"
   before_run: |
-    ./elixir/scripts/polyphony_issue_artifacts.sh before_run
+    issue_id="$(basename "$PWD")"
+    # Older worker attempts injected a temporary .codex/config.toml. Clean up
+    # only that harness-owned path before a retry so Codex never spends a turn
+    # repairing runtime scaffolding. Current workers use the isolated CODEX_HOME
+    # profile and leave the project checkout untouched.
+    if git diff --quiet -- .codex/config.toml; then
+      true
+    else
+      git restore --source=HEAD -- .codex/config.toml
+    fi
+    mkdir -p "docs/issues/${issue_id}/logs" "docs/issues/${issue_id}/evidence" "docs/issues/${issue_id}/decisions" "docs/issues/${issue_id}/spikes"
+    printf '%s phase=before_run workspace=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" >> "docs/issues/${issue_id}/run-log.md"
   after_run: |
-    ./elixir/scripts/polyphony_issue_artifacts.sh after_run
+    issue_id="$(basename "$PWD")"
+    printf '%s phase=after_run workspace=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" >> "docs/issues/${issue_id}/run-log.md"
+    if git diff --quiet -- .codex/config.toml; then
+      true
+    else
+      git restore --source=HEAD -- .codex/config.toml
+    fi
   before_remove: |
-    cd elixir && mise exec -- mix workspace.before_remove
+    true
+worker:
+  # Model profiles are selected per Codex thread below. Polyphony itself runs locally.
+  ssh_hosts: []
+  max_concurrent_agents_per_host: 3
+  # Hard limits are applied to each Codex process tree with systemd-run --user.
+  # Leave headroom on this workstation's 14 GiB RAM / 16 CPU threads while
+  # allowing concurrent builds and test suites.
+  cpu_quota_percent: 600
+  memory_max_mb: 6144
+  tasks_max: 1536
+  cgroup_required: true
 agent:
-  max_concurrent_agents: 10
-  max_turns: 20
+  # Validate the bounded harness one worker at a time before scaling the pool
+  # back up. The systemd/cgroup limits remain the hard safety bound.
+  max_concurrent_agents: 1
+  # One execution turn owns the slot. The harness then delivers and parks on
+  # CI/merge webhooks; a red result resumes the same workspace/session.
+  max_turns: 1
+  # Luna gets the first repair, Terra gets the second, Sol gets the final
+  # escalation. Further retries are persisted as failed instead of consuming
+  # the worker pool indefinitely.
+  max_delivery_retry_attempts: 3
 codex:
-  command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
+  # Workers run in isolated app-server processes. Keep the inherited shell
+  # environment for the project toolchain, but do not pass ad-hoc MCP table
+  # overrides here: malformed project MCP entries make Codex exit before a
+  # worker can start. Browser MCP is disabled by the worker workspace config
+  # when it is not needed.
+  command: /home/allie/develop/polyphony/scripts/codex-worker-app-server.sh --disable apps --config shell_environment_policy.inherit=all app-server
+  # Do not attach workers to the user's interactive app-server daemon. That
+  # daemon can carry the active VS Code/Codex conversation into every thread,
+  # multiplying input tokens and leaking unrelated instructions. Each worker
+  # gets a clean local app-server process under Polyphony's isolated CODEX_HOME.
+  shared_app_server: false
+  read_timeout_ms: 30000
+  models:
+    default: gpt-5.6-luna
+    review: gpt-5.6-terra
+    # Premium Sol is selected only by an explicit `escalate: sol` issue
+    # marker or an equivalent explicit runtime signal; retries never select it.
+    escalation: gpt-5.6-sol
   approval_policy: never
   thread_sandbox: workspace-write
   turn_sandbox_policy:
     type: workspaceWrite
+  # Bound one model turn so a pathological context/tool loop cannot consume
+  # the whole account allowance. The harness preserves the workspace and
+  # retries/escalates after the worker exits.
+  # Keep one pathological turn below the Luna context cliff. Retries preserve
+  # the workspace and delivery evidence instead of replaying an unbounded
+  # transcript.
+  # Keep pathological turns cheap enough that the first token-usage event
+  # cannot consume the account allowance before the Elixir guard sees it.
+  max_total_tokens: 100000
 server:
   host: "127.0.0.1"
   port: 4000
@@ -101,7 +150,7 @@ Continuation context:
 - This is retry attempt #{{ attempt }} because the ticket is still in an active state.
 - Resume from the current workspace state instead of restarting from scratch.
 - Do not repeat already-completed investigation or validation unless needed for new code changes.
-- Do not end the turn while the issue remains in an active state unless you are blocked by missing required permissions/secrets.
+- Resume the same coherent local slice, but return to the harness after local validation; do not wait on remote systems.
   {% endif %}
 
 Issue context:
@@ -124,7 +173,50 @@ Instructions:
 2. Only stop early for a true blocker (missing required auth/permissions/secrets). If blocked, record it in the workpad and move the issue according to workflow.
 3. Final message must report completed actions and blockers only. Do not include "next steps for user".
 
+## Worker/harness ownership boundary (highest priority)
+
+- `.codex/config.toml` is temporary harness scaffolding installed to suppress
+  project MCP startup. Never edit, restore, stage, or validate that file; the
+  harness restores it after the turn.
+- The worker owns investigation, implementation, local validation, and concise handoff notes only.
+- Polyphony's harness owns `git commit`, `git push`, pull-request creation/update, auto-merge, CI observation, retries, escalation, and workspace cleanup. Never perform those harness operations from this turn.
+- Never invoke `gh`, curl, a browser login, or any other remote GitHub write/read workflow from the worker. The harness supplies the issue context and owns all tracker mutations; a temporary GitHub outage must not consume the turn. Record any remote blocker in the local workpad and continue with local work when possible.
+- Never wait for or poll CI, deployments, reviews, mergeability, or a human decision. Query remote state once when needed for context; after local validation, return control immediately so the token-free harness can observe events.
+- If an issue already has a PR and there is actionable feedback, make and validate the required local correction. If it is merely waiting for CI/review/merge or its branch is not the provided workspace branch, record that state and return immediately without repeated remote queries.
+- One turn should complete one coherent local slice. An active tracker state is not a reason to keep the model alive after the slice is locally validated or externally blocked.
+- Context budget is a hard production constraint. Never `cat` or otherwise dump `tasks.md`, lockfiles, generated output, dependency directories, full logs, or a full repository diff. Use `rg` for targeted discovery and `sed -n` or `git diff -- <path>` for focused excerpts, keeping each excerpt under 200 lines. Bound command output with `head`/`tail`, do not repeat an unchanged command, and summarize results in the issue workpad instead of replaying them in later turns.
+- If a command runner reports `No such file or directory`, a rejected
+  process, or a sandbox/project-boundary error, do not retry the same command.
+  Record the exact error as a harness/environment blocker, perform at most one
+  alternate read-only probe from the current directory, and return control.
+- If the issue is broad, lacks actionable acceptance criteria, or is explicitly
+  blocked by a product/design decision, write a concise local handoff and stop;
+  do not spend the turn inventing a design or implementing an entire subsystem.
+- Keep one turn bounded to six tool calls total and three GitHub requests total.
+  Use focused commands rather than exploratory dumps. Once the acceptance
+  criteria and required local validation are green, stop immediately with the
+  handoff; do not spend additional calls editing comments, re-reading the
+  board, or polishing the final message.
+- Do not use a browser login or other interactive external-auth flow. Record the exact access blocker and return control.
+
+## Slice and stacked-PR policy
+
+- Treat the board as a dependency graph, not a FIFO list. The injected Board context is a compact planning hint; verify the live Project fields, blockers, parent/sub-issues, and linked PRs before editing.
+- Prefer a coherent vertical slice: work on a parent issue and its disjoint leaves together when the board has an explicit parent/sub-issue relationship or shared `slice:` label. Keep heavy CI at the slice boundary and avoid duplicating full-suite runs for every leaf.
+- Normal implementation workers may prepare one logical change or stack layer, but must not merge. Keep branches in the Patches repository and preserve the repository's existing `gh-stack` skill.
+- A worker assigned an issue labelled `stack`, `stacked-pr`, `stack-reconcile`, or `stack/reconcile` is the Terra stack reconciler. It must inspect the complete stack with `gh stack view --json`, synchronize/rebase with `gh stack sync` and `gh stack rebase` as needed, wait for all required checks, and use `gh stack merge --yes` only when every stack PR is green and no human hold is present. Reconcile issue statuses and workpads for the whole stack afterward.
+- When a normal worker finishes a coherent stacked slice and has opened/updated its PRs, it must add `stack-reconcile` to the slice's lead issue and leave the lead issue active. This is the handoff signal that causes the next poll to dispatch Terra for whole-stack reconciliation.
+- Do not invent a stack or merge a single PR merely because one issue is complete. If the stack is ambiguous, leave it in review and record the exact blocker.
+
 Work only in the provided repository copy. Do not touch any other path.
+
+## Required worker handoff
+
+Unless the issue is genuinely blocked or already waiting on remote state,
+finish the smallest coherent implementation and its local validation. Leave
+the resulting workspace changes for the harness to commit and publish. Keep
+generated workpads under `docs/issues/<issue-id>/` and include validation or
+the evidence-backed blocker in the handoff.
 
 ## Prerequisite: GitHub MCP or `github_graphql` tool is available
 
@@ -153,10 +245,8 @@ The agent should be able to talk to GitHub, either via a configured GitHub MCP s
 ## Related skills
 
 - `github`: interact with GitHub.
-- `commit`: produce clean, logical commits during implementation.
-- `push`: keep remote branch current and publish updates.
 - `pull`: keep branch updated with latest `origin/main` before handoff.
-- `land`: when ticket reaches `Merging`, explicitly open and follow `.codex/skills/land/SKILL.md`, which includes the `land` loop.
+- Do not invoke `commit`, `push`, or `land` from a normal implementation worker; Polyphony invokes delivery and reconciliation separately.
 
 ## Status map
 
@@ -164,7 +254,7 @@ The agent should be able to talk to GitHub, either via a configured GitHub MCP s
 - `Todo` -> queued; immediately transition to `In Progress` before active work.
   - Special case: if a PR is already attached, treat as feedback/rework loop (run full PR feedback sweep, address or explicitly push back, revalidate, return to `Human Review`).
 - `In Progress` -> implementation actively underway.
-- `Human Review` -> PR is attached and validated; waiting on human approval.
+- `Human Review` -> inspect attached PR state once and return immediately.
 - `Merging` -> approved by human; execute the `land` skill flow (do not call `gh pr merge` directly).
 - `Rework` -> reviewer requested changes; planning + implementation required.
 - `Done` -> terminal state; no further action required.
@@ -178,7 +268,7 @@ The agent should be able to talk to GitHub, either via a configured GitHub MCP s
    - `Todo` -> immediately move to `In Progress`, then ensure bootstrap workpad comment exists (create if missing), then start execution flow.
      - If PR is already attached, start by reviewing all open PR comments and deciding required changes vs explicit pushback responses.
    - `In Progress` -> continue execution flow from current scratchpad comment.
-   - `Human Review` -> wait and poll for decision/review updates.
+   - `Human Review` -> inspect once for actionable feedback, then return immediately.
    - `Merging` -> on entry, open and follow `.codex/skills/land/SKILL.md`; do not call `gh pr merge` directly.
    - `Rework` -> run rework flow.
    - `Done` -> do nothing and shut down.
@@ -267,38 +357,29 @@ Use this only when completion is blocked by missing required tools or missing au
     - Mandatory gate: execute all ticket-provided `Validation`/`Test Plan`/ `Testing` requirements when present; treat unmet items as incomplete work.
     - Prefer a targeted proof that directly demonstrates the behavior you changed.
     - You may make temporary local proof edits to validate assumptions (for example: tweak a local build input for `make`, or hardcode a UI account / response path) when this increases confidence.
-    - Revert every temporary proof edit before commit/push.
+    - Revert every temporary proof edit before handoff.
     - Document these temporary proof steps and outcomes in the workpad `Validation`/`Notes` sections so reviewers can follow the evidence.
     - If app-touching, run `launch-app` validation and capture/upload media via `github-pr-media` before handoff.
 6.  Re-check all acceptance criteria and close any gaps.
-7.  Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.
-8.  Attach PR URL to the issue (prefer attachment; use the workpad comment only if attachment is unavailable).
-    - Ensure the GitHub PR has label `polyphony` (add it if missing).
-9.  Merge latest `origin/main` into branch, resolve conflicts, and rerun checks.
-10. Update the workpad comment with final checklist status and validation notes.
+7.  Run the required local validation for your scope; if it fails, address issues and rerun until green.
+8.  Do not commit, push, create/update a PR, merge, or wait for CI. Preserve the validated workspace for Polyphony's delivery harness.
+9.  Update the workpad comment with final checklist status and validation notes.
     - Mark completed plan/acceptance/validation checklist items as checked.
     - Add final handoff notes (commit + validation summary) in the same workpad comment.
     - Do not include PR URL in the workpad comment; keep PR linkage on the issue via attachment/link fields.
     - Add a short `### Confusions` section at the bottom when any part of task execution was unclear/confusing, with concise bullets.
     - Do not post any additional completion summary comment.
-11. Before moving to `Human Review`, poll PR feedback and checks:
+10. If an attached PR had actionable feedback at kickoff, inspect that feedback once:
     - Read the PR `Manual QA Plan` comment (when present) and use it to sharpen UI/runtime test coverage for the current change.
     - Run the full PR feedback sweep protocol.
-    - Confirm PR checks are passing (green) after the latest changes.
     - Confirm every required ticket-provided validation/test-plan item is explicitly marked complete in the workpad.
-    - Repeat this check-address-verify loop until no outstanding comments remain and checks are fully passing.
-    - Re-open and refresh the workpad before state transition so `Plan`, `Acceptance Criteria`, and `Validation` exactly match completed work.
-12. Only then move issue to `Human Review`.
-    - Exception: if blocked by missing required non-GitHub tools/auth per the blocked-access escape hatch, move to `Human Review` with the blocker brief and explicit unblock actions.
-13. For `Todo` tickets that already had a PR attached at kickoff:
-    - Ensure all existing PR feedback was reviewed and resolved, including inline review comments (code changes or explicit, justified pushback response).
-    - Ensure branch was pushed with any required updates.
-    - Then move to `Human Review`.
+    - Address feedback already present, but never wait for checks or new comments; the harness owns subsequent events.
+11. Return control immediately after the local handoff is complete. The harness performs delivery and status transitions.
 
 ## Step 3: Human Review and merge handling
 
 1. When the issue is in `Human Review`, do not code or change ticket content.
-2. Poll for updates as needed, including GitHub PR review comments from humans and bots.
+2. Inspect current review state once. Never poll; return control to the harness if no actionable feedback is present.
 3. If review feedback requires changes, move the issue to `Rework` and follow the rework flow.
 4. If approved, human moves the issue to `Merging`.
 5. When the issue is in `Merging`, open and follow `.codex/skills/land/SKILL.md`, then run the `land` skill in a loop until the PR is merged. Do not call `gh pr merge` directly.
@@ -341,7 +422,7 @@ Use this only when completion is blocked by missing required tools or missing au
   link to the current issue, and `blockedBy` when the follow-up depends on the
   current issue.
 - Do not move to `Human Review` unless the `Completion bar before Human Review` is satisfied.
-- In `Human Review`, do not make changes; wait and poll.
+- In `Human Review`, address already-present actionable feedback or return immediately; never wait or poll.
 - If state is terminal (`Done`), do nothing and shut down.
 - Keep issue text concise, specific, and reviewer-oriented.
 - If blocked and no workpad exists yet, add one blocker comment describing blocker, impact, and next unblock action.

@@ -13,6 +13,14 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     json(conn, Presenter.state_payload(orchestrator(), snapshot_timeout_ms()))
   end
 
+  @spec health(Conn.t(), map()) :: Conn.t()
+  def health(conn, _params) do
+    case Process.whereis(orchestrator()) do
+      pid when is_pid(pid) -> json(conn, %{ok: true, service: "polyphony-orchestrator"})
+      _ -> error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
+    end
+  end
+
   @spec issue(Conn.t(), map()) :: Conn.t()
   def issue(conn, %{"issue_identifier" => issue_identifier}) do
     case Presenter.issue_payload(issue_identifier, orchestrator(), snapshot_timeout_ms()) do

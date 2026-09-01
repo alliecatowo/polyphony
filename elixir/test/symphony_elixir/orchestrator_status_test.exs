@@ -1,6 +1,256 @@
 defmodule SymphonyElixir.OrchestratorStatusTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Orchestrator.State
+  alias SymphonyElixir.Delivery
+
+  test "provider recovery re-enters a parked delivery once without releasing its claim" do
+    runtime_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-provider-recovery-#{System.unique_integer([:positive])}"
+      )
+
+    orchestrator_name = Module.concat(__MODULE__, :ProviderRecoveryOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name, runtime_state_dir: runtime_dir)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+      File.rm_rf(runtime_dir)
+    end)
+
+    issue_id = "issue-provider-recovery"
+
+    parked =
+      Delivery.new(
+        issue_id: issue_id,
+        workspace: "/work/#{issue_id}",
+        branch: "agent/#{issue_id}",
+        state: :waiting_provider,
+        resume_state: :delivering,
+        provider_error: :rate_limited,
+        provider_retry_at: 123,
+        attempt: 4,
+        metadata: %{"identifier" => "MT-PROVIDER"}
+      )
+
+    initial_state = :sys.get_state(pid)
+    retry_entry = %{attempt: 4, retry_token: make_ref(), due_at_ms: 999}
+
+    :sys.replace_state(pid, fn _ ->
+      %{
+        initial_state
+        | deliveries: %{issue_id => parked},
+          claimed: MapSet.new([issue_id]),
+          completed: MapSet.new([issue_id]),
+          retry_attempts: %{issue_id => retry_entry}
+      }
+    end)
+
+    send(pid, :provider_available)
+    wait_until(fn -> :sys.get_state(pid).deliveries[issue_id].state == :retry_ready end)
+
+    recovered = :sys.get_state(pid)
+    assert recovered.deliveries[issue_id].last_event == :code_failure
+    assert recovered.deliveries[issue_id].attempt == 5
+    assert recovered.claimed == MapSet.new([issue_id])
+    assert recovered.retry_attempts[issue_id].attempt == 5
+    assert is_reference(recovered.retry_attempts[issue_id].timer_ref)
+
+    send(pid, :provider_available)
+    Process.sleep(25)
+    assert :sys.get_state(pid).deliveries[issue_id] == recovered.deliveries[issue_id]
+  end
+
+  test "provider recovery is asynchronous, deduplicated, and timeout-cleaned" do
+    orchestrator_name = Module.concat(__MODULE__, :AsyncProviderRecoveryOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+    end)
+
+    issue_id = "issue-provider-recovery-timeout"
+
+    parked =
+      Delivery.new(
+        issue_id: issue_id,
+        workspace: "/work/#{issue_id}",
+        branch: "agent/#{issue_id}",
+        state: :waiting_provider,
+        resume_state: :delivering,
+        provider_error: :rate_limited,
+        provider_retry_at: 123,
+        attempt: 4,
+        metadata: %{"identifier" => "MT-PROVIDER-TIMEOUT"}
+      )
+
+    task =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    task_ref = make_ref()
+    timeout_ref = Process.send_after(pid, :provider_recovery_timeout_should_be_cancelled, 60_000)
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      %{
+        initial_state
+        | deliveries: %{issue_id => parked},
+          claimed: MapSet.new([issue_id]),
+          provider_recovery_tasks: %{
+            issue_id => %{pid: task, task_ref: task_ref, timeout_timer_ref: timeout_ref}
+          }
+      }
+    end)
+
+    send(pid, :provider_available)
+    assert is_map(GenServer.call(pid, :snapshot, 100))
+
+    state_while_running = :sys.get_state(pid)
+    assert state_while_running.provider_recovery_tasks[issue_id].task_ref == task_ref
+    assert Process.alive?(task)
+
+    send(pid, {:provider_recovery_timeout, issue_id, task_ref})
+    wait_until(fn -> not Process.alive?(task) end)
+
+    recovered = :sys.get_state(pid)
+    assert recovered.provider_recovery_tasks == %{}
+    assert recovered.deliveries[issue_id] == parked
+    assert recovered.claimed == MapSet.new([issue_id])
+  end
+
+  test "targeted refresh timeout terminates the task and clears its in-flight lease" do
+    orchestrator_name = Module.concat(__MODULE__, :TargetedRefreshTimeoutOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+    end)
+
+    task =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    task_ref = Process.monitor(task)
+    timeout_ref = Process.send_after(pid, :targeted_timeout_should_be_cancelled, 60_000)
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      %{
+        initial_state
+        | target_refresh_in_progress: true,
+          target_refresh_task_pid: task,
+          target_refresh_task_ref: task_ref,
+          target_refresh_timeout_timer_ref: timeout_ref,
+          target_refresh_item: nil
+      }
+    end)
+
+    send(pid, {:targeted_refresh_timeout, task_ref})
+    wait_until(fn -> not Process.alive?(task) end)
+
+    state = :sys.get_state(pid)
+    refute state.target_refresh_in_progress
+    assert is_nil(state.target_refresh_task_pid)
+    assert is_nil(state.target_refresh_task_ref)
+    assert is_nil(state.target_refresh_timeout_timer_ref)
+  end
+
+  test "retry lookup timeout terminates the task and schedules a bounded retry" do
+    orchestrator_name = Module.concat(__MODULE__, :RetryLookupTimeoutOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+    end)
+
+    issue_id = "issue-retry-timeout"
+
+    task =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    task_ref = Process.monitor(task)
+    timeout_ref = Process.send_after(pid, :retry_timeout_should_be_cancelled, 60_000)
+    initial_state = :sys.get_state(pid)
+
+    retry_entry = %{
+      attempt: 2,
+      timer_ref: nil,
+      retry_token: make_ref(),
+      due_at_ms: System.monotonic_time(:millisecond),
+      lookup_task_pid: task,
+      lookup_task_ref: task_ref,
+      lookup_timeout_timer_ref: timeout_ref,
+      identifier: "MT-TIMEOUT",
+      error: "previous failure",
+      delay_type: :failure,
+      worker_host: nil,
+      workspace_path: nil,
+      resume_thread_id: nil,
+      failure_class: nil,
+      failure_attempt: nil,
+      delivery_retry: false,
+      delivery_failure_reason: nil,
+      slice_metadata: %{}
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      %{initial_state | retry_attempts: %{issue_id => retry_entry}}
+    end)
+
+    send(pid, {:retry_lookup_timeout, issue_id, 2, task_ref})
+    wait_until(fn -> not Process.alive?(task) end)
+
+    state = :sys.get_state(pid)
+    assert state.retry_attempts[issue_id].attempt == 3
+    assert is_reference(state.retry_attempts[issue_id].timer_ref)
+    refute Map.has_key?(state.retry_attempts[issue_id], :lookup_task_pid)
+    refute Map.has_key?(state.retry_attempts[issue_id], :lookup_task_ref)
+  end
+
+  test "poll completion preserves worker events and never resurrects poll snapshots" do
+    issue = %Issue{id: "issue-1", identifier: "MT-1", title: "Existing", state: "In Progress"}
+    existing_entry = %{issue: issue, last_codex_event: :turn_completed, slice_member_ids: ["issue-1"]}
+
+    current = %State{
+      running: %{"issue-1" => existing_entry},
+      claimed: MapSet.new(["issue-1"]),
+      completed: MapSet.new(),
+      retry_attempts: %{},
+      codex_rate_limits: %{remaining: 9}
+    }
+
+    added_issue = %Issue{id: "issue-2", identifier: "MT-2", title: "Added", state: "Todo"}
+    added_entry = %{issue: added_issue, slice_member_ids: ["issue-2", "slice-2"]}
+
+    polled = %State{
+      running: %{"issue-1" => %{existing_entry | last_codex_event: :stale}, "issue-2" => added_entry},
+      claimed: MapSet.new(["issue-1", "issue-2", "slice-2"]),
+      completed: MapSet.new(["poll-completed"]),
+      retry_attempts: %{},
+      codex_rate_limits: %{remaining: 8}
+    }
+
+    merged = Orchestrator.merge_poll_cycle_state_for_test(current, polled, MapSet.new(["issue-1"]))
+
+    assert merged.running["issue-1"].last_codex_event == :turn_completed
+    refute Map.has_key?(merged.running, "issue-2")
+    assert merged.claimed == MapSet.new(["issue-1"])
+    assert MapSet.member?(merged.completed, "poll-completed")
+    assert merged.codex_rate_limits == %{remaining: 9}
+  end
+
   test "snapshot returns :timeout when snapshot server is unresponsive" do
     server_name = Module.concat(__MODULE__, :UnresponsiveSnapshotServer)
     parent = self()
@@ -99,6 +349,91 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              message: %{method: "some-event"},
              timestamp: now
            }
+  end
+
+  test "dashboard notification is published after worker state is committed" do
+    issue_id = "issue-dashboard-ordering"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "#146",
+      title: "Dashboard ordering test",
+      description: "Ensure LiveView snapshots the new worker state",
+      state: "In Progress",
+      url: "https://example.org/issues/146"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :DashboardOrderingOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+    :ok = SymphonyElixirWeb.ObservabilityPubSub.subscribe()
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(pid, {
+      :codex_worker_update,
+      issue_id,
+      %{
+        event: :session_started,
+        session_id: "thread-146-turn-1",
+        timestamp: DateTime.utc_now()
+      }
+    })
+
+    assert_receive :observability_updated, 1_000
+
+    assert %{running: [%{session_id: "thread-146-turn-1", turn_count: 1}]} =
+             GenServer.call(pid, :snapshot)
+
+    send(pid, {
+      :codex_worker_update,
+      issue_id,
+      %{
+        event: :notification,
+        payload: %{
+          "method" => "thread/tokenUsage/updated",
+          "params" => %{
+            "tokenUsage" => %{
+              "total" => %{"inputTokens" => 7, "outputTokens" => 3, "totalTokens" => 10}
+            }
+          }
+        },
+        timestamp: DateTime.utc_now()
+      }
+    })
+
+    assert_receive :observability_updated, 1_000
+
+    assert %{running: [%{codex_input_tokens: 7, codex_output_tokens: 3, codex_total_tokens: 10}]} =
+             GenServer.call(pid, :snapshot)
   end
 
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
@@ -796,6 +1131,65 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert %{polling: %{checking?: true, next_poll_in_ms: nil}} = snapshot
   end
 
+  test "a dead poll task clears checking state and schedules recovery" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      poll_interval_ms: 900_000
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :DeadPollOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    poll_task = spawn(fn -> Process.sleep(:infinity) end)
+    poll_task_ref = Process.monitor(poll_task)
+
+    :sys.replace_state(pid, fn state ->
+      %{state | poll_check_in_progress: true, poll_task_pid: poll_task, poll_task_ref: poll_task_ref}
+    end)
+
+    Process.exit(poll_task, :kill)
+
+    assert %{polling: %{checking?: false, next_poll_in_ms: next_poll_in_ms}} =
+             wait_for_snapshot(pid, &match?(%{polling: %{checking?: false}}, &1), 1_000)
+
+    assert is_integer(next_poll_in_ms)
+    assert next_poll_in_ms <= 900_000
+  end
+
+  test "a timed out poll task is terminated and recovery is scheduled" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      poll_interval_ms: 900_000
+    )
+
+    orchestrator_name = Module.concat(__MODULE__, :TimedOutPollOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    poll_task = spawn(fn -> Process.sleep(:infinity) end)
+    poll_task_ref = Process.monitor(poll_task)
+
+    :sys.replace_state(pid, fn state ->
+      %{state | poll_check_in_progress: true, poll_task_pid: poll_task, poll_task_ref: poll_task_ref}
+    end)
+
+    send(pid, {:poll_cycle_timeout, poll_task_ref})
+
+    assert %{polling: %{checking?: false, next_poll_in_ms: next_poll_in_ms}} =
+             wait_for_snapshot(pid, &match?(%{polling: %{checking?: false}}, &1), 1_000)
+
+    refute Process.alive?(poll_task)
+    assert is_integer(next_poll_in_ms)
+    assert next_poll_in_ms <= 900_000
+  end
+
   test "orchestrator triggers an immediate poll cycle shortly after startup" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -941,7 +1335,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
     end)
 
-    send(pid, :tick)
+    # Stall recovery is a local watchdog and must not depend on a GitHub poll.
+    send(pid, :stall_check)
     Process.sleep(100)
     state = :sys.get_state(pid)
 
@@ -1601,4 +1996,17 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     end)
     |> elem(1)
   end
+
+  defp wait_until(predicate, attempts \\ 100)
+
+  defp wait_until(predicate, attempts) when attempts > 0 do
+    if predicate.() do
+      :ok
+    else
+      Process.sleep(10)
+      wait_until(predicate, attempts - 1)
+    end
+  end
+
+  defp wait_until(_predicate, 0), do: flunk("condition did not become true")
 end

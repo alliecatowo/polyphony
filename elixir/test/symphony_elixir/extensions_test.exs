@@ -484,7 +484,7 @@ defmodule SymphonyElixir.ExtensionsTest do
              }
   end
 
-  test "github webhook endpoint verifies signature and requests refresh for issue events" do
+  test "github webhook endpoint verifies signature and records issue events" do
     webhook_secret = "test-webhook-secret"
     previous_secret = System.get_env("GITHUB_WEBHOOK_SECRET")
     on_exit(fn -> restore_env("GITHUB_WEBHOOK_SECRET", previous_secret) end)
@@ -496,16 +496,22 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     payload = ~s({"action":"opened"})
     signature = "sha256=" <> hmac_sha256_hex(webhook_secret, payload)
+    delivery_id = "delivery-extensions-#{System.unique_integer([:positive])}"
 
     conn =
       build_conn()
       |> Plug.Conn.put_req_header("x-github-event", "issues")
+      |> Plug.Conn.put_req_header("x-github-delivery", delivery_id)
       |> Plug.Conn.put_req_header("x-hub-signature-256", signature)
       |> Plug.Conn.put_req_header("content-type", "application/json")
       |> post("/github/webhook", payload)
 
-    assert json_response(conn, 200) == %{"ok" => true, "event" => "issues"}
-    assert_receive :webhook_refresh_requested, 200
+    assert response = json_response(conn, 200)
+    assert response["ok"]
+    assert response["event"] == "issues"
+    assert response["delivery_id"] == delivery_id
+    refute response["duplicate"]
+    refute_receive :webhook_refresh_requested, 50
   end
 
   test "github webhook endpoint rejects invalid signatures" do
@@ -519,6 +525,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     conn =
       build_conn()
       |> Plug.Conn.put_req_header("x-github-event", "issues")
+      |> Plug.Conn.put_req_header("x-github-delivery", "delivery-extensions-invalid")
       |> Plug.Conn.put_req_header("x-hub-signature-256", "sha256=deadbeef")
       |> Plug.Conn.put_req_header("content-type", "application/json")
       |> post("/github/webhook", ~s({"action":"opened"}))
@@ -610,21 +617,21 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "rendered"
     assert html =~ "Runtime"
     assert html =~ "Live"
-    assert html =~ "Offline"
+    assert html =~ "Live"
     assert html =~ "Copy ID"
     assert html =~ "Codex update"
+    assert html =~ ~s(href="/api/v1/MT-HTTP")
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"
     refute html =~ "Transport"
     assert html =~ "status-badge-live"
-    assert html =~ "status-badge-offline"
 
     updated_snapshot =
       put_in(snapshot.running, [
         %{
           issue_id: "issue-http",
-          identifier: "MT-HTTP",
+          identifier: "#146",
           state: "In Progress",
           session_id: "thread-http",
           turn_count: 8,
@@ -659,6 +666,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert_eventually(fn ->
       render(view) =~ "agent message content streaming: structured update"
     end)
+
+    assert render(view) =~ ~s(href="/api/v1/%23146")
   end
 
   test "dashboard liveview renders an unavailable state without crashing" do

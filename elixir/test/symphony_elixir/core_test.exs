@@ -106,11 +106,37 @@ defmodule SymphonyElixir.CoreTest do
 
     hooks = Map.get(config, "hooks", %{})
     assert is_map(hooks)
-    assert Map.get(hooks, "after_create") =~
-             "git clone --depth 1 https://github.com/$GITHUB_REPO_OWNER/$GITHUB_REPO_NAME ."
-    assert Map.get(hooks, "after_create") =~ "cd elixir && mise trust"
-    assert Map.get(hooks, "after_create") =~ "mise exec -- mix deps.get"
-    assert Map.get(hooks, "before_remove") =~ "cd elixir && mise exec -- mix workspace.before_remove"
+
+    assert Map.get(hooks, "after_create") =~ "git clone --quiet \"$repo_url\" ."
+
+    refute Map.get(hooks, "after_create") =~ "cd elixir"
+    assert Map.get(hooks, "before_run") =~ "docs/issues/${issue_id}"
+    assert Map.get(hooks, "before_remove") =~ "true"
+
+    worker = Map.get(config, "worker", %{})
+    assert Map.get(worker, "ssh_hosts") == []
+
+    codex = Map.get(config, "codex", %{})
+    assert Map.get(codex, "shared_app_server") == true
+    assert get_in(codex, ["models", "default"]) == "gpt-5.6-luna"
+    assert get_in(codex, ["models", "review"]) == "gpt-5.6-terra"
+    assert get_in(codex, ["models", "escalation"]) == "gpt-5.6-sol"
+
+    assert Config.codex_model_for_issue(%{state: "Todo", labels: []}) == "gpt-5.6-luna"
+    assert Config.codex_model_for_issue(%{state: "Todo", labels: ["review"]}) == "gpt-5.6-terra"
+    assert Config.codex_model_for_issue(%{state: "Todo", labels: ["audit"]}) == "gpt-5.6-terra"
+    assert Config.codex_model_for_issue(%{state: "Todo", labels: []}, attempt: 2) == "gpt-5.6-luna"
+
+    assert Config.codex_model_for_issue(%{state: "Todo", labels: []},
+             failure_class: :ci,
+             failure_attempt: 3
+           ) == "gpt-5.6-sol"
+
+    assert Config.codex_model_for_issue(%{state: "Todo", labels: ["escalate: sol"]}) == "gpt-5.6-sol"
+
+    assert Config.codex_model_for_issue(
+             %{state: "Todo", labels: [], tracker_metadata: %{"escalate" => "sol"}}
+           ) == "gpt-5.6-sol"
 
     assert String.trim(prompt) != ""
     assert is_binary(Config.workflow_prompt())
@@ -119,10 +145,13 @@ defmodule SymphonyElixir.CoreTest do
 
   test "linear api token resolves from LINEAR_API_KEY env var" do
     previous_linear_api_key = System.get_env("LINEAR_API_KEY")
+    previous_github_token = System.get_env("GITHUB_TOKEN")
     env_api_key = "test-linear-api-key"
 
     on_exit(fn -> restore_env("LINEAR_API_KEY", previous_linear_api_key) end)
+    on_exit(fn -> restore_env("GITHUB_TOKEN", previous_github_token) end)
     System.put_env("LINEAR_API_KEY", env_api_key)
+    System.delete_env("GITHUB_TOKEN")
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -750,6 +779,15 @@ defmodule SymphonyElixir.CoreTest do
     }
 
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
+  end
+
+  test "select_worker_host_for_test treats an empty ssh host list as local capacity" do
+    state = %Orchestrator.State{
+      running: %{},
+      reservations: %{}
+    }
+
+    assert Orchestrator.select_worker_host_for_test(state, nil) == nil
   end
 
   defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do

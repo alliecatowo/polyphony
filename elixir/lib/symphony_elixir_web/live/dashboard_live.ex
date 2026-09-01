@@ -5,6 +5,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
+  alias SymphonyElixir.Config
   alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
   @runtime_tick_ms 1_000
 
@@ -13,6 +14,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
     socket =
       socket
       |> assign(:payload, load_payload())
+      |> assign(:control_scope, configured_control_scope())
       |> assign(:now, DateTime.utc_now())
 
     if connected?(socket) do
@@ -38,6 +40,21 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   @impl true
+  def handle_event(command, _params, socket) when command in ["pause", "drain", "resume", "stop"] do
+    invoke_control(socket, String.to_existing_atom(command), %{})
+  end
+
+  @impl true
+  def handle_event("hard-stop", _params, %{assigns: %{control_scope: nil}} = socket) do
+    {:noreply, put_flash(socket, :error, "Hard stop is disabled until a project cgroup scope is configured.")}
+  end
+
+  @impl true
+  def handle_event("hard-stop", _params, %{assigns: %{control_scope: scope}} = socket) do
+    invoke_control(socket, :hard_stop, %{scope: scope})
+  end
+
+  @impl true
   def render(assigns) do
     ~H"""
     <section class="dashboard-shell">
@@ -56,17 +73,66 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </div>
 
           <div class="status-stack">
-            <span class="status-badge status-badge-live">
+            <span class={status_badge_class(@payload)}>
               <span class="status-badge-dot"></span>
-              Live
+              <%= if @payload[:error], do: "Offline", else: "Live" %>
             </span>
-            <span class="status-badge status-badge-offline">
-              <span class="status-badge-dot"></span>
-              Offline
-            </span>
+            <%= if is_nil(@payload[:error]) and stalled_count(@payload, @now) > 0 do %>
+              <span class="status-badge status-badge-offline">
+                <span class="status-badge-dot"></span>
+                <%= stalled_count(@payload, @now) %> stalled
+              </span>
+            <% end %>
           </div>
         </div>
       </header>
+
+      <%= if @flash[:info] do %>
+        <p class="section-copy"><%= @flash[:info] %></p>
+      <% end %>
+
+      <%= if @flash[:error] do %>
+        <section class="error-card">
+          <p class="error-copy"><%= @flash[:error] %></p>
+        </section>
+      <% end %>
+
+      <section class="section-card control-card">
+        <div class="section-header">
+          <div>
+            <h2 class="section-title">Runtime controls</h2>
+            <p class="section-copy">
+              Pause or drain admission while existing work finishes. Resume reconciles before admitting new work.
+            </p>
+          </div>
+          <span class="state-badge"><%= control_state(@payload) %></span>
+        </div>
+
+        <div class="button-row">
+          <button type="button" class="subtle-button" phx-click="pause" phx-disable-with="Pausing…">Pause</button>
+          <button type="button" class="subtle-button" phx-click="drain" phx-disable-with="Draining…">Pause and drain</button>
+          <button type="button" class="subtle-button" phx-click="resume" phx-disable-with="Resuming…">Resume</button>
+          <button type="button" class="subtle-button" phx-click="stop" phx-disable-with="Stopping…">Graceful stop</button>
+          <button
+            type="button"
+            class="subtle-button"
+            phx-click="hard-stop"
+            phx-confirm="Hard-stop only the configured project cgroup? This cannot be undone."
+            phx-disable-with="Stopping…"
+            disabled={is_nil(@control_scope)}
+          >
+            Hard stop
+          </button>
+        </div>
+
+        <p class="muted">
+          <%= if @control_scope do %>
+            Hard-stop scope: <span class="mono"><%= @control_scope.project %> / <%= @control_scope.cgroup %></span>
+          <% else %>
+            Hard stop unavailable: no configured project cgroup scope.
+          <% end %>
+        </p>
+      </section>
 
       <%= if @payload[:error] do %>
         <section class="error-card">
@@ -92,6 +158,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </article>
 
           <article class="metric-card">
+            <p class="metric-label">Stalled</p>
+            <p class="metric-value numeric"><%= stalled_count(@payload, @now) %></p>
+            <p class="metric-detail">Sessions beyond the configured no-activity threshold.</p>
+          </article>
+
+          <article class="metric-card">
             <p class="metric-label">Total tokens</p>
             <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
             <p class="metric-detail numeric">
@@ -104,6 +176,48 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <p class="metric-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@payload, @now)) %></p>
             <p class="metric-detail">Total Codex runtime across completed and active sessions.</p>
           </article>
+        </section>
+
+        <section class="section-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">Delivery pipeline</h2>
+              <p class="section-copy">Harness-owned commits, pull requests, CI retries, merges, and cleanup.</p>
+            </div>
+          </div>
+
+          <%= if Map.get(@payload, :deliveries, []) == [] do %>
+            <p class="empty-state">No durable deliveries have been recorded.</p>
+          <% else %>
+            <div class="table-wrap">
+              <table class="data-table" style="min-width: 760px;">
+                <thead>
+                  <tr>
+                    <th>Issue</th>
+                    <th>State</th>
+                    <th>Pull request</th>
+                    <th>Branch</th>
+                    <th>Attempt</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={entry <- Map.get(@payload, :deliveries, [])}>
+                    <td><span class="issue-id"><%= entry.issue_identifier %></span></td>
+                    <td><span class={state_badge_class(entry.state)}><%= entry.state %></span></td>
+                    <td>
+                      <%= if entry.pr_url do %>
+                        <a class="issue-link" href={entry.pr_url} target="_blank" rel="noreferrer">#<%= entry.pr_number %></a>
+                      <% else %>
+                        <span class="mono"><%= if entry.pr_number, do: "##{entry.pr_number}", else: "n/a" %></span>
+                      <% end %>
+                    </td>
+                    <td class="mono"><%= entry.branch || "n/a" %></td>
+                    <td class="numeric"><%= entry.attempt %></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          <% end %>
         </section>
 
         <section class="section-card">
@@ -153,7 +267,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <div class="issue-stack">
                         <span class="issue-id"><%= entry.issue_identifier %></span>
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                        <a class="issue-link" href={issue_api_path(entry.issue_identifier)}>JSON details</a>
                       </div>
                     </td>
                     <td>
@@ -232,7 +346,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <td>
                       <div class="issue-stack">
                         <span class="issue-id"><%= entry.issue_identifier %></span>
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                        <a class="issue-link" href={issue_api_path(entry.issue_identifier)}>JSON details</a>
                       </div>
                     </td>
                     <td><%= entry.attempt %></td>
@@ -253,12 +367,80 @@ defmodule SymphonyElixirWeb.DashboardLive do
     Presenter.state_payload(orchestrator(), snapshot_timeout_ms())
   end
 
+  defp invoke_control(socket, command, params) do
+    case call_control(command, params) do
+      {:ok, _payload} ->
+        {:noreply,
+         socket
+         |> assign(:payload, load_payload())
+         |> assign(:now, DateTime.utc_now())
+         |> put_flash(:info, "#{control_label(command)} requested")}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, control_error_message(reason))}
+
+      :unavailable ->
+        {:noreply, put_flash(socket, :error, "Orchestrator is unavailable")}
+    end
+  end
+
+  defp call_control(command, params) do
+    orchestrator()
+    |> apply(:control, [command, params])
+  rescue
+    UndefinedFunctionError -> :unavailable
+    _error -> :unavailable
+  catch
+    :exit, _reason -> :unavailable
+  end
+
+  defp configured_control_scope do
+    case Endpoint.config(:control_scope) do
+      scope when is_map(scope) -> normalize_control_scope(scope)
+      _ -> nil
+    end
+  end
+
+  defp normalize_control_scope(scope) do
+    project = Map.get(scope, :project) || Map.get(scope, "project")
+    cgroup = Map.get(scope, :cgroup) || Map.get(scope, "cgroup")
+
+    if present_string?(project) and present_string?(cgroup) do
+      %{project: project, cgroup: cgroup}
+    else
+      nil
+    end
+  end
+
+  defp present_string?(value), do: is_binary(value) and String.trim(value) != ""
+
+  defp control_state(%{control: %{state: state}}), do: state
+  defp control_state(%{control: %{"state" => state}}), do: state
+  defp control_state(_payload), do: "unknown"
+
+  defp control_label(:hard_stop), do: "Hard stop"
+  defp control_label(command), do: command |> to_string() |> String.capitalize()
+
+  defp control_error_message(reason) when is_binary(reason), do: reason
+  defp control_error_message(reason), do: "Control command rejected: #{inspect(reason)}"
+
+  defp issue_api_path(identifier) when is_binary(identifier) do
+    "/api/v1/" <> URI.encode(identifier, &URI.char_unreserved?/1)
+  end
+
+  defp issue_api_path(identifier) do
+    "/api/v1/" <> URI.encode(to_string(identifier), &URI.char_unreserved?/1)
+  end
+
+  defp status_badge_class(%{error: _error}), do: "status-badge status-badge-offline"
+  defp status_badge_class(_payload), do: "status-badge status-badge-live"
+
   defp orchestrator do
     Endpoint.config(:orchestrator) || SymphonyElixir.Orchestrator
   end
 
   defp snapshot_timeout_ms do
-    Endpoint.config(:snapshot_timeout_ms) || 15_000
+    Endpoint.config(:snapshot_timeout_ms) || 1_000
   end
 
   defp completed_runtime_seconds(payload) do
@@ -271,6 +453,29 @@ defmodule SymphonyElixirWeb.DashboardLive do
         total + runtime_seconds_from_started_at(entry.started_at, now)
       end)
   end
+
+  defp stalled_count(%{running: running}, now) when is_list(running) do
+    timeout_ms = Config.settings!().codex.stall_timeout_ms
+
+    if timeout_ms <= 0 do
+      0
+    else
+      Enum.count(running, fn entry ->
+        case entry.last_event_at do
+          timestamp when is_binary(timestamp) ->
+            case DateTime.from_iso8601(timestamp) do
+              {:ok, parsed, _offset} -> DateTime.diff(now, parsed, :millisecond) > timeout_ms
+              _ -> false
+            end
+
+          _ ->
+            false
+        end
+      end)
+    end
+  end
+
+  defp stalled_count(_payload, _now), do: 0
 
   defp format_runtime_and_turns(started_at, turn_count, now) when is_integer(turn_count) and turn_count > 0 do
     "#{format_runtime_seconds(runtime_seconds_from_started_at(started_at, now))} / #{turn_count}"

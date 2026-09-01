@@ -1,0 +1,26 @@
+[Unit]
+Description=Polyphony Patches orchestrator
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/develop/polyphony/elixir
+Environment=POLYPHONY_DIRECT=1
+# User services do not inherit the interactive shell PATH. Codex is installed
+# as the user's CLI, so make the executable discoverable for unattended runs.
+Environment=PATH=%h/.local/bin:%h/.codex/packages/standalone/releases/0.151.0-x86_64-unknown-linux-musl/codex-path:/usr/local/bin:/usr/bin
+Environment=LD_LIBRARY_PATH=/home/linuxbrew/.linuxbrew/opt/openssl@3/lib
+Environment=LD_LIBRARY_PATH=/home/linuxbrew/.linuxbrew/opt/openssl@3/lib
+ExecStart=%h/develop/polyphony/scripts/launch-patches.sh
+Restart=always
+RestartSec=5s
+CPUQuota=800%
+MemoryMax=10240M
+TasksMax=2048
+LimitNOFILE=16384
+OOMPolicy=kill
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

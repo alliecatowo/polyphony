@@ -18,15 +18,90 @@ defmodule SymphonyElixir.PromptBuilder do
       |> prompt_template!()
       |> parse_template!()
 
-    template
-    |> Solid.render!(
-      %{
-        "attempt" => Keyword.get(opts, :attempt),
-        "issue" => issue |> Map.from_struct() |> to_solid_map()
-      },
-      @render_opts
-    )
-    |> IO.iodata_to_binary()
+    rendered =
+      template
+      |> Solid.render!(
+        %{
+          "attempt" => Keyword.get(opts, :attempt),
+          "issue" => issue |> Map.from_struct() |> to_solid_map()
+        },
+        @render_opts
+      )
+      |> IO.iodata_to_binary()
+
+    rendered
+    |> append_board_context(Keyword.get(opts, :board_context))
+    |> append_slice_context(issue)
+    |> append_retry_context(issue)
+    |> append_worker_role(issue)
+  end
+
+  defp append_board_context(prompt, context) when is_binary(context) and context != "" do
+    prompt <> "\n\n## Board context (read-only planning signal)\n" <> context
+  end
+
+  defp append_board_context(prompt, _context), do: prompt
+
+  defp append_slice_context(prompt, issue) do
+    issue_map = if is_struct(issue), do: Map.from_struct(issue), else: issue
+    members = Map.get(Map.get(issue_map, :tracker_metadata, %{}), "slice_members")
+
+    if is_list(members) and length(members) > 1 do
+      summary =
+        Enum.map_join(members, "\n", fn member ->
+          "- #{member["identifier"]}: [#{member["state"]}] #{member["title"]}"
+        end)
+
+      prompt <> "\n\n## Explicit slice\nTreat this as one coherent slice and coordinate these related issues in one workspace/PR or stack when appropriate:\n" <> summary
+    else
+      prompt
+    end
+  end
+
+  defp append_retry_context(prompt, issue) do
+    issue_map = if is_struct(issue), do: Map.from_struct(issue), else: issue
+    metadata = Map.get(issue_map, :tracker_metadata, %{})
+
+    case Map.get(metadata, "delivery_failure_reason") do
+      nil ->
+        prompt
+
+      reason ->
+        encoded = reason |> json_safe() |> Jason.encode!()
+
+        prompt <>
+          "\n\n## Harness retry context\nThe previous delivery failed after the local handoff. Diagnose and fix the following persisted CI/delivery evidence, then rerun the relevant local validation. Do not poll GitHub or perform delivery yourself.\n\n```json\n#{encoded}\n```"
+    end
+  end
+
+  defp json_safe(value) when is_map(value) do
+    Map.new(value, fn {key, nested} -> {json_safe(key), json_safe(nested)} end)
+  end
+
+  defp json_safe(value) when is_list(value), do: Enum.map(value, &json_safe/1)
+  defp json_safe(value) when is_tuple(value), do: inspect(value, limit: :infinity, printable_limit: :infinity)
+  defp json_safe(value) when is_atom(value) and value not in [nil, true, false], do: Atom.to_string(value)
+  defp json_safe(value), do: value
+
+  defp append_worker_role(prompt, issue) do
+    issue_map = if is_struct(issue), do: Map.from_struct(issue), else: issue
+    metadata = Map.get(issue_map, :tracker_metadata, %{})
+    lifecycle = Map.get(metadata, "pull_request_lifecycle", %{})
+    labels = Map.get(issue_map, :labels, [])
+
+    stack_role? =
+      Map.get(lifecycle, "ready_for_review", false) == true or
+        Enum.any?(labels, fn label ->
+          is_binary(label) and
+            String.downcase(label) in ["stack", "stacked-pr", "stack-reconcile", "stack/reconcile"]
+        end)
+
+    if stack_role? do
+      prompt <>
+        "\n\n## Worker role: stack reconciler\nReview the complete linked PR stack, not only this issue. Use the repository's gh-stack skill and merge atomically only after every required check is green and no human hold exists."
+    else
+      prompt
+    end
   end
 
   defp prompt_template!({:ok, %{prompt_template: prompt}}), do: default_prompt(prompt)

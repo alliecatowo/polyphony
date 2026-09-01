@@ -11,7 +11,7 @@ defmodule SymphonyElixirWeb.Presenter do
 
     case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
       %{} = snapshot ->
-        %{
+        payload = %{
           generated_at: generated_at,
           counts: %{
             running: length(snapshot.running),
@@ -23,12 +23,49 @@ defmodule SymphonyElixirWeb.Presenter do
           rate_limits: snapshot.rate_limits
         }
 
+        payload
+        |> maybe_put_snapshot(snapshot, :deliveries, &delivery_payloads/1)
+        |> maybe_put_snapshot(snapshot, :capacity)
+        |> maybe_put_snapshot(snapshot, :github_api)
+        |> maybe_put_snapshot(snapshot, :github_events)
+        |> maybe_put_snapshot(snapshot, :polling)
+        |> maybe_put_snapshot(snapshot, :control)
+
       :timeout ->
-        %{generated_at: generated_at, error: %{code: "snapshot_timeout", message: "Snapshot timed out"}}
+        case Orchestrator.cached_snapshot() do
+          %{} = snapshot -> snapshot_payload(snapshot, generated_at, true)
+          _ -> %{generated_at: generated_at, error: %{code: "snapshot_timeout", message: "Snapshot timed out"}}
+        end
 
       :unavailable ->
-        %{generated_at: generated_at, error: %{code: "snapshot_unavailable", message: "Snapshot unavailable"}}
+        case Orchestrator.cached_snapshot() do
+          %{} = snapshot -> snapshot_payload(snapshot, generated_at, true)
+          _ -> %{generated_at: generated_at, error: %{code: "snapshot_unavailable", message: "Snapshot unavailable"}}
+        end
     end
+  end
+
+  defp snapshot_payload(snapshot, generated_at, stale?) do
+    payload = %{
+      generated_at: generated_at,
+      counts: %{
+        running: length(snapshot.running),
+        retrying: length(snapshot.retrying)
+      },
+      running: Enum.map(snapshot.running, &running_entry_payload/1),
+      retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
+      codex_totals: snapshot.codex_totals,
+      rate_limits: snapshot.rate_limits,
+      snapshot_stale: stale?
+    }
+
+    payload
+    |> maybe_put_snapshot(snapshot, :deliveries, &delivery_payloads/1)
+    |> maybe_put_snapshot(snapshot, :capacity)
+    |> maybe_put_snapshot(snapshot, :github_api)
+    |> maybe_put_snapshot(snapshot, :github_events)
+    |> maybe_put_snapshot(snapshot, :polling)
+    |> maybe_put_snapshot(snapshot, :control)
   end
 
   @spec issue_payload(String.t(), GenServer.name(), timeout()) :: {:ok, map()} | {:error, :issue_not_found}
@@ -127,6 +164,44 @@ defmodule SymphonyElixirWeb.Presenter do
       workspace_path: Map.get(entry, :workspace_path)
     }
   end
+
+  defp delivery_payloads(deliveries) when is_map(deliveries) do
+    deliveries
+    |> Enum.map(fn {issue_id, delivery} ->
+      proof = map_value(delivery, :delivery_proof) || %{}
+      pr = map_value(proof, :pr) || %{}
+
+      %{
+        issue_id: issue_id,
+        issue_identifier: map_value(map_value(delivery, :metadata) || %{}, :identifier) || issue_id,
+        state: map_value(delivery, :state),
+        pr_number: map_value(delivery, :pr_number),
+        pr_url: map_value(pr, :url),
+        branch: map_value(delivery, :branch),
+        commit_sha: map_value(delivery, :commit_sha),
+        attempt: map_value(delivery, :attempt) || 0,
+        failure_reason: presentable_failure_reason(map_value(delivery, :failure_reason))
+      }
+    end)
+    |> Enum.sort_by(&to_string(&1.issue_identifier))
+  end
+
+  defp delivery_payloads(_deliveries), do: []
+
+  defp maybe_put_snapshot(payload, snapshot, key, transform \\ &Function.identity/1) do
+    if Map.has_key?(snapshot, key) do
+      Map.put(payload, key, transform.(Map.get(snapshot, key)))
+    else
+      payload
+    end
+  end
+
+  defp map_value(map, key) when is_map(map), do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
+  defp map_value(_map, _key), do: nil
+
+  defp presentable_failure_reason(nil), do: nil
+  defp presentable_failure_reason(reason) when is_binary(reason), do: reason
+  defp presentable_failure_reason(reason), do: inspect(reason, limit: :infinity, printable_limit: :infinity)
 
   defp running_issue_payload(running) do
     %{

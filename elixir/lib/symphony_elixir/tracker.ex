@@ -52,7 +52,8 @@ defmodule SymphonyElixir.Tracker do
       tracker_adapter != SymphonyElixir.GitHub.Adapter ->
         :ok
 
-      function_exported?(tracker_adapter, :apply_orchestrator_tracker_writes, 2) ->
+      Code.ensure_loaded?(tracker_adapter) and
+          function_exported?(tracker_adapter, :apply_orchestrator_tracker_writes, 2) ->
         apply(tracker_adapter, :apply_orchestrator_tracker_writes, [issue, writes])
 
       true ->
@@ -81,13 +82,13 @@ defmodule SymphonyElixir.Tracker do
 
     tracker_adapter = adapter()
 
-    with :ok <- maybe_reconcile_issue_primitives_in_order(tracker_adapter, issue, desired),
+    with :ok <- maybe_reconcile_issue_state_projection(tracker_adapter, issue),
+         :ok <- maybe_reconcile_issue_primitives_in_order(tracker_adapter, issue, desired),
          :ok <- maybe_reconcile_pr_lifecycle_hooks(tracker_adapter, issue),
          :ok <- maybe_reconcile_hierarchy(tracker_adapter, issue, desired.hierarchy),
          :ok <- maybe_reconcile_structure_dependencies(tracker_adapter, issue_id, desired),
          :ok <- maybe_reconcile_taxonomy(tracker_adapter, issue_id, desired),
-         :ok <- maybe_reconcile_project_custom_fields(tracker_adapter, issue, desired.project_custom_fields),
-         :ok <- maybe_reconcile_issue_state_projection(tracker_adapter, issue) do
+         :ok <- maybe_reconcile_project_custom_fields(tracker_adapter, issue, desired.project_custom_fields) do
       :ok
     end
   end
@@ -107,7 +108,7 @@ defmodule SymphonyElixir.Tracker do
        when is_atom(adapter_module) and is_atom(function_name) and is_list(args) do
     arity = length(args)
 
-    if function_exported?(adapter_module, function_name, arity) do
+    if Code.ensure_loaded?(adapter_module) and function_exported?(adapter_module, function_name, arity) do
       apply(adapter_module, function_name, args)
     else
       :ok

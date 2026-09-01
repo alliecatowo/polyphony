@@ -28,13 +28,121 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "git clone --depth 1 #{template_repo} ."
+        hook_after_create: "git clone --depth 1 #{template_repo} . && git switch --create agent/polyphony-S-1"
       )
 
       assert {:ok, workspace} = Workspace.create_for_issue("S-1")
       assert File.exists?(Path.join(workspace, ".git"))
       assert File.read!(Path.join(workspace, "README.md")) == "hook clone\n"
       assert File.read!(Path.join([workspace, "keep", "file.txt"])) == "keep me"
+      assert {:ok, []} = File.ls(Path.join(workspace_root, ".symphony-bootstrap"))
+
+      {branch, 0} = System.cmd("git", ["-C", workspace, "branch", "--show-current"])
+      assert String.trim(branch) == "agent/polyphony-S-1"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "workspace rejects and quarantines a directory discovered inside a parent repository" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-parent-repository-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-PARENT")
+
+      File.mkdir_p!(workspace)
+      File.write!(Path.join(workspace, "partial.txt"), "incomplete bootstrap\n")
+      System.cmd("git", ["-C", test_root, "init", "-b", "main"])
+      System.cmd("git", ["-C", test_root, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", test_root, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", test_root, "add", "."])
+      System.cmd("git", ["-C", test_root, "commit", "-m", "parent"])
+
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      assert {:error, {:workspace_quarantined, {:workspace_parent_repository, _top, _workspace}, quarantine}} =
+               Workspace.create_for_issue("MT-PARENT")
+
+      refute File.exists?(workspace)
+      assert File.exists?(quarantine)
+      assert File.read!(Path.join(quarantine, "partial.txt")) == "incomplete bootstrap\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "workspace validates the configured repository and unique issue branch" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-repository-validation-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "validated\n")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "github",
+        tracker_repo_owner: "acme",
+        tracker_repo_name: "patches",
+        workspace_root: workspace_root,
+        hook_after_create: "git clone --quiet #{template_repo} . && git remote set-url origin https://github.com/acme/patches.git && git switch --create agent/polyphony-MT-VALID"
+      )
+
+      issue = %{id: "issue-1", identifier: "MT-VALID", branch_name: "agent/polyphony-MT-VALID"}
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert File.exists?(Path.join(workspace, ".git"))
+
+      {remote, 0} = System.cmd("git", ["-C", workspace, "remote", "get-url", "origin"])
+      {branch, 0} = System.cmd("git", ["-C", workspace, "branch", "--show-current"])
+      assert String.trim(remote) == "https://github.com/acme/patches.git"
+      assert String.trim(branch) == "agent/polyphony-MT-VALID"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "workspace quarantines a repository with the wrong remote or branch" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-wrong-repository-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-WRONG")
+
+      File.mkdir_p!(workspace)
+      System.cmd("git", ["-C", workspace, "init", "-b", "main"])
+      System.cmd("git", ["-C", workspace, "remote", "add", "origin", "https://github.com/acme/other.git"])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "github",
+        tracker_repo_owner: "acme",
+        tracker_repo_name: "patches",
+        workspace_root: workspace_root
+      )
+
+      assert {:error, {:workspace_quarantined, {:workspace_wrong_remote, _remote, "acme/patches"}, quarantine}} =
+               Workspace.create_for_issue(%{id: "issue-2", identifier: "MT-WRONG"})
+
+      refute File.exists?(workspace)
+      assert File.exists?(Path.join(quarantine, ".git"))
     after
       File.rm_rf(test_root)
     end
@@ -206,6 +314,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert {:error, {:workspace_hook_failed, "after_create", 17, _output}} =
                Workspace.create_for_issue("MT-FAIL")
+
+      refute File.exists?(Path.join(workspace_root, "MT-FAIL"))
     after
       File.rm_rf(workspace_root)
     end
@@ -227,6 +337,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert {:error, {:workspace_hook_timeout, "after_create", 10}} =
                Workspace.create_for_issue("MT-TIMEOUT")
+
+      refute File.exists?(Path.join(workspace_root, "MT-TIMEOUT"))
     after
       File.rm_rf(workspace_root)
     end
@@ -558,6 +670,26 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Orchestrator.should_dispatch_issue_for_test(issue, state)
   end
 
+  test "explicitly blocked issue is not dispatch-eligible even when its state is active" do
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: "explicitly-blocked-1",
+      identifier: "MT-1008",
+      title: "Waiting on product decision",
+      state: "In Progress",
+      labels: ["blocked"]
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
   test "dispatch revalidation skips stale todo issue once a non-terminal blocker appears" do
     stale_issue = %Issue{
       id: "blocked-2",
@@ -771,6 +903,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.codex.turn_timeout_ms == 3_600_000
     assert config.codex.read_timeout_ms == 5_000
     assert config.codex.stall_timeout_ms == 300_000
+    assert config.codex.max_total_tokens == 100_000
 
     write_workflow_file!(Workflow.workflow_file_path(),
       codex_command: "codex --config 'model=\"gpt-5.5\"' app-server"
@@ -833,6 +966,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     write_workflow_file!(Workflow.workflow_file_path(), codex_stall_timeout_ms: "bad")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "codex.stall_timeout_ms"
+
+    write_workflow_file!(Workflow.workflow_file_path(), codex_max_total_tokens: 0)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.max_total_tokens"
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_active_states: %{todo: true},

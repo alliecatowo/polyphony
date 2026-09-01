@@ -251,6 +251,7 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
 
     assert {:ok, issues} = Client.fetch_candidate_issues()
     assert Enum.map(issues, & &1.id) == ["I2"]
+    assert Enum.map(issues, & &1.state) == ["OPEN"]
 
     assert_receive {:graphql_request, nil, ["OPEN"]}
     assert_receive {:graphql_request, "CURSOR-1", ["OPEN"]}
@@ -325,6 +326,88 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
     assert {:ok, []} = Client.fetch_candidate_issues()
   end
 
+  test "candidate issues expose the exact project Status and reject blank Status" do
+    Req.Test.stub(__MODULE__, fn conn ->
+      query = get_in(conn.body_params, ["query"]) || ""
+
+      cond do
+        String.contains?(query, "OwnerLookup") ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "organization" => %{
+                "id" => "ORG1",
+                "projectsV2" => %{"nodes" => [%{"id" => "PROJ1", "title" => "Polyphony", "url" => "u", "number" => 1}]}
+              }
+            }
+          })
+
+        String.contains?(query, "ProjectFields") ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "node" => %{
+                "fields" => %{"nodes" => [%{"id" => "F1", "name" => "Status", "dataType" => "SINGLE_SELECT"}]}
+              }
+            }
+          })
+
+        String.contains?(query, "RepositoryIssues") ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "repository" => %{
+                "issues" => %{
+                  "nodes" => [
+                    issue_node("I-TODO", 31, "OPEN", status_name: "Todo"),
+                    issue_node("I-BLANK", 32, "OPEN")
+                  ],
+                  "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+                }
+              }
+            }
+          })
+
+        String.contains?(query, "ProjectIssues") ->
+          Req.Test.json(conn, %{
+            "data" => %{
+              "node" => %{
+                "items" => %{
+                  "nodes" => [
+                    %{
+                      "id" => "ITEM-TODO",
+                      "isArchived" => false,
+                      "content" => Map.put(issue_node("I-TODO", 31, "OPEN"), "repository", %{"nameWithOwner" => "acme/polyphony"}),
+                      "fieldValues" => %{"nodes" => status_field_nodes("Todo")}
+                    },
+                    %{
+                      "id" => "ITEM-BLANK",
+                      "isArchived" => false,
+                      "content" => Map.put(issue_node("I-BLANK", 32, "OPEN"), "repository", %{"nameWithOwner" => "acme/polyphony"}),
+                      "fieldValues" => %{
+                        "nodes" => [
+                          %{
+                            "__typename" => "ProjectV2ItemFieldTextValue",
+                            "text" => "field was deleted",
+                            "field" => nil
+                          }
+                        ]
+                      }
+                    }
+                  ],
+                  "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+                }
+              }
+            }
+          })
+
+        true ->
+          Req.Test.json(conn, %{"data" => %{}})
+      end
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+
+    assert {:ok, [%{id: "I-TODO", state: "Todo"}]} = Client.fetch_candidate_issues()
+  end
+
   test "fetch_issue_states_by_ids preserves requested ordering" do
     Req.Test.stub(__MODULE__, fn conn ->
       payload = %{
@@ -344,6 +427,43 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
 
     assert {:ok, issues} = Client.fetch_issue_states_by_ids(["I1", "I2", "I3"])
     assert Enum.map(issues, & &1.id) == ["I1", "I2", "I3"]
+  end
+
+  test "summarizes GraphQL errors without returning response details" do
+    sensitive_value = "ghs_graphql_response_secret"
+
+    Req.Test.stub(__MODULE__, fn conn ->
+      Req.Test.json(conn, %{
+        "errors" => [
+          %{
+            "message" => "Forbidden request containing #{sensitive_value}",
+            "extensions" => %{"code" => "FORBIDDEN", "requestId" => sensitive_value},
+            "path" => ["viewer", sensitive_value]
+          },
+          %{"message" => "API rate limit exceeded for #{sensitive_value}"}
+        ]
+      })
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+
+    assert {:error, {:github_graphql_errors, [%{"type" => "FORBIDDEN"}, %{"type" => "RATE_LIMIT"}]}} =
+             Client.fetch_issue_states_by_ids(["I-ERROR"])
+  end
+
+  test "fetch_issue_states_by_ids materializes project Status for dispatch revalidation" do
+    Req.Test.stub(__MODULE__, fn conn ->
+      Req.Test.json(conn, %{
+        "data" => %{
+          "nodes" => [issue_node("I-REVALIDATE", 33, "OPEN", status_name: "In Progress")]
+        }
+      })
+    end)
+
+    Req.default_options(plug: {Req.Test, __MODULE__})
+
+    assert {:ok, [%{id: "I-REVALIDATE", state: "In Progress"}]} =
+             Client.fetch_issue_states_by_ids(["I-REVALIDATE"])
   end
 
   test "fetch_issues_by_states applies project-status precedence with issue-state fallback under mixed states" do

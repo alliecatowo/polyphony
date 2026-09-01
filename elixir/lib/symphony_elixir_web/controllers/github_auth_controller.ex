@@ -1,9 +1,12 @@
 defmodule SymphonyElixirWeb.GitHubAuthController do
   use Phoenix.Controller, formats: [:json]
 
+  alias SymphonyElixir.GitHub.Gateway
+
   @state_table :symphony_github_oauth_state
   @state_ttl_seconds 600
 
+  @spec start(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def start(conn, _params) do
     with {:ok, client_id} <- env("GITHUB_CLIENT_ID"),
          {:ok, callback_url} <- callback_url(conn),
@@ -15,12 +18,13 @@ defmodule SymphonyElixirWeb.GitHubAuthController do
           scheme: "https",
           host: "github.com",
           path: "/login/oauth/authorize",
-          query: URI.encode_query(%{
-            "client_id" => client_id,
-            "redirect_uri" => callback_url,
-            "state" => state,
-            "scope" => scopes
-          })
+          query:
+            URI.encode_query(%{
+              "client_id" => client_id,
+              "redirect_uri" => callback_url,
+              "state" => state,
+              "scope" => scopes
+            })
         })
 
       redirect(conn, external: authorize_url)
@@ -30,6 +34,7 @@ defmodule SymphonyElixirWeb.GitHubAuthController do
     end
   end
 
+  @spec callback(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def callback(conn, %{"code" => code, "state" => state}) do
     with :ok <- pop_state(state),
          {:ok, client_id} <- env("GITHUB_CLIENT_ID"),
@@ -49,6 +54,7 @@ defmodule SymphonyElixirWeb.GitHubAuthController do
     conn |> put_status(400) |> json(%{"error" => "Missing code/state"})
   end
 
+  @spec status(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def status(conn, _params) do
     case oauth_token() do
       nil ->
@@ -75,29 +81,37 @@ defmodule SymphonyElixirWeb.GitHubAuthController do
 
     headers = [{"Accept", "application/json"}]
 
-    case Req.post("https://github.com/login/oauth/access_token", headers: headers, form: body) do
+    case github_request(:post, "https://github.com/login/oauth/access_token", headers, form: body) do
       {:ok, %{status: 200, body: %{"access_token" => token}}} when is_binary(token) and token != "" ->
         {:ok, token}
 
-      {:ok, %{status: 200, body: body}} ->
-        {:error, "OAuth exchange did not return access_token: #{inspect(body)}"}
+      {:ok, %{status: 200}} ->
+        {:error, "OAuth exchange did not return access_token"}
 
-      {:ok, %{status: status, body: body}} ->
-        {:error, "OAuth exchange failed status=#{status} body=#{inspect(body)}"}
+      {:ok, %{status: status}} ->
+        {:error, "OAuth exchange failed status=#{status}"}
 
-      {:error, reason} ->
-        {:error, "OAuth exchange request failed: #{inspect(reason)}"}
+      {:error, _reason} ->
+        {:error, "OAuth exchange request failed"}
     end
   end
 
   defp fetch_user_login(token) do
     headers = [{"Authorization", "Bearer #{token}"}, {"Accept", "application/vnd.github+json"}]
 
-    case Req.get("https://api.github.com/user", headers: headers) do
+    case github_request(:get, "https://api.github.com/user", headers) do
       {:ok, %{status: 200, body: %{"login" => login}}} when is_binary(login) -> {:ok, login}
-      {:ok, %{status: status, body: body}} -> {:error, "OAuth token user lookup failed status=#{status} body=#{inspect(body)}"}
-      {:error, reason} -> {:error, "OAuth token user lookup failed: #{inspect(reason)}"}
+      {:ok, %{status: status}} -> {:error, "OAuth token user lookup failed status=#{status}"}
+      {:error, _reason} -> {:error, "OAuth token user lookup failed"}
     end
+  end
+
+  defp github_request(:get, url, headers, opts \\ []) do
+    Gateway.request(:rest, fn -> Req.get(url, Keyword.merge([headers: headers], opts)) end)
+  end
+
+  defp github_request(:post, url, headers, opts) do
+    Gateway.request(:rest, fn -> Req.post(url, Keyword.merge([headers: headers], opts)) end)
   end
 
   defp callback_url(conn) do

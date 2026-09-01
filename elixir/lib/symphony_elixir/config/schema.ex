@@ -147,13 +147,21 @@ defmodule SymphonyElixir.Config.Schema do
     embedded_schema do
       field(:ssh_hosts, {:array, :string}, default: [])
       field(:max_concurrent_agents_per_host, :integer)
+      field(:routing, :map, default: %{})
+      field(:cpu_quota_percent, :integer, default: 350)
+      field(:memory_max_mb, :integer, default: 4096)
+      field(:tasks_max, :integer, default: 512)
+      field(:cgroup_required, :boolean, default: false)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:ssh_hosts, :max_concurrent_agents_per_host], empty_values: [])
+      |> cast(attrs, [:ssh_hosts, :max_concurrent_agents_per_host, :routing, :cpu_quota_percent, :memory_max_mb, :tasks_max, :cgroup_required], empty_values: [])
       |> validate_number(:max_concurrent_agents_per_host, greater_than: 0)
+      |> validate_number(:cpu_quota_percent, greater_than: 0)
+      |> validate_number(:memory_max_mb, greater_than: 0)
+      |> validate_number(:tasks_max, greater_than: 0)
     end
   end
 
@@ -168,6 +176,7 @@ defmodule SymphonyElixir.Config.Schema do
     embedded_schema do
       field(:max_concurrent_agents, :integer, default: 10)
       field(:max_turns, :integer, default: 20)
+      field(:max_delivery_retry_attempts, :integer, default: 3)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_concurrent_agents_by_state, :map, default: %{})
     end
@@ -177,11 +186,18 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
+        [
+          :max_concurrent_agents,
+          :max_turns,
+          :max_delivery_retry_attempts,
+          :max_retry_backoff_ms,
+          :max_concurrent_agents_by_state
+        ],
         empty_values: []
       )
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
+      |> validate_number(:max_delivery_retry_attempts, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
@@ -196,6 +212,8 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:command, :string, default: "codex app-server")
+      field(:shared_app_server, :boolean, default: false)
+      field(:models, :map, default: %{})
 
       field(:approval_policy, StringOrMap,
         default: %{
@@ -212,6 +230,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
+      field(:max_total_tokens, :integer, default: 750_000)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -221,12 +240,15 @@ defmodule SymphonyElixir.Config.Schema do
         attrs,
         [
           :command,
+          :shared_app_server,
+          :models,
           :approval_policy,
           :thread_sandbox,
           :turn_sandbox_policy,
           :turn_timeout_ms,
           :read_timeout_ms,
-          :stall_timeout_ms
+          :stall_timeout_ms,
+          :max_total_tokens
         ],
         empty_values: []
       )
@@ -234,6 +256,7 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+      |> validate_number(:max_total_tokens, greater_than: 0)
     end
   end
 
@@ -476,6 +499,7 @@ defmodule SymphonyElixir.Config.Schema do
         field_name
         |> to_string()
         |> String.trim()
+
       normalized_name = String.downcase(original_name)
 
       normalized_definition = normalize_required_project_field_definition(definition)

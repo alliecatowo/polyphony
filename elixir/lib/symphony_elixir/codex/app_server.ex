@@ -8,10 +8,15 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   @initialize_id 1
   @thread_start_id 2
+  @thread_resume_id 2
   @turn_start_id 3
+  @turn_interrupt_id 4
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
+  @proxy_bridge Path.expand("../../../../scripts/codex-proxy.py", __DIR__)
+  @provider_retry_base_ms 60_000
+  @provider_retry_max_ms 900_000
 
   @type session :: %{
           port: port(),
@@ -36,16 +41,42 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  @doc "Classifies Codex app-server/provider errors without treating ordinary turn failures as outages."
+  @spec classify_provider_error(term(), keyword()) :: {:ok, map()} | :none
+  def classify_provider_error(reason, opts \\ []) do
+    text = provider_error_text(reason)
+
+    cond do
+      usage_limit_text?(text) ->
+        {:ok, provider_error_details(:usage_limit, reason, opts)}
+
+      rate_limit_text?(text) ->
+        {:ok, provider_error_details(:rate_limit, reason, opts)}
+
+      true ->
+        :none
+    end
+  end
+
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
+    model = Keyword.get(opts, :model)
+    resume_thread_id = Keyword.get(opts, :resume_thread_id)
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host) do
       metadata = port_metadata(port, worker_host)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
+           {:ok, thread_id} <-
+             do_start_session(
+               port,
+               expanded_workspace,
+               session_policies,
+               model,
+               resume_thread_id
+             ) do
         {:ok,
          %{
            port: port,
@@ -104,7 +135,16 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+        case await_turn_completion(
+               port,
+               on_message,
+               tool_executor,
+               auto_approve_requests,
+               Keyword.get(opts, :provider_retry_attempt, 0),
+               thread_id,
+               turn_id,
+               Config.settings!().codex.max_total_tokens
+             ) do
           {:ok, result} ->
             Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
@@ -192,6 +232,15 @@ defmodule SymphonyElixir.Codex.AppServer do
     if is_nil(executable) do
       {:error, :bash_not_found}
     else
+      ensure_shared_app_server()
+
+      command =
+        if Config.settings!().codex.shared_app_server do
+          "python3 #{shell_escape(@proxy_bridge)}"
+        else
+          launch_command(Config.settings!().codex.command, workspace)
+        end
+
       port =
         Port.open(
           {:spawn_executable, String.to_charlist(executable)},
@@ -199,7 +248,7 @@ defmodule SymphonyElixir.Codex.AppServer do
             :binary,
             :exit_status,
             :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(Config.settings!().codex.command)],
+            args: [~c"-lc", String.to_charlist(command)],
             cd: String.to_charlist(workspace),
             line: @port_line_bytes
           ]
@@ -217,9 +266,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp remote_launch_command(workspace) when is_binary(workspace) do
     [
       "cd #{shell_escape(workspace)}",
-      "exec #{Config.settings!().codex.command}"
+      "exec #{launch_command(Config.settings!().codex.command, workspace)}"
     ]
     |> Enum.join(" && ")
+  end
+
+  defp launch_command(command, workspace) do
+    Config.worker_resource_command(command, Path.basename(workspace))
   end
 
   defp port_metadata(port, worker_host) when is_port(port) do
@@ -270,35 +323,104 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace, remote: true)
   end
 
-  defp do_start_session(port, workspace, session_policies) do
+  defp do_start_session(port, workspace, session_policies, model, resume_thread_id) do
     case send_initialize(port) do
-      :ok -> start_thread(port, workspace, session_policies)
+      :ok -> start_or_resume_thread(port, workspace, session_policies, model, resume_thread_id)
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp start_thread(port, workspace, %{approval_policy: approval_policy, thread_sandbox: thread_sandbox}) do
+  defp start_thread(port, workspace, %{approval_policy: approval_policy, thread_sandbox: thread_sandbox}, model) do
+    params = %{
+      "approvalPolicy" => approval_policy,
+      "sandbox" => thread_sandbox,
+      "cwd" => workspace,
+      "dynamicTools" => DynamicTool.tool_specs()
+    }
+
+    params = if is_binary(model) and model != "", do: Map.put(params, "model", model), else: params
+
     send_message(port, %{
       "method" => "thread/start",
       "id" => @thread_start_id,
-      "params" => %{
-        "approvalPolicy" => approval_policy,
-        "sandbox" => thread_sandbox,
-        "cwd" => workspace,
-        "dynamicTools" => DynamicTool.tool_specs()
-      }
+      "params" => params
     })
 
     case await_response(port, @thread_start_id) do
       {:ok, %{"thread" => thread_payload}} ->
-        case thread_payload do
-          %{"id" => thread_id} -> {:ok, thread_id}
-          _ -> {:error, {:invalid_thread_payload, thread_payload}}
-        end
+        validate_thread_payload(thread_payload)
 
       other ->
         other
     end
+  end
+
+  defp start_or_resume_thread(port, workspace, session_policies, model, resume_thread_id)
+       when is_binary(resume_thread_id) do
+    case String.trim(resume_thread_id) do
+      "" -> start_thread(port, workspace, session_policies, model)
+      thread_id -> resume_thread(port, workspace, session_policies, model, thread_id)
+    end
+  end
+
+  defp start_or_resume_thread(port, workspace, session_policies, model, _resume_thread_id) do
+    start_thread(port, workspace, session_policies, model)
+  end
+
+  defp resume_thread(
+         port,
+         workspace,
+         %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
+         model,
+         thread_id
+       ) do
+    params = %{
+      "threadId" => thread_id,
+      "approvalPolicy" => approval_policy,
+      "sandbox" => thread_sandbox,
+      "cwd" => workspace
+    }
+
+    params = if is_binary(model) and model != "", do: Map.put(params, "model", model), else: params
+
+    send_message(port, %{
+      "method" => "thread/resume",
+      "id" => @thread_resume_id,
+      "params" => params
+    })
+
+    case await_response(port, @thread_resume_id) do
+      {:ok, %{"thread" => thread_payload}} -> validate_thread_payload(thread_payload)
+      other -> other
+    end
+  end
+
+  defp validate_thread_payload(%{"id" => thread_id}) when is_binary(thread_id) do
+    case String.trim(thread_id) do
+      "" -> {:error, {:invalid_thread_payload, %{"id" => thread_id}}}
+      _ -> {:ok, thread_id}
+    end
+  end
+
+  defp validate_thread_payload(thread_payload) do
+    {:error, {:invalid_thread_payload, thread_payload}}
+  end
+
+  defp ensure_shared_app_server do
+    if Config.settings!().codex.shared_app_server do
+      case :persistent_term.get({__MODULE__, :shared_daemon_started}, false) do
+        true ->
+          :ok
+
+        false ->
+          case System.cmd("codex", ["app-server", "daemon", "start"], stderr_to_stdout: true) do
+            {_output, 0} -> :persistent_term.put({__MODULE__, :shared_daemon_started}, true)
+            {output, status} -> Logger.warning("Codex shared app-server daemon start returned #{status}: #{String.slice(output, 0, 500)}")
+          end
+      end
+    end
+
+    :ok
   end
 
   defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
@@ -326,22 +448,50 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+  defp await_turn_completion(
+         port,
+         on_message,
+         tool_executor,
+         auto_approve_requests,
+         retry_attempt,
+         thread_id,
+         turn_id,
+         token_limit
+       ) do
+    Process.delete(:symphony_codex_token_budget_exceeded)
+
     receive_loop(
       port,
       on_message,
       Config.settings!().codex.turn_timeout_ms,
       "",
       tool_executor,
-      auto_approve_requests
+      auto_approve_requests,
+      retry_attempt,
+      thread_id,
+      turn_id,
+      token_limit,
+      false
     )
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+  defp receive_loop(
+         port,
+         on_message,
+         timeout_ms,
+         pending_line,
+         tool_executor,
+         auto_approve_requests,
+         retry_attempt,
+         thread_id,
+         turn_id,
+         token_limit,
+         interrupt_sent?
+       ) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests, retry_attempt, thread_id, turn_id, token_limit, interrupt_sent?)
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
@@ -350,7 +500,12 @@ defmodule SymphonyElixir.Codex.AppServer do
           timeout_ms,
           pending_line <> to_string(chunk),
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          retry_attempt,
+          thread_id,
+          turn_id,
+          token_limit,
+          interrupt_sent?
         )
 
       {^port, {:exit_status, status}} ->
@@ -361,40 +516,60 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
+  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests, retry_attempt, thread_id, turn_id, token_limit, interrupt_sent?) do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
         emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-        {:ok, :turn_completed}
 
-      {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
+        if Process.get(:symphony_codex_token_budget_exceeded, false) do
+          {:error, {:token_budget_exhausted, token_limit}}
+        else
+          {:ok, :turn_completed}
+        end
+
+      {:ok, %{"method" => "turn/failed", "params" => params} = payload} ->
         emit_turn_event(
           on_message,
           :turn_failed,
           payload,
           payload_string,
           port,
-          Map.get(payload, "params")
+          params
         )
 
-        {:error, {:turn_failed, Map.get(payload, "params")}}
+        provider_error_result({:turn_failed, params}, retry_attempt)
 
-      {:ok, %{"method" => "turn/cancelled", "params" => _} = payload} ->
+      {:ok, %{"method" => "turn/cancelled", "params" => params} = payload} ->
         emit_turn_event(
           on_message,
           :turn_cancelled,
           payload,
           payload_string,
           port,
-          Map.get(payload, "params")
+          params
         )
 
-        {:error, {:turn_cancelled, Map.get(payload, "params")}}
+        provider_error_result({:turn_cancelled, params}, retry_attempt)
+
+      {:ok, %{"method" => "account/rateLimits/updated"} = payload} ->
+        metadata = metadata_from_message(port, payload)
+
+        case classify_rate_limit_notification(payload, retry_attempt) do
+          {:ok, details} ->
+            emit_message(on_message, :provider_unavailable, %{payload: payload, details: details, raw: payload_string}, metadata)
+            {:error, {:codex_provider_unavailable, details}}
+
+          :none ->
+            emit_message(on_message, :notification, %{payload: payload, raw: payload_string}, metadata)
+            receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, retry_attempt, thread_id, turn_id, token_limit, interrupt_sent?)
+        end
 
       {:ok, %{"method" => method} = payload}
       when is_binary(method) ->
+        interrupt_sent? = maybe_interrupt_for_token_budget(port, payload, thread_id, turn_id, token_limit, interrupt_sent?)
+
         handle_turn_method(
           port,
           on_message,
@@ -403,10 +578,17 @@ defmodule SymphonyElixir.Codex.AppServer do
           method,
           timeout_ms,
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          retry_attempt,
+          thread_id,
+          turn_id,
+          token_limit,
+          interrupt_sent?
         )
 
       {:ok, payload} ->
+        interrupt_sent? = maybe_interrupt_for_token_budget(port, payload, thread_id, turn_id, token_limit, interrupt_sent?)
+
         emit_message(
           on_message,
           :other_message,
@@ -417,7 +599,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata_from_message(port, payload)
         )
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, retry_attempt, thread_id, turn_id, token_limit, interrupt_sent?)
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -434,7 +616,75 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
         end
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, retry_attempt, thread_id, turn_id, token_limit, interrupt_sent?)
+    end
+  end
+
+  defp maybe_interrupt_for_token_budget(_port, _payload, _thread_id, _turn_id, limit, sent?)
+       when not is_integer(limit) or limit <= 0 or sent?,
+       do: sent?
+
+  defp maybe_interrupt_for_token_budget(port, payload, thread_id, turn_id, limit, false) do
+    case total_tokens_from_payload(payload) do
+      total when is_integer(total) and total >= limit ->
+        Logger.warning(
+          "Interrupting Codex turn at token budget thread_id=#{thread_id} turn_id=#{turn_id} " <>
+            "total_tokens=#{total} limit=#{limit}"
+        )
+
+        send_message(port, %{
+          "method" => "turn/interrupt",
+          "id" => @turn_interrupt_id,
+          "params" => %{"threadId" => thread_id, "turnId" => turn_id}
+        })
+
+        Process.put(:symphony_codex_token_budget_exceeded, true)
+        true
+
+      _ ->
+        false
+    end
+  end
+
+  defp total_tokens_from_payload(payload) when is_map(payload) do
+    [
+      ["params", "tokenUsage", "total"],
+      ["params", "msg", "payload", "info", "total_token_usage", "total_tokens"],
+      ["params", "msg", "info", "total_token_usage", "total_tokens"],
+      ["payload", "info", "total_token_usage", "total_tokens"],
+      ["tokenUsage", "total"],
+      ["totalTokens"]
+    ]
+    |> Enum.find_value(fn path ->
+      case get_in(payload, path) do
+        value when is_integer(value) -> value
+        value when is_binary(value) -> parse_integer(value)
+        _ -> nil
+      end
+    end)
+    |> case do
+      nil -> find_total_tokens_leaf(payload)
+      total -> total
+    end
+  end
+
+  defp total_tokens_from_payload(_payload), do: nil
+
+  defp find_total_tokens_leaf(%{"total_tokens" => value}) when is_integer(value), do: value
+  defp find_total_tokens_leaf(%{"total_tokens" => value}) when is_binary(value), do: parse_integer(value)
+
+  defp find_total_tokens_leaf(payload) when is_map(payload) do
+    payload
+    |> Map.values()
+    |> Enum.find_value(&find_total_tokens_leaf/1)
+  end
+
+  defp find_total_tokens_leaf(_payload), do: nil
+
+  defp parse_integer(value) do
+    case Integer.parse(value) do
+      {integer, ""} -> integer
+      _ -> nil
     end
   end
 
@@ -459,7 +709,12 @@ defmodule SymphonyElixir.Codex.AppServer do
          method,
          timeout_ms,
          tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         retry_attempt,
+         thread_id,
+         turn_id,
+         token_limit,
+         interrupt_sent?
        ) do
     metadata = metadata_from_message(port, payload)
 
@@ -484,7 +739,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_input_required, payload}}
 
       :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, retry_attempt, thread_id, turn_id, token_limit, interrupt_sent?)
 
       :approval_required ->
         emit_message(
@@ -518,7 +773,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
 
           Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, retry_attempt, thread_id, turn_id, token_limit, interrupt_sent?)
         end
     end
   end
@@ -708,7 +963,16 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp dynamic_tool_output(%{"contentItems" => [%{"text" => text} | _]}) when is_binary(text), do: text
-  defp dynamic_tool_output(result), do: Jason.encode!(result, pretty: true)
+  defp dynamic_tool_output(result), do: result |> json_safe() |> Jason.encode!(pretty: true)
+
+  defp json_safe(value) when is_map(value) do
+    Map.new(value, fn {key, nested} -> {json_safe(key), json_safe(nested)} end)
+  end
+
+  defp json_safe(value) when is_list(value), do: Enum.map(value, &json_safe/1)
+  defp json_safe(value) when is_tuple(value), do: inspect(value, limit: :infinity, printable_limit: :infinity)
+  defp json_safe(value) when is_atom(value) and value not in [nil, true, false], do: Atom.to_string(value)
+  defp json_safe(value), do: value
 
   defp dynamic_tool_content_items(output) when is_binary(output) do
     [
@@ -945,13 +1209,13 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     case Jason.decode(payload) do
       {:ok, %{"id" => ^request_id, "error" => error}} ->
-        {:error, {:response_error, error}}
+        provider_error_result({:response_error, error}, 0)
 
       {:ok, %{"id" => ^request_id, "result" => result}} ->
         {:ok, result}
 
       {:ok, %{"id" => ^request_id} = response_payload} ->
-        {:error, {:response_error, response_payload}}
+        provider_error_result({:response_error, response_payload}, 0)
 
       {:ok, %{} = other} ->
         Logger.debug("Ignoring message while waiting for response: #{inspect(other)}")
@@ -1026,6 +1290,182 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp maybe_set_usage(metadata, _payload), do: metadata
+
+  defp provider_error_result(reason, retry_attempt) do
+    case classify_provider_error(reason, retry_attempt: retry_attempt) do
+      {:ok, details} -> {:error, {:codex_provider_unavailable, details}}
+      :none -> {:error, reason}
+    end
+  end
+
+  defp classify_rate_limit_notification(payload, retry_attempt) do
+    rate_limits = Map.get(payload, "params", %{}) |> value_from_map(["rateLimits", "rate_limits"])
+
+    if is_map(rate_limits) and exhausted_rate_limits?(rate_limits) do
+      {:ok, provider_error_details(:rate_limit, payload, retry_attempt: retry_attempt)}
+    else
+      :none
+    end
+  end
+
+  defp provider_error_details(kind, reason, opts) do
+    retry_in_ms = provider_retry_in_ms(reason) || computed_retry_in_ms(Keyword.get(opts, :retry_attempt, 0))
+
+    %{
+      kind: kind,
+      message: provider_error_text(reason) |> String.slice(0, @max_stream_log_bytes),
+      retry_in_ms: retry_in_ms,
+      retry_at_ms: System.system_time(:millisecond) + retry_in_ms,
+      source: :codex_app_server
+    }
+  end
+
+  defp provider_error_text(reason) when is_binary(reason), do: String.downcase(reason)
+
+  defp provider_error_text(reason) do
+    reason
+    |> inspect(limit: :infinity, printable_limit: @max_stream_log_bytes)
+    |> String.downcase()
+  end
+
+  defp usage_limit_text?(text) when is_binary(text) do
+    String.contains?(text, [
+      "usage_limit_exceeded",
+      "usage limit",
+      "quota exceeded",
+      "quota_exceeded",
+      "spend_control_reached"
+    ])
+  end
+
+  defp rate_limit_text?(text) when is_binary(text) do
+    String.contains?(text, [
+      "rate_limit_exceeded",
+      "rate limit",
+      "rate_limit",
+      "too many requests",
+      "429"
+    ])
+  end
+
+  defp value_from_map(map, keys) when is_map(map) and is_list(keys) do
+    Enum.find_value(keys, &Map.get(map, &1))
+  end
+
+  defp value_from_map(_map, _keys), do: nil
+
+  defp exhausted_rate_limits?(rate_limits) when is_map(rate_limits) do
+    reached_type = value_from_map(rate_limits, ["rateLimitReachedType", "rate_limit_reached_type"])
+
+    (is_binary(reached_type) and String.trim(reached_type) != "") or
+      Enum.any?(["primary", "secondary"], fn window_name ->
+        case Map.get(rate_limits, window_name) do
+          window when is_map(window) ->
+            used_percent = value_from_map(window, ["usedPercent", "used_percent"])
+            remaining = value_from_map(window, ["remaining"])
+            (is_number(used_percent) and used_percent >= 100) or remaining == 0
+
+          _ ->
+            false
+        end
+      end)
+  end
+
+  defp exhausted_rate_limits?(_rate_limits), do: false
+
+  defp provider_retry_in_ms(reason) when is_map(reason) do
+    retry_values =
+      reason
+      |> provider_retry_candidates()
+      |> Enum.filter(&is_integer/1)
+      |> Enum.filter(&(&1 > 0))
+
+    case retry_values do
+      [] -> nil
+      values -> Enum.min(values)
+    end
+  end
+
+  defp provider_retry_in_ms(reason) when is_tuple(reason) do
+    reason
+    |> Tuple.to_list()
+    |> Enum.find_value(&provider_retry_in_ms/1)
+  end
+
+  defp provider_retry_in_ms(_reason), do: nil
+
+  defp provider_retry_candidates(map) when is_map(map) do
+    Enum.flat_map(map, fn {key, value} ->
+      key = to_string(key)
+
+      direct =
+        cond do
+          key in ["retry_in_ms", "retryInMs", "retry_after_ms", "retryAfterMs"] ->
+            [integer_value(value)]
+
+          key in ["retry_after", "retryAfter"] ->
+            [duration_ms(value)]
+
+          key in ["retry_at_ms", "retryAtMs"] ->
+            case integer_value(value) do
+              retry_at_ms when is_integer(retry_at_ms) -> [retry_at_ms - System.system_time(:millisecond)]
+              _ -> []
+            end
+
+          key in ["resets_at", "resetsAt", "reset_at", "resetAt"] ->
+            [reset_delay_ms(value)]
+
+          true ->
+            []
+        end
+
+      nested = if is_map(value), do: provider_retry_candidates(value), else: []
+      direct ++ nested
+    end)
+  end
+
+  defp provider_retry_candidates(_map), do: []
+
+  defp integer_value(value) when is_integer(value), do: value
+  defp integer_value(value) when is_float(value), do: trunc(value)
+
+  defp integer_value(value) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {integer, _} -> integer
+      _ -> nil
+    end
+  end
+
+  defp integer_value(_value), do: nil
+
+  defp duration_ms(value) do
+    case integer_value(value) do
+      seconds when is_integer(seconds) and seconds > 0 and seconds < 1_000_000 -> seconds * 1_000
+      milliseconds when is_integer(milliseconds) -> milliseconds
+      _ -> nil
+    end
+  end
+
+  defp reset_delay_ms(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, datetime, _offset} -> max(DateTime.to_unix(datetime, :millisecond) - System.system_time(:millisecond), 0)
+      _ -> reset_delay_ms(integer_value(value))
+    end
+  end
+
+  defp reset_delay_ms(value) when is_integer(value) and value > 1_000_000_000 do
+    max(value * 1_000 - System.system_time(:millisecond), 0)
+  end
+
+  defp reset_delay_ms(value) when is_integer(value), do: duration_ms(value)
+  defp reset_delay_ms(_value), do: nil
+
+  defp computed_retry_in_ms(attempt) when is_integer(attempt) and attempt >= 0 do
+    multiplier = Integer.pow(2, min(attempt, 4))
+    min(@provider_retry_base_ms * multiplier, @provider_retry_max_ms)
+  end
+
+  defp computed_retry_in_ms(_attempt), do: @provider_retry_base_ms
 
   defp shell_escape(value) when is_binary(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
