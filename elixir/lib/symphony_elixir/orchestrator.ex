@@ -585,18 +585,47 @@ defmodule SymphonyElixir.Orchestrator do
           })
 
         {_reason, _delivery} ->
-          Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
+          if Map.get(running_entry, :token_budget_exceeded, false) do
+            token_retry_attempt = Map.get(running_entry, :retry_attempt, 0)
 
-          next_attempt = next_retry_attempt_from_running(running_entry)
+            if token_retry_attempt >= 1 do
+              Logger.error(
+                "Token budget exhausted twice; refusing hot retry for " <>
+                  "issue_id=#{issue_id} issue_identifier=#{running_entry.identifier}"
+              )
 
-          schedule_issue_retry(state, issue_id, next_attempt, %{
-            identifier: running_entry.identifier,
-            error: "agent exited: #{inspect(reason)}",
-            worker_host: Map.get(running_entry, :worker_host),
-            workspace_path: Map.get(running_entry, :workspace_path),
-            resume_thread_id: Map.get(running_entry, :resume_thread_id),
-            slice_metadata: slice_metadata_from_running(running_entry)
-          })
+              complete_issue(state, issue_id)
+            else
+              Logger.warning(
+                "Token budget exhausted; scheduling one bounded model escalation " <>
+                  "for issue_id=#{issue_id}"
+              )
+
+              schedule_issue_retry(state, issue_id, 1, %{
+                identifier: running_entry.identifier,
+                error: "worker exceeded #{Config.settings!().codex.max_total_tokens} tokens",
+                failure_class: :code,
+                failure_attempt: 2,
+                worker_host: Map.get(running_entry, :worker_host),
+                workspace_path: Map.get(running_entry, :workspace_path),
+                resume_thread_id: Map.get(running_entry, :resume_thread_id),
+                slice_metadata: slice_metadata_from_running(running_entry)
+              })
+            end
+          else
+            Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
+
+            next_attempt = next_retry_attempt_from_running(running_entry)
+
+            schedule_issue_retry(state, issue_id, next_attempt, %{
+              identifier: running_entry.identifier,
+              error: "agent exited: #{inspect(reason)}",
+              worker_host: Map.get(running_entry, :worker_host),
+              workspace_path: Map.get(running_entry, :workspace_path),
+              resume_thread_id: Map.get(running_entry, :resume_thread_id),
+              slice_metadata: slice_metadata_from_running(running_entry)
+            })
+          end
       end
 
     state = state |> refresh_control_obligations() |> schedule_targeted_refresh(0)
@@ -636,6 +665,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       running_entry ->
         {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
+        updated_running_entry = maybe_stop_token_exhausted_worker(updated_running_entry, issue_id)
 
         state =
           state
@@ -649,6 +679,30 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info({:codex_worker_update, _issue_id, _update}, state), do: {:noreply, state}
+
+  defp maybe_stop_token_exhausted_worker(%{} = running_entry, issue_id) do
+    limit = Config.settings!().codex.max_total_tokens
+    total_tokens = Map.get(running_entry, :codex_total_tokens, 0)
+
+    if is_integer(limit) and limit > 0 and total_tokens >= limit and
+         not Map.get(running_entry, :token_budget_exceeded, false) do
+      Logger.warning(
+        "Stopping worker at token budget issue_id=#{issue_id} " <>
+          "total_tokens=#{total_tokens} limit=#{limit}"
+      )
+
+      running_entry = Map.put(running_entry, :token_budget_exceeded, true)
+
+      case Map.get(running_entry, :pid) do
+        pid when is_pid(pid) -> terminate_task(pid)
+        _ -> :ok
+      end
+
+      running_entry
+    else
+      running_entry
+    end
+  end
 
   def handle_info({:retry_issue, issue_id, retry_token}, state) do
     case Map.get(state.deliveries, issue_id) do

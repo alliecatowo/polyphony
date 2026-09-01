@@ -100,6 +100,10 @@ codex:
   thread_sandbox: workspace-write
   turn_sandbox_policy:
     type: workspaceWrite
+  # Bound one model turn so a pathological context/tool loop cannot consume
+  # the whole account allowance. The harness preserves the workspace and
+  # retries/escalates after the worker exits.
+  max_total_tokens: 750000
 server:
   host: "127.0.0.1"
   port: 4000
