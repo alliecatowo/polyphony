@@ -29,6 +29,9 @@ defmodule SymphonyElixir.Orchestrator do
   @delivery_reconcile_interval_ms 900_000
   @delivery_reconcile_timeout_ms 45_000
   @targeted_refresh_timeout_ms 45_000
+  # Webhook bursts are coalesced, but never turn into one GitHub request per
+  # queued event in a tight loop. The normal board poll remains much slower.
+  @targeted_refresh_min_interval_ms 5_000
   @retry_lookup_timeout_ms 45_000
   # DeliveryController may need to invoke git or the provider while resuming a
   # parked delivery. Keep that work out of this GenServer and kill it if the
@@ -69,6 +72,7 @@ defmodule SymphonyElixir.Orchestrator do
       :github_projection,
       :target_refresh_in_progress,
       :target_refresh_timer_ref,
+      :target_refresh_not_before_ms,
       :target_refresh_task_pid,
       :target_refresh_task_ref,
       :target_refresh_timeout_timer_ref,
@@ -127,6 +131,7 @@ defmodule SymphonyElixir.Orchestrator do
       github_projection: load_github_projection(opts),
       target_refresh_in_progress: false,
       target_refresh_timer_ref: nil,
+      target_refresh_not_before_ms: 0,
       target_refresh_task_pid: nil,
       target_refresh_task_ref: nil,
       target_refresh_timeout_timer_ref: nil,
@@ -848,7 +853,13 @@ defmodule SymphonyElixir.Orchestrator do
 
       true ->
         {item, projection} = GitHubProjection.pop(state.github_projection)
-        state = %{state | github_projection: projection} |> persist_github_projection()
+        state =
+          %{state |
+            github_projection: projection,
+            target_refresh_not_before_ms:
+              System.monotonic_time(:millisecond) + @targeted_refresh_min_interval_ms
+          }
+          |> persist_github_projection()
 
         case targeted_issue_node_id(item) do
           nil ->
@@ -4695,7 +4706,7 @@ defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, wor
     end
   end
 
-  defp schedule_targeted_refresh(%State{} = state, delay_ms)
+defp schedule_targeted_refresh(%State{} = state, delay_ms)
        when is_integer(delay_ms) and delay_ms >= 0 do
     ready? = GitHubProjection.ready_ids(state.github_projection) != []
 
@@ -4708,7 +4719,10 @@ defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, wor
           Process.cancel_timer(state.target_refresh_timer_ref)
         end
 
-        timer_ref = Process.send_after(self(), :process_targeted_refresh, delay_ms)
+        now_ms = System.monotonic_time(:millisecond)
+        not_before_ms = Map.get(state, :target_refresh_not_before_ms, 0) || 0
+        effective_delay_ms = max(delay_ms, max(0, not_before_ms - now_ms))
+        timer_ref = Process.send_after(self(), :process_targeted_refresh, effective_delay_ms)
         %{state | target_refresh_timer_ref: timer_ref}
     end
   end
