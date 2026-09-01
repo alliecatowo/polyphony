@@ -1904,11 +1904,11 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, board_context) do
+defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host, board_context) do
     slice_member_ids = SlicePlanner.slice_member_ids(issue)
 
-    case reserve_worker_slot_on_owner(recipient, issue, worker_host, slice_member_ids, attempt) do
-      {:ok, reservation_token} ->
+    case reserve_worker_slot_for_dispatch(state, recipient, issue, worker_host, slice_member_ids, attempt) do
+      {:ok, reservation_token, reserved_state, local_reservation?} ->
         case start_agent_child(issue, recipient, attempt, worker_host, board_context) do
           {:ok, pid} ->
             send(recipient, {:worker_started, issue.id, pid, issue, worker_host, slice_member_ids, attempt})
@@ -1919,15 +1919,22 @@ defmodule SymphonyElixir.Orchestrator do
             # existing worker_started message remains the authority that
             # promotes it to running, so this copied state must not invent a
             # second worker entry.
-            Map.put(state, :retry_attempts, Map.delete(state.retry_attempts, issue.id))
+            Map.put(reserved_state, :retry_attempts, Map.delete(reserved_state.retry_attempts, issue.id))
 
           {:error, reason} ->
-            release_worker_reservation_on_owner(recipient, reservation_token)
+            released_state =
+              release_dispatch_reservation(
+                reserved_state,
+                recipient,
+                reservation_token,
+                local_reservation?
+              )
+
             Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
             next_attempt = if is_integer(attempt), do: attempt + 1, else: nil
 
             schedule_issue_retry(
-              state,
+              released_state,
               issue.id,
               next_attempt,
               %{
@@ -1955,6 +1962,31 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.warning("Owner rejected worker reservation for #{issue_context(issue)}: #{inspect(reason)}")
         state
     end
+  end
+
+  defp reserve_worker_slot_for_dispatch(state, recipient, issue, worker_host, slice_member_ids, attempt)
+       when recipient == self() do
+    case reserve_worker_slot(state, issue, worker_host, slice_member_ids, attempt) do
+      {:ok, token, reserved_state} -> {:ok, token, reserved_state, true}
+      error -> error
+    end
+  end
+
+  defp reserve_worker_slot_for_dispatch(state, recipient, issue, worker_host, slice_member_ids, attempt) do
+    case reserve_worker_slot_on_owner(recipient, issue, worker_host, slice_member_ids, attempt) do
+      {:ok, token} -> {:ok, token, state, false}
+      error -> error
+    end
+  end
+
+  defp release_dispatch_reservation(state, recipient, token, true) when recipient == self() do
+    {released_state, _released?} = release_worker_reservation(state, token)
+    released_state
+  end
+
+  defp release_dispatch_reservation(state, recipient, token, false) do
+    release_worker_reservation_on_owner(recipient, token)
+    state
   end
 
   defp start_agent_child(issue, recipient, attempt, worker_host, board_context) do
