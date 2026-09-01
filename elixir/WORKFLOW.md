@@ -87,10 +87,12 @@ agent:
   # the worker pool indefinitely.
   max_delivery_retry_attempts: 3
 codex:
-  # Browser MCP is opt-in for interactive work; unattended issue workers use
-  # the lightweight shared app-server profile unless a future worker role
-  # explicitly provisions browser access.
-  command: codex --config mcp_servers.playwright.enabled=false --config shell_environment_policy.inherit=all app-server
+  # Workers run in isolated app-server processes. Keep the inherited shell
+  # environment for the project toolchain, but do not pass ad-hoc MCP table
+  # overrides here: malformed project MCP entries make Codex exit before a
+  # worker can start. Browser MCP is disabled by the worker workspace config
+  # when it is not needed.
+  command: codex --config shell_environment_policy.inherit=all app-server
   # Do not attach workers to the user's interactive app-server daemon. That
   # daemon can carry the active VS Code/Codex conversation into every thread,
   # multiplying input tokens and leaking unrelated instructions. Each worker
