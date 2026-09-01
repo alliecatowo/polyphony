@@ -29,25 +29,36 @@ defmodule SymphonyElixir.DeliveryController do
   defmodule SystemCommandAdapter do
     @moduledoc false
 
+    @default_timeout_ms 120_000
+
     @spec run(Path.t(), [String.t()], keyword()) ::
             {:ok, binary(), non_neg_integer()} | {:error, term()}
     def run(cwd, argv, opts) when is_binary(cwd) and is_list(argv) do
-      if Enum.all?(argv, &is_binary/1) do
+      timeout_ms = Keyword.get(opts, :timeout, @default_timeout_ms)
+
+      if Enum.all?(argv, &is_binary/1) and is_integer(timeout_ms) and timeout_ms > 0 do
         try do
           {output, status} =
-            System.cmd("git", argv,
+            System.cmd("timeout", ["--signal=TERM", "--kill-after=100ms", timeout_duration(timeout_ms), "git" | argv],
               cd: cwd,
               stderr_to_stdout: true,
               env: Keyword.get(opts, :env, [])
             )
 
-          {:ok, output, status}
+          case status do
+            124 -> {:error, {:command_timeout, timeout_ms}}
+            _ -> {:ok, output, status}
+          end
         rescue
           error -> {:error, {:command_exception, Exception.message(error)}}
         end
       else
-        {:error, :invalid_argv}
+        if Enum.all?(argv, &is_binary/1), do: {:error, :invalid_timeout}, else: {:error, :invalid_argv}
       end
+    end
+
+    defp timeout_duration(timeout_ms) do
+      :erlang.float_to_binary(timeout_ms / 1_000, decimals: 3) <> "s"
     end
 
     @spec cleanup_workspace(Path.t()) :: :ok | {:error, term()}

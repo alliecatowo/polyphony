@@ -3,6 +3,7 @@ defmodule SymphonyElixir.DeliveryControllerTest do
 
   alias SymphonyElixir.Delivery
   alias SymphonyElixir.DeliveryController
+  alias SymphonyElixir.DeliveryController.SystemCommandAdapter
 
   setup do
     runtime_dir = Path.join(System.tmp_dir!(), "polyphony-delivery-controller-#{System.unique_integer([:positive])}")
@@ -311,6 +312,24 @@ defmodule SymphonyElixir.DeliveryControllerTest do
     assert {:ok, %{state: :waiting_ci}} = DeliveryController.codex_turn_completed(pid)
     assert {:ok, %{state: :waiting_merge}} = DeliveryController.handle_webhook_event(pid, "check_run", %{"conclusion" => "success"})
     assert {:ok, %{state: :complete}} = DeliveryController.handle_webhook_event(pid, :pull_request, %{"merged" => true, "merge_commit_sha" => "merge-10"})
+  end
+
+  test "system command adapter terminates commands that exceed the configured timeout", %{runtime_dir: runtime_dir} do
+    bin_dir = Path.join(runtime_dir, "bin")
+    File.mkdir_p!(bin_dir)
+    git_path = Path.join(bin_dir, "git")
+    File.write!(git_path, "#!/bin/sh\nexec sleep 5\n")
+    File.chmod!(git_path, 0o700)
+
+    started_at = System.monotonic_time(:millisecond)
+
+    assert {:error, {:command_timeout, 100}} =
+             SystemCommandAdapter.run(runtime_dir, [],
+               timeout: 100,
+               env: [{"PATH", bin_dir <> ":" <> System.fetch_env!("PATH")}]
+             )
+
+    assert System.monotonic_time(:millisecond) - started_at < 1_000
   end
 
   defp start_controller(runtime_dir, workspace, branch, command, github, cleanup) do
