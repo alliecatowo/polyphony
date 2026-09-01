@@ -130,6 +130,10 @@ defmodule SymphonyElixir.DeliveryController do
   @spec provider_available(GenServer.server()) :: result()
   def provider_available(server), do: call(server, :provider_available)
 
+  @doc "Resumes the persisted delivery operation after a provider recovery."
+  @spec resume_delivery(GenServer.server()) :: result()
+  def resume_delivery(server), do: call(server, :resume_delivery)
+
   @doc "Handles normalized webhook payloads without polling the whole board."
   @spec handle_webhook_event(GenServer.server(), atom() | String.t(), map()) :: result()
   def handle_webhook_event(server, event, payload),
@@ -247,6 +251,18 @@ defmodule SymphonyElixir.DeliveryController do
       {:ok, delivery} -> reply_saved(state, delivery)
       {:error, reason} -> {:reply, error_reply(state, reason), state}
     end
+  end
+
+  @impl true
+  def handle_call(:resume_delivery, _from, %{delivery: %Delivery{state: :delivering}} = state) do
+    case deliver(state) do
+      {:ok, state} -> {:reply, {:ok, state.delivery}, state}
+      {:error, reason, state} -> {:reply, error_reply(state, reason), state}
+    end
+  end
+
+  def handle_call(:resume_delivery, _from, state) do
+    {:reply, error_reply(state, {:invalid_transition, :resume_delivery}), state}
   end
 
   @impl true

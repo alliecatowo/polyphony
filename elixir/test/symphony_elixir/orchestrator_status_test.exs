@@ -4,7 +4,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   alias SymphonyElixir.Orchestrator.State
   alias SymphonyElixir.Delivery
 
-  test "provider recovery resumes a parked delivery once without changing claims or attempts" do
+  test "provider recovery re-enters a parked delivery once without releasing its claim" do
     runtime_dir =
       Path.join(
         System.tmp_dir!(),
@@ -48,17 +48,114 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     end)
 
     send(pid, :provider_available)
-    wait_until(fn -> :sys.get_state(pid).deliveries[issue_id].state == :delivering end)
+    wait_until(fn -> :sys.get_state(pid).deliveries[issue_id].state == :retry_ready end)
 
     recovered = :sys.get_state(pid)
-    assert recovered.deliveries[issue_id].last_event == :provider_available
-    assert recovered.deliveries[issue_id].attempt == 4
+    assert recovered.deliveries[issue_id].last_event == :code_failure
+    assert recovered.deliveries[issue_id].attempt == 5
     assert recovered.claimed == MapSet.new([issue_id])
-    assert recovered.retry_attempts == %{issue_id => retry_entry}
+    assert recovered.retry_attempts[issue_id].attempt == 5
+    assert is_reference(recovered.retry_attempts[issue_id].timer_ref)
 
     send(pid, :provider_available)
     Process.sleep(25)
     assert :sys.get_state(pid).deliveries[issue_id] == recovered.deliveries[issue_id]
+  end
+
+  test "targeted refresh timeout terminates the task and clears its in-flight lease" do
+    orchestrator_name = Module.concat(__MODULE__, :TargetedRefreshTimeoutOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+    end)
+
+    task =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    task_ref = Process.monitor(task)
+    timeout_ref = Process.send_after(pid, :targeted_timeout_should_be_cancelled, 60_000)
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      %{
+        initial_state
+        | target_refresh_in_progress: true,
+          target_refresh_task_pid: task,
+          target_refresh_task_ref: task_ref,
+          target_refresh_timeout_timer_ref: timeout_ref,
+          target_refresh_item: nil
+      }
+    end)
+
+    send(pid, {:targeted_refresh_timeout, task_ref})
+    wait_until(fn -> not Process.alive?(task) end)
+
+    state = :sys.get_state(pid)
+    refute state.target_refresh_in_progress
+    assert is_nil(state.target_refresh_task_pid)
+    assert is_nil(state.target_refresh_task_ref)
+    assert is_nil(state.target_refresh_timeout_timer_ref)
+  end
+
+  test "retry lookup timeout terminates the task and schedules a bounded retry" do
+    orchestrator_name = Module.concat(__MODULE__, :RetryLookupTimeoutOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+    end)
+
+    issue_id = "issue-retry-timeout"
+
+    task =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    task_ref = Process.monitor(task)
+    timeout_ref = Process.send_after(pid, :retry_timeout_should_be_cancelled, 60_000)
+    initial_state = :sys.get_state(pid)
+
+    retry_entry = %{
+      attempt: 2,
+      timer_ref: nil,
+      retry_token: make_ref(),
+      due_at_ms: System.monotonic_time(:millisecond),
+      lookup_task_pid: task,
+      lookup_task_ref: task_ref,
+      lookup_timeout_timer_ref: timeout_ref,
+      identifier: "MT-TIMEOUT",
+      error: "previous failure",
+      delay_type: :failure,
+      worker_host: nil,
+      workspace_path: nil,
+      resume_thread_id: nil,
+      failure_class: nil,
+      failure_attempt: nil,
+      delivery_retry: false,
+      delivery_failure_reason: nil,
+      slice_metadata: %{}
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      %{initial_state | retry_attempts: %{issue_id => retry_entry}}
+    end)
+
+    send(pid, {:retry_lookup_timeout, issue_id, 2, task_ref})
+    wait_until(fn -> not Process.alive?(task) end)
+
+    state = :sys.get_state(pid)
+    assert state.retry_attempts[issue_id].attempt == 3
+    assert is_reference(state.retry_attempts[issue_id].timer_ref)
+    refute Map.has_key?(state.retry_attempts[issue_id], :lookup_task_pid)
+    refute Map.has_key?(state.retry_attempts[issue_id], :lookup_task_ref)
   end
 
   test "poll completion preserves worker events and never resurrects poll snapshots" do

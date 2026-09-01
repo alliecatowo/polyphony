@@ -136,6 +136,45 @@ defmodule SymphonyElixir.DeliveryControllerTest do
     assert restored.state == :delivering
   end
 
+  test "provider recovery resumes the interrupted delivery protocol", %{runtime_dir: runtime_dir} do
+    calls = Agent.start_link(fn -> 0 end) |> elem(1)
+    workspace = "/work/issue-provider-resume"
+    branch = "agent/issue-provider-resume"
+
+    github = %{
+      find_or_create_pull_request: fn attrs ->
+        call = Agent.get_and_update(calls, fn count -> {count, count + 1} end)
+
+        if call == 0 do
+          {:error, %{status: 429, retry_at: 123}}
+        else
+          {:ok, %{"number" => 91, "head" => attrs.branch}}
+        end
+      end,
+      enable_auto_merge: fn _, _ -> :ok end
+    }
+
+    {:ok, pid} =
+      start_controller(
+        runtime_dir,
+        workspace,
+        branch,
+        command_adapter(self(), workspace, branch, []),
+        github,
+        fn _ -> :ok end
+      )
+
+    assert {:error, {:provider_unavailable, _}, %{state: :waiting_provider, attempt: 0}} =
+             DeliveryController.codex_turn_completed(pid, %{session_id: "thread-provider"})
+
+    assert {:ok, %{state: :delivering, attempt: 0}} = DeliveryController.provider_available(pid)
+
+    assert {:ok, %{state: :waiting_ci, attempt: 0, pr_number: 91}} =
+             DeliveryController.resume_delivery(pid)
+
+    assert Agent.get(calls, & &1) == 2
+  end
+
   test "invalid PR proof and auto-merge failures are classified as code delivery failures", %{runtime_dir: runtime_dir} do
     invalid_pr = %{
       find_or_create_pull_request: fn _ -> {:ok, %{"number" => 12, "head" => "agent/another-issue"}} end,
