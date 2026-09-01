@@ -27,4 +27,9 @@ trap cleanup EXIT HUP INT TERM
 
 export CODEX_HOME="$worker_home"
 export CODEX_APP_SERVER_SOCKET="$worker_home/app-server-control/app-server-control.sock"
+# Git's fsmonitor daemon otherwise survives the short workspace hooks and
+# leaves orphaned processes/scopes behind between worker attempts.
+export GIT_CONFIG_COUNT=1
+export GIT_CONFIG_KEY_0=core.fsmonitor
+export GIT_CONFIG_VALUE_0=false
 codex "$@"

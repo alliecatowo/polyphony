@@ -483,7 +483,14 @@ defmodule SymphonyElixir.Workspace do
 
   defp bounded_hook_command(command, hook_name, workspace)
        when is_binary(command) and is_binary(hook_name) and is_binary(workspace) do
-    Config.worker_resource_command("sh -lc #{shell_escape(command)}", "hook-#{hook_name}-#{Path.basename(workspace)}")
+    # Hooks are intentionally short-lived. Disable Git's fsmonitor for them;
+    # otherwise `git status`/`git switch` can leave a detached fsmonitor
+    # daemon in the transient systemd scope after the hook exits.
+    hook_command =
+      "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false; " <>
+        command
+
+    Config.worker_resource_command("sh -lc #{shell_escape(hook_command)}", "hook-#{hook_name}-#{Path.basename(workspace)}")
   end
 
   defp handle_hook_command_result({_output, 0}, _workspace, _issue_id, _hook_name) do
