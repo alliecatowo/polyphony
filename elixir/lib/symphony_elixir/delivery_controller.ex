@@ -39,7 +39,9 @@ defmodule SymphonyElixir.DeliveryController do
       if Enum.all?(argv, &is_binary/1) and is_integer(timeout_ms) and timeout_ms > 0 do
         try do
           {output, status} =
-            System.cmd("timeout", ["--signal=TERM", "--kill-after=100ms", timeout_duration(timeout_ms), "git" | argv],
+            # Use the portable seconds form: this host's timeout accepts
+            # fractional seconds but rejects the millisecond suffix here.
+            System.cmd("timeout", ["--signal=TERM", "--kill-after=0.1s", timeout_duration(timeout_ms), "git" | argv],
               cd: cwd,
               stderr_to_stdout: true,
               env: Keyword.get(opts, :env, [])
@@ -915,18 +917,18 @@ defmodule SymphonyElixir.DeliveryController do
 
   defp truthy?(value), do: value in [true, "true", 1, "1"]
 
-  defp provider_error?(reason) do
-    text = inspect(reason, limit: 20, printable_limit: 2_000) |> String.downcase()
+  # Provider parking is reserved for typed transient failures. Treating every
+  # `github_api` error as an outage turns deterministic 400/permission errors
+  # into an infinite parked loop and hides the actionable delivery failure.
+  defp provider_error?({:github, reason}), do: provider_error?(reason)
+  defp provider_error?({:provider, _reason}), do: true
+  defp provider_error?({:rate_limited, _reason}), do: true
+  defp provider_error?({:github_rate_limited, _reset_at, _retry_after}), do: true
+  defp provider_error?({:github_provider_unavailable, _details}), do: true
 
-    match?({:provider, _}, reason) or
-      match?({:rate_limited, _}, reason) or
-      value(reason, :provider_error) == true or
-      value(reason, :rate_limited) == true or
-      String.contains?(text, "rate limit") or
-      String.contains?(text, "rate_limit") or
-      String.contains?(text, "github_api") or
-      String.contains?(text, "provider unavailable") or
-      String.contains?(text, "status: 429") or
-      String.contains?(text, "status: 503")
+  defp provider_error?(reason) when is_map(reason) do
+    value(reason, :provider_error) == true or value(reason, :rate_limited) == true
   end
+
+  defp provider_error?(_reason), do: false
 end
