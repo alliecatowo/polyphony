@@ -60,8 +60,13 @@ defmodule SymphonyElixir.Orchestrator do
       :github_projection,
       :target_refresh_in_progress,
       :target_refresh_timer_ref,
+      :target_refresh_task_pid,
+      :target_refresh_task_ref,
+      :target_refresh_item,
       :delivery_reconcile_in_progress,
       :delivery_reconcile_timer_ref,
+      :delivery_reconcile_task_pid,
+      :delivery_reconcile_task_ref,
       :delivery_reconcile_cursor,
       delivery_reconcile_cycle_count: 0,
       running: %{},
@@ -89,6 +94,7 @@ defmodule SymphonyElixir.Orchestrator do
   def init(opts) do
     now_ms = System.monotonic_time(:millisecond)
     config = Config.settings!()
+
     deliveries =
       opts
       |> load_deliveries()
@@ -109,8 +115,13 @@ defmodule SymphonyElixir.Orchestrator do
       github_projection: load_github_projection(opts),
       target_refresh_in_progress: false,
       target_refresh_timer_ref: nil,
+      target_refresh_task_pid: nil,
+      target_refresh_task_ref: nil,
+      target_refresh_item: nil,
       delivery_reconcile_in_progress: false,
       delivery_reconcile_timer_ref: nil,
+      delivery_reconcile_task_pid: nil,
+      delivery_reconcile_task_ref: nil,
       delivery_reconcile_cursor: nil,
       delivery_reconcile_cycle_count: 0,
       deliveries: deliveries,
@@ -273,6 +284,58 @@ defmodule SymphonyElixir.Orchestrator do
 
     notify_dashboard()
     {:noreply, state}
+  end
+
+  def handle_info({:DOWN, task_ref, :process, _pid, reason}, %State{target_refresh_task_ref: task_ref} = state)
+      when is_reference(task_ref) do
+    # A supervised task can die without sending its result message. Release
+    # the in-flight lease so one bad provider/client task cannot wedge the
+    # targeted queue forever.
+    item = state.target_refresh_item
+    state = clear_target_refresh_tracking(state)
+    provider_wait? = provider_wait_error?(reason) or github_gateway_open?()
+
+    state =
+      state
+      |> requeue_targeted_item(item, {:target_refresh_task_exit, reason}, not provider_wait?)
+      |> schedule_targeted_refresh(if(provider_wait?, do: provider_retry_delay(), else: targeted_failure_delay(item)))
+
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info({:DOWN, task_ref, :process, _pid, reason}, %State{delivery_reconcile_task_ref: task_ref} = state)
+      when is_reference(task_ref) do
+    Logger.warning("Delivery reconciliation task exited: #{inspect(reason)}")
+    state = clear_delivery_reconcile_tracking(state)
+    {:noreply, schedule_delivery_reconcile(state, if(github_gateway_open?(), do: provider_retry_delay(), else: @delivery_reconcile_interval_ms))}
+  end
+
+  def handle_info({:DOWN, task_ref, :process, _pid, reason}, %State{} = state)
+      when is_reference(task_ref) do
+    case find_retry_lookup(state.retry_attempts, task_ref) do
+      {issue_id, retry_entry} ->
+        provider_wait? = github_gateway_open?() or provider_wait_error?(reason)
+        state = %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}
+        metadata = retry_metadata(retry_entry)
+
+        next_state =
+          schedule_issue_retry(
+            state,
+            issue_id,
+            if(provider_wait?, do: retry_entry.attempt, else: retry_entry.attempt + 1),
+            Map.merge(metadata, %{
+              error: if(provider_wait?, do: metadata[:error], else: "retry lookup task exited: #{inspect(reason)}"),
+              delay_type: if(provider_wait?, do: :provider, else: :failure)
+            })
+          )
+
+        notify_dashboard()
+        {:noreply, next_state}
+
+      nil ->
+        {:noreply, state}
+    end
   end
 
   def handle_info(
@@ -523,6 +586,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info({:retry_issue_lookup, issue_id, attempt, metadata, {:ok, issues}}, state) do
+    state = clear_retry_lookup_state(state, issue_id, attempt)
+
     next_state =
       issues
       |> find_issue_by_id(issue_id)
@@ -533,13 +598,18 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info({:retry_issue_lookup, issue_id, attempt, metadata, {:error, reason}}, state) do
-    Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
-
     provider_wait? = provider_wait_error?(reason)
 
+    if provider_wait? do
+      Logger.debug("Retry poll parked for provider wait issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}")
+    else
+      Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
+    end
+
     next_state =
-      schedule_issue_retry(
-        state,
+      state
+      |> clear_retry_lookup_state(issue_id, attempt)
+      |> schedule_issue_retry(
         issue_id,
         if(provider_wait?, do: attempt, else: attempt + 1),
         Map.merge(metadata, %{
@@ -589,8 +659,9 @@ defmodule SymphonyElixir.Orchestrator do
 
                    send(owner, {:targeted_refresh_result, item, result})
                  end) do
-              {:ok, _pid} ->
-                {:noreply, %{state | target_refresh_in_progress: true}}
+              {:ok, pid} ->
+                task_ref = Process.monitor(pid)
+                {:noreply, %{state | target_refresh_in_progress: true, target_refresh_task_pid: pid, target_refresh_task_ref: task_ref, target_refresh_item: item}}
 
               {:error, reason} ->
                 state = requeue_targeted_item(state, item, reason, true)
@@ -601,6 +672,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info({:targeted_refresh_result, item, {:ok, issues}}, %State{} = state) do
+    state = clear_target_refresh_tracking(state)
+
     case targeted_dispatch_issue(issues, state) do
       nil ->
         state =
@@ -622,8 +695,8 @@ defmodule SymphonyElixir.Orchestrator do
 
     state =
       state
+      |> clear_target_refresh_tracking()
       |> requeue_targeted_item(item, reason, not provider_wait?)
-      |> Map.put(:target_refresh_in_progress, false)
       |> schedule_targeted_refresh(if(provider_wait?, do: provider_retry_delay(), else: targeted_failure_delay(item)))
 
     notify_dashboard()
@@ -638,7 +711,7 @@ defmodule SymphonyElixir.Orchestrator do
       state
       |> merge_poll_cycle_state(dispatched_state, base_running)
       |> acknowledge_targeted_item(item, %{reason: :dispatch_evaluated})
-      |> Map.put(:target_refresh_in_progress, false)
+      |> clear_target_refresh_tracking()
       |> schedule_targeted_refresh(0)
 
     notify_dashboard()
@@ -649,7 +722,7 @@ defmodule SymphonyElixir.Orchestrator do
     state =
       state
       |> requeue_targeted_item(item, reason, true)
-      |> Map.put(:target_refresh_in_progress, false)
+      |> clear_target_refresh_tracking()
       |> schedule_targeted_refresh(targeted_failure_delay(item))
 
     notify_dashboard()
@@ -682,10 +755,12 @@ defmodule SymphonyElixir.Orchestrator do
                    result_task =
                      Task.async(fn ->
                        try do
-                         result = DeliveryAdapter.inspect_pull_request(%{
-                           pr_number: delivery.pr_number,
-                           commit_sha: delivery.commit_sha
-                         })
+                         result =
+                           DeliveryAdapter.inspect_pull_request(%{
+                             pr_number: delivery.pr_number,
+                             commit_sha: delivery.commit_sha
+                           })
+
                          result
                        rescue
                          exception -> {:error, {:delivery_reconcile_exception, exception, __STACKTRACE__}}
@@ -704,8 +779,9 @@ defmodule SymphonyElixir.Orchestrator do
 
                    send(owner, {:delivery_reconcile_result, issue_id, result})
                  end) do
-              {:ok, _pid} ->
-                {:noreply, %{state | delivery_reconcile_in_progress: true}}
+              {:ok, pid} ->
+                task_ref = Process.monitor(pid)
+                {:noreply, %{state | delivery_reconcile_in_progress: true, delivery_reconcile_task_pid: pid, delivery_reconcile_task_ref: task_ref}}
 
               {:error, reason} ->
                 Logger.warning("Unable to start delivery reconciliation for issue_id=#{issue_id}: #{inspect(reason)}")
@@ -716,7 +792,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info({:delivery_reconcile_result, issue_id, {:ok, summary}}, %State{} = state) do
-    state = %{state | delivery_reconcile_in_progress: false}
+    state = clear_delivery_reconcile_tracking(state)
 
     state =
       case Map.get(state.deliveries, issue_id) do
@@ -730,7 +806,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:delivery_reconcile_result, issue_id, {:error, reason}}, %State{} = state) do
     Logger.warning("Delivery reconciliation failed for issue_id=#{issue_id}: #{inspect(reason)}")
-    state = Map.put(state, :delivery_reconcile_in_progress, false)
+    state = clear_delivery_reconcile_tracking(state)
 
     if provider_wait_error?(reason) do
       {:noreply, schedule_delivery_reconcile(state, provider_retry_delay())}
@@ -748,6 +824,10 @@ defmodule SymphonyElixir.Orchestrator do
     cond do
       not control_admits?(state, :worker) ->
         Logger.debug("Control state #{state.control && state.control.state} blocks new worker admission")
+        state
+
+      github_gateway_open?() ->
+        Logger.debug("GitHub provider circuit open; parking tracker poll")
         state
 
       github_rate_limited?(state) ->
@@ -834,7 +914,7 @@ defmodule SymphonyElixir.Orchestrator do
     state = reconcile_stalled_running_issues(state, owner)
     running_ids = Map.keys(state.running)
 
-    if running_ids == [] do
+    if running_ids == [] or github_gateway_open?() do
       state
     else
       case Tracker.fetch_issue_states_by_ids(running_ids) do
@@ -1298,28 +1378,33 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host, board_context, orchestrator)
        when is_pid(orchestrator) do
-    case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
-      {:ok, %{} = refreshed_issue} ->
-        refreshed_issue = preserve_slice_metadata(issue, refreshed_issue)
+    if github_gateway_open?() do
+      Logger.debug("GitHub provider circuit open; parking dispatch revalidation for #{issue_context(issue)}")
+      state
+    else
+      case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
+        {:ok, %{} = refreshed_issue} ->
+          refreshed_issue = preserve_slice_metadata(issue, refreshed_issue)
 
-        refreshed_issue
-        |> reconcile_tracker_primitives_for_dispatch()
-        |> then(fn reconciled_issue ->
-          do_dispatch_issue(state, reconciled_issue, attempt, preferred_worker_host, board_context, orchestrator)
-        end)
+          refreshed_issue
+          |> reconcile_tracker_primitives_for_dispatch()
+          |> then(fn reconciled_issue ->
+            do_dispatch_issue(state, reconciled_issue, attempt, preferred_worker_host, board_context, orchestrator)
+          end)
 
-      {:skip, :missing} ->
-        Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
-        state
+        {:skip, :missing} ->
+          Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
+          state
 
-      {:skip, %{} = refreshed_issue} ->
-        Logger.info("Skipping stale dispatch after issue refresh: #{issue_context(refreshed_issue)} state=#{inspect(refreshed_issue.state)} blocked_by=#{length(refreshed_issue.blocked_by)}")
+        {:skip, %{} = refreshed_issue} ->
+          Logger.info("Skipping stale dispatch after issue refresh: #{issue_context(refreshed_issue)} state=#{inspect(refreshed_issue.state)} blocked_by=#{length(refreshed_issue.blocked_by)}")
 
-        state
+          state
 
-      {:error, reason} ->
-        Logger.warning("Skipping dispatch; issue refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
-        state
+        {:error, reason} ->
+          Logger.warning("Skipping dispatch; issue refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
+          state
+      end
     end
   end
 
@@ -1716,6 +1801,52 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp retry_metadata(retry_entry) when is_map(retry_entry) do
+    %{
+      identifier: Map.get(retry_entry, :identifier),
+      error: Map.get(retry_entry, :error),
+      delay_type: Map.get(retry_entry, :delay_type),
+      worker_host: Map.get(retry_entry, :worker_host),
+      workspace_path: Map.get(retry_entry, :workspace_path),
+      resume_thread_id: Map.get(retry_entry, :resume_thread_id),
+      failure_class: Map.get(retry_entry, :failure_class),
+      failure_attempt: Map.get(retry_entry, :failure_attempt),
+      delivery_retry: Map.get(retry_entry, :delivery_retry, false),
+      delivery_failure_reason: Map.get(retry_entry, :delivery_failure_reason),
+      slice_metadata: Map.get(retry_entry, :slice_metadata, %{})
+    }
+  end
+
+  defp find_retry_lookup(retry_attempts, task_ref) when is_map(retry_attempts) and is_reference(task_ref) do
+    Enum.find_value(retry_attempts, fn
+      {issue_id, %{lookup_task_ref: ^task_ref} = retry_entry} -> {issue_id, retry_entry}
+      _ -> nil
+    end)
+  end
+
+  defp find_retry_lookup(_retry_attempts, _task_ref), do: nil
+
+  defp clear_retry_lookup_state(%State{} = state, issue_id, attempt) do
+    case Map.get(state.retry_attempts, issue_id) do
+      %{attempt: ^attempt, lookup_task_ref: task_ref} = retry_entry when is_reference(task_ref) ->
+        Process.demonitor(task_ref, [:flush])
+        %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}
+
+      _ ->
+        state
+    end
+  end
+
+  defp park_retry_for_provider(%State{} = state, issue_id, retry_token) do
+    case Map.get(state.retry_attempts, issue_id) do
+      %{attempt: attempt, retry_token: ^retry_token} = retry_entry ->
+        schedule_issue_retry(state, issue_id, attempt, Map.put(retry_metadata(retry_entry), :delay_type, :provider))
+
+      _ ->
+        state
+    end
+  end
+
   defp handle_retry_issue_lookup(%{} = issue, state, issue_id, attempt, metadata) do
     terminal_states = terminal_state_set()
 
@@ -1901,7 +2032,15 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp github_gateway_open? do
+    case GitHubGateway.snapshot() do
+      %{available?: true, circuit: :open} -> true
+      _ -> false
+    end
+  end
+
   defp provider_wait_error?({:github_rate_limited, _reset_at, _retry_in_ms}), do: true
+  defp provider_wait_error?({:github_provider_unavailable, _details}), do: true
 
   defp provider_wait_error?(reason) when is_tuple(reason) do
     reason
@@ -2421,11 +2560,13 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp poll_delay(%State{github_rate_limited_until_ms: until_ms}) when is_integer(until_ms) do
-    max(0, until_ms - System.monotonic_time(:millisecond))
+  defp poll_delay(%State{} = state) do
+    cond do
+      github_gateway_open?() -> provider_retry_delay()
+      is_integer(state.github_rate_limited_until_ms) -> max(0, state.github_rate_limited_until_ms - System.monotonic_time(:millisecond))
+      true -> state.poll_interval_ms
+    end
   end
-
-  defp poll_delay(%State{poll_interval_ms: interval_ms}), do: interval_ms
 
   defp github_rate_limited?(%State{github_rate_limited_until_ms: until_ms})
        when is_integer(until_ms),
@@ -2509,6 +2650,22 @@ defmodule SymphonyElixir.Orchestrator do
         poll_task_ref: nil,
         poll_timeout_timer_ref: nil
     }
+  end
+
+  defp clear_target_refresh_tracking(%State{} = state) do
+    if is_reference(state.target_refresh_task_ref) do
+      Process.demonitor(state.target_refresh_task_ref, [:flush])
+    end
+
+    %{state | target_refresh_in_progress: false, target_refresh_task_pid: nil, target_refresh_task_ref: nil, target_refresh_item: nil}
+  end
+
+  defp clear_delivery_reconcile_tracking(%State{} = state) do
+    if is_reference(state.delivery_reconcile_task_ref) do
+      Process.demonitor(state.delivery_reconcile_task_ref, [:flush])
+    end
+
+    %{state | delivery_reconcile_in_progress: false, delivery_reconcile_task_pid: nil, delivery_reconcile_task_ref: nil}
   end
 
   defp next_poll_in_ms(nil, _now_ms), do: nil
@@ -2985,43 +3142,59 @@ defmodule SymphonyElixir.Orchestrator do
   defp integer_like(_value), do: nil
 
   defp handle_retry_timer(issue_id, retry_token, state) do
-    case pop_retry_attempt_state(state, issue_id, retry_token) do
-      {:ok, attempt, metadata, state} ->
-        orchestrator = self()
+    if github_gateway_open?() do
+      {:noreply, park_retry_for_provider(state, issue_id, retry_token)}
+    else
+      case pop_retry_attempt_state(state, issue_id, retry_token) do
+        {:ok, attempt, metadata, state} ->
+          orchestrator = self()
 
-        case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-               result =
-                 try do
-                   Tracker.fetch_issue_states_by_ids([issue_id])
-                 rescue
-                   exception -> {:error, {:exception, exception, __STACKTRACE__}}
-                 catch
-                   kind, reason -> {:error, {kind, reason}}
-                 end
+          case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
+                 result =
+                   try do
+                     Tracker.fetch_issue_states_by_ids([issue_id])
+                   rescue
+                     exception -> {:error, {:exception, exception, __STACKTRACE__}}
+                   catch
+                     kind, reason -> {:error, {kind, reason}}
+                   end
 
-               send(orchestrator, {:retry_issue_lookup, issue_id, attempt, metadata, result})
-             end) do
-          {:ok, _pid} ->
-            notify_dashboard()
-            {:noreply, state}
+                 send(orchestrator, {:retry_issue_lookup, issue_id, attempt, metadata, result})
+               end) do
+            {:ok, pid} ->
+              task_ref = Process.monitor(pid)
 
-          {:error, reason} ->
-            Logger.warning("Failed to start retry lookup for issue_id=#{issue_id}: #{inspect(reason)}")
+              retry_entry = %{
+                attempt: attempt,
+                timer_ref: nil,
+                retry_token: make_ref(),
+                due_at_ms: System.monotonic_time(:millisecond),
+                lookup_task_pid: pid,
+                lookup_task_ref: task_ref
+              }
 
-            next_state =
-              schedule_issue_retry(
-                state,
-                issue_id,
-                attempt + 1,
-                Map.merge(metadata, %{error: "retry lookup task failed: #{inspect(reason)}"})
-              )
+              state = %{state | retry_attempts: Map.put(state.retry_attempts, issue_id, Map.merge(retry_entry, metadata))}
+              notify_dashboard()
+              {:noreply, state}
 
-            notify_dashboard()
-            {:noreply, next_state}
-        end
+            {:error, reason} ->
+              Logger.warning("Failed to start retry lookup for issue_id=#{issue_id}: #{inspect(reason)}")
 
-      :missing ->
-        {:noreply, state}
+              next_state =
+                schedule_issue_retry(
+                  state,
+                  issue_id,
+                  attempt + 1,
+                  Map.merge(metadata, %{error: "retry lookup task failed: #{inspect(reason)}"})
+                )
+
+              notify_dashboard()
+              {:noreply, next_state}
+          end
+
+        :missing ->
+          {:noreply, state}
+      end
     end
   end
 
@@ -3366,19 +3539,23 @@ defmodule SymphonyElixir.Orchestrator do
   defp next_reconcilable_delivery(deliveries, cursor) when is_map(deliveries) do
     candidates =
       deliveries
-    |> Enum.filter(fn
-      {_issue_id, %Delivery{state: state, pr_number: pr_number}}
-      when state in [:waiting_ci, :waiting_merge] and is_integer(pr_number) and pr_number > 0 ->
-        true
+      |> Enum.filter(fn
+        {_issue_id, %Delivery{state: state, pr_number: pr_number}}
+        when state in [:waiting_ci, :waiting_merge] and is_integer(pr_number) and pr_number > 0 ->
+          true
 
-      _ ->
-        false
-    end)
-    |> Enum.sort_by(fn {issue_id, _delivery} -> issue_id end)
+        _ ->
+          false
+      end)
+      |> Enum.sort_by(fn {issue_id, _delivery} -> issue_id end)
 
     case candidates do
-      [] -> nil
-      candidates when is_nil(cursor) -> List.first(candidates)
+      [] ->
+        nil
+
+      candidates when is_nil(cursor) ->
+        List.first(candidates)
+
       candidates ->
         {before, after_cursor} = Enum.split_while(candidates, fn {issue_id, _} -> issue_id != cursor end)
 
@@ -3411,8 +3588,11 @@ defmodule SymphonyElixir.Orchestrator do
   defp reconcilable_delivery_count(deliveries) do
     Enum.count(deliveries, fn
       {_issue_id, %Delivery{state: state, pr_number: pr_number}}
-      when state in [:waiting_ci, :waiting_merge] and is_integer(pr_number) and pr_number > 0 -> true
-      _ -> false
+      when state in [:waiting_ci, :waiting_merge] and is_integer(pr_number) and pr_number > 0 ->
+        true
+
+      _ ->
+        false
     end)
   end
 
@@ -3696,8 +3876,9 @@ defmodule SymphonyElixir.Orchestrator do
                send(owner, {:targeted_dispatch_failed, item, reason})
            end
          end) do
-      {:ok, _pid} ->
-        {:noreply, state}
+      {:ok, pid} ->
+        task_ref = Process.monitor(pid)
+        {:noreply, %{state | target_refresh_in_progress: true, target_refresh_task_pid: pid, target_refresh_task_ref: task_ref, target_refresh_item: item}}
 
       {:error, reason} ->
         next_state =

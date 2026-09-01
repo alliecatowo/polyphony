@@ -6,6 +6,7 @@ defmodule SymphonyElixir.AgentRunner do
   require Logger
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.{Config, Delivery, DeliveryController, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.GitHub.Gateway, as: GitHubGateway
   alias SymphonyElixir.GitHub.DeliveryAdapter
 
   @type worker_host :: String.t() | nil
@@ -200,6 +201,16 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp continue_with_issue?(%{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
+    case GitHubGateway.snapshot() do
+      %{available?: true, circuit: :open} ->
+        {:error, {:provider_unavailable, :github_circuit_open}}
+
+      _ ->
+        refresh_issue_state(issue, issue_id, issue_state_fetcher)
+    end
+  end
+
+  defp refresh_issue_state(issue, issue_id, issue_state_fetcher) do
     case issue_state_fetcher.([issue_id]) do
       {:ok, [%{} = refreshed_issue | _]} ->
         if active_issue_state?(refreshed_issue.state) do
@@ -228,6 +239,7 @@ defmodule SymphonyElixir.AgentRunner do
   defp active_issue_state?(_state_name), do: false
 
   defp provider_wait_error?({:github_rate_limited, _reset_at, _retry_in_ms}), do: true
+  defp provider_wait_error?({:github_provider_unavailable, _details}), do: true
   defp provider_wait_error?({:codex_provider_unavailable, _details}), do: true
   defp provider_wait_error?({:provider_unavailable, _details}), do: true
 
