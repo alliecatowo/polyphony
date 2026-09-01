@@ -2265,6 +2265,14 @@ defmodule SymphonyElixir.GitHub.Client do
 
         {:ok, blocked_numbers}
 
+      # GitHub has returned a successful response without either documented
+      # dependency key for this endpoint (for example while the dependency
+      # preview is unavailable). Treat that as an empty dependency set. A
+      # successful request must not be reported as an API failure or cause a
+      # dispatch to be needlessly retried.
+      {:ok, %{status: 200}} ->
+        {:ok, []}
+
       {:ok, %{status: status}} ->
         Logger.error("GitHub fetch blocked_by failed status=#{status}")
         {:error, {:github_api_status, status}}

@@ -2453,7 +2453,10 @@ defmodule SymphonyElixir.Orchestrator do
   defp select_worker_host(%State{} = state, preferred_worker_host, candidate_hosts) do
     case candidate_hosts do
       [] ->
-        nil
+        # An empty SSH host list is the normal local-worker configuration.
+        # Keep the host value nil so Workspace/AgentRunner use the local
+        # process path, but still account for it as a bounded worker slot.
+        select_worker_host(state, preferred_worker_host, [nil])
 
       hosts ->
         available_hosts = Enum.filter(hosts, &worker_host_slots_available?(state, &1))
@@ -2494,6 +2497,8 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
+  defp running_worker_host_count(_running, nil), do: 0
+
   defp reserved_worker_host_count(reservations, worker_host)
        when is_map(reservations) and is_binary(worker_host) do
     Enum.count(reservations, fn
@@ -2501,6 +2506,8 @@ defmodule SymphonyElixir.Orchestrator do
       _ -> false
     end)
   end
+
+  defp reserved_worker_host_count(_reservations, nil), do: 0
 
   defp reserved_worker_host_count(_reservations, _worker_host), do: 0
 
