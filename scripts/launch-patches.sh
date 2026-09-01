@@ -30,7 +30,6 @@ if [[ ! -e "$polyphony_codex_home/packages" && -d "$user_home/.codex/packages" ]
 fi
 cp "$repo_root/scripts/polyphony-codex-config.toml" "$polyphony_codex_home/config.toml"
 export CODEX_HOME="$polyphony_codex_home"
-export POLYPHONY_WORKER_CODEX_CONFIG="$repo_root/scripts/worker-codex-config.toml"
 # Do not pin workers to one daemon-owned app-server socket. The worker wrapper
 # assigns each Codex process its own socket so its process tree stays inside
 # its transient systemd/cgroup scope.
@@ -163,8 +162,7 @@ for config_var in \
   POLYPHONY_SKIP_BOARD_ENRICHMENT \
   POLYPHONY_RUNTIME_STATE_DIR \
   POLYPHONY_PROJECT_ID \
-  POLYPHONY_PROJECT_CGROUP \
-  POLYPHONY_WORKER_CODEX_CONFIG; do
+  POLYPHONY_PROJECT_CGROUP; do
   if [[ -n "${!config_var:-}" ]]; then
     auth_args+=(--setenv="$config_var=${!config_var}")
   fi
