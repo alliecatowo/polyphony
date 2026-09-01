@@ -91,7 +91,11 @@ codex:
   # the lightweight shared app-server profile unless a future worker role
   # explicitly provisions browser access.
   command: codex --config mcp_servers.playwright.enabled=false --config shell_environment_policy.inherit=all app-server
-  shared_app_server: true
+  # Do not attach workers to the user's interactive app-server daemon. That
+  # daemon can carry the active VS Code/Codex conversation into every thread,
+  # multiplying input tokens and leaking unrelated instructions. Each worker
+  # gets a clean local app-server process under Polyphony's isolated CODEX_HOME.
+  shared_app_server: false
   read_timeout_ms: 30000
   models:
     default: gpt-5.6-luna
