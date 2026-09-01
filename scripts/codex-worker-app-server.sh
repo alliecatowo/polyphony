@@ -25,4 +25,4 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 export CODEX_HOME="$worker_home"
-exec codex "$@"
+codex "$@"
