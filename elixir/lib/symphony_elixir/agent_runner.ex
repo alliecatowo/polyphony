@@ -455,30 +455,16 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp retry_existing_delivery(delivery, issue, worker_host, recipient, opts) do
-    with {:ok, controller} <-
-           DeliveryController.start_link(
-             delivery_id: issue.id,
-             delivery: delivery,
-             runtime_dir: delivery_runtime_dir(),
-             github_adapter: Keyword.get(opts, :delivery_github_adapter, DeliveryAdapter),
-             command_adapter: Keyword.get(opts, :delivery_command_adapter, DeliveryController.SystemCommandAdapter),
-             cleanup_adapter: Keyword.get(opts, :delivery_cleanup_adapter, DeliveryController.SystemCommandAdapter)
-           ),
-         {:ok, %Delivery{state: :executing}} <- DeliveryController.admit_retry(controller),
-         result <-
-           DeliveryController.codex_turn_completed(controller, %{
-             session_id: Map.get(delivery.metadata, "session_id"),
-             thread_id: Map.get(delivery.metadata, "thread_id"),
-             summary: Map.get(delivery.metadata, "codex_summary")
-           }) do
-      handle_delivery_result(result, controller, issue, recipient, worker_host)
-    else
-      {:error, reason, %Delivery{} = failed_delivery} ->
-        send_delivery_update(recipient, issue, failed_delivery, worker_host)
-        {:error, {:delivery_retry_failed, reason}}
+    workspace = delivery.workspace
 
-      {:error, reason} ->
-        {:error, {:delivery_retry_failed, reason}}
+    # A retry is a new implementation turn with the prior delivery evidence
+    # available in the worktree/persisted delivery. Replaying delivery alone
+    # cannot repair a conflict or failing CI and creates a hot retry loop.
+    with :ok <- prepare_delivery_for_model_retry(issue, workspace, worker_host, recipient, opts),
+         :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host),
+         {:ok, turn_session} <-
+           run_codex_with_finalized_hooks(workspace, issue, recipient, opts, worker_host) do
+      maybe_deliver_turn(issue, workspace, worker_host, turn_session, recipient, opts)
     end
   end
 
