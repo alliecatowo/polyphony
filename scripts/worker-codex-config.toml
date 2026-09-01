@@ -5,5 +5,12 @@
 approval_policy = "never"
 sandbox_mode = "workspace-write"
 model_reasoning_effort = "medium"
+include_apps_instructions = false
+include_permissions_instructions = false
+include_environment_context = false
+include_collaboration_mode_instructions = false
+include_skills_usage_instructions = false
+include_plugin_usage_instructions = false
+include_apps_usage_instructions = false
 
 [mcp_servers]

@@ -70,6 +70,14 @@ hooks:
   after_run: |
     issue_id="$(basename "$PWD")"
     printf '%s phase=after_run workspace=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD" >> "docs/issues/${issue_id}/run-log.md"
+    # The worker-local Codex profile is runtime scaffolding, not product work.
+    # Restore the repository version before Polyphony computes delivery status
+    # so it can never leak into a PR.
+    if git diff --quiet -- .codex/config.toml; then
+      true
+    else
+      git restore -- .codex/config.toml
+    fi
   before_remove: |
     true
 worker:
