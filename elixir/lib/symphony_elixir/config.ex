@@ -133,7 +133,14 @@ defmodule SymphonyElixir.Config do
   @spec worker_resource_command(String.t(), String.t()) :: String.t()
   def worker_resource_command(command, unit_suffix) when is_binary(command) and is_binary(unit_suffix) do
     worker = settings!().worker
-    unit = "polyphony-agent-" <> sanitize_unit_suffix(unit_suffix)
+    # A worker/retry can be relaunched while systemd is still collecting the
+    # previous scope. Reusing the issue-only unit name then fails before Codex
+    # starts (`Unit ... was already loaded`). Keep the readable issue suffix,
+    # but make every resource scope unique for its lifetime.
+    unit =
+      "polyphony-agent-" <>
+        sanitize_unit_suffix(unit_suffix) <>
+        "-" <> Integer.to_string(System.unique_integer([:positive]))
 
     prefix =
       [
