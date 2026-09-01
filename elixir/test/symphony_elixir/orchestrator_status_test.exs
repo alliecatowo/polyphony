@@ -62,6 +62,67 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert :sys.get_state(pid).deliveries[issue_id] == recovered.deliveries[issue_id]
   end
 
+  test "provider recovery is asynchronous, deduplicated, and timeout-cleaned" do
+    orchestrator_name = Module.concat(__MODULE__, :AsyncProviderRecoveryOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+    end)
+
+    issue_id = "issue-provider-recovery-timeout"
+
+    parked =
+      Delivery.new(
+        issue_id: issue_id,
+        workspace: "/work/#{issue_id}",
+        branch: "agent/#{issue_id}",
+        state: :waiting_provider,
+        resume_state: :delivering,
+        provider_error: :rate_limited,
+        provider_retry_at: 123,
+        attempt: 4,
+        metadata: %{"identifier" => "MT-PROVIDER-TIMEOUT"}
+      )
+
+    task =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    task_ref = make_ref()
+    timeout_ref = Process.send_after(pid, :provider_recovery_timeout_should_be_cancelled, 60_000)
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      %{
+        initial_state
+        | deliveries: %{issue_id => parked},
+          claimed: MapSet.new([issue_id]),
+          provider_recovery_tasks: %{
+            issue_id => %{pid: task, task_ref: task_ref, timeout_timer_ref: timeout_ref}
+          }
+      }
+    end)
+
+    send(pid, :provider_available)
+    assert is_map(GenServer.call(pid, :snapshot, 100))
+
+    state_while_running = :sys.get_state(pid)
+    assert state_while_running.provider_recovery_tasks[issue_id].task_ref == task_ref
+    assert Process.alive?(task)
+
+    send(pid, {:provider_recovery_timeout, issue_id, task_ref})
+    wait_until(fn -> not Process.alive?(task) end)
+
+    recovered = :sys.get_state(pid)
+    assert recovered.provider_recovery_tasks == %{}
+    assert recovered.deliveries[issue_id] == parked
+    assert recovered.claimed == MapSet.new([issue_id])
+  end
+
   test "targeted refresh timeout terminates the task and clears its in-flight lease" do
     orchestrator_name = Module.concat(__MODULE__, :TargetedRefreshTimeoutOrchestrator)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)

@@ -27,6 +27,10 @@ defmodule SymphonyElixir.Orchestrator do
   @delivery_reconcile_timeout_ms 45_000
   @targeted_refresh_timeout_ms 45_000
   @retry_lookup_timeout_ms 45_000
+  # DeliveryController may need to invoke git or the provider while resuming a
+  # parked delivery. Keep that work out of this GenServer and kill it if the
+  # lower layer fails to return so scheduler control messages remain live.
+  @provider_recovery_timeout_ms 45_000
   @stall_check_interval_ms 30_000
   # A poll may perform several bounded provider calls, but it must never be
   # able to wedge admission forever if a provider/client task disappears.
@@ -72,6 +76,7 @@ defmodule SymphonyElixir.Orchestrator do
       :delivery_reconcile_task_ref,
       :delivery_reconcile_cursor,
       :delivery_runtime_dir,
+      provider_recovery_tasks: %{},
       delivery_reconcile_cycle_count: 0,
       running: %{},
       deliveries: %{},
@@ -129,6 +134,7 @@ defmodule SymphonyElixir.Orchestrator do
       delivery_reconcile_task_ref: nil,
       delivery_reconcile_cursor: nil,
       delivery_runtime_dir: delivery_runtime_dir(opts),
+      provider_recovery_tasks: %{},
       delivery_reconcile_cycle_count: 0,
       deliveries: deliveries,
       claimed: pending_delivery_ids(deliveries),
@@ -340,30 +346,71 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, schedule_delivery_reconcile(state, if(github_gateway_open?(), do: provider_retry_delay(), else: @delivery_reconcile_interval_ms))}
   end
 
-  def handle_info({:DOWN, task_ref, :process, _pid, reason}, %State{} = state)
-      when is_reference(task_ref) do
-    case find_retry_lookup(state.retry_attempts, task_ref) do
-      {issue_id, retry_entry} ->
-        provider_wait? = github_gateway_open?() or provider_wait_error?(reason)
-        state = clear_retry_lookup_state(state, issue_id, retry_entry.attempt)
-        metadata = retry_metadata(retry_entry)
-
-        next_state =
-          schedule_issue_retry(
-            state,
-            issue_id,
-            if(provider_wait?, do: retry_entry.attempt, else: retry_entry.attempt + 1),
-            Map.merge(metadata, %{
-              error: if(provider_wait?, do: metadata[:error], else: "retry lookup task exited: #{inspect(reason)}"),
-              delay_type: if(provider_wait?, do: :provider, else: :failure)
-            })
-          )
-
+  def handle_info({task_ref, result}, %State{} = state) when is_reference(task_ref) do
+    case find_provider_recovery_task(state.provider_recovery_tasks, task_ref) do
+      {issue_id, _task} ->
+        state = clear_provider_recovery_task(state, issue_id, task_ref)
+        state = apply_provider_recovery_result(state, issue_id, result)
         notify_dashboard()
-        {:noreply, next_state}
+        {:noreply, schedule_delivery_reconcile(state, 0)}
 
       nil ->
         {:noreply, state}
+    end
+  end
+
+  def handle_info({:provider_recovery_timeout, issue_id, task_ref}, %State{} = state)
+      when is_binary(issue_id) and is_reference(task_ref) do
+    case Map.get(state.provider_recovery_tasks, issue_id) do
+      %{task_ref: ^task_ref} = task ->
+        Logger.warning("Provider recovery exceeded #{@provider_recovery_timeout_ms}ms; terminating issue_id=#{issue_id}")
+
+        if is_pid(task.pid) and Process.alive?(task.pid) do
+          Process.exit(task.pid, :kill)
+        end
+
+        state = clear_provider_recovery_task(state, issue_id, task_ref)
+        notify_dashboard()
+        {:noreply, schedule_delivery_reconcile(state, provider_retry_delay())}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:DOWN, task_ref, :process, _pid, reason}, %State{} = state)
+      when is_reference(task_ref) do
+    case find_provider_recovery_task(state.provider_recovery_tasks, task_ref) do
+      {issue_id, _task} ->
+        Logger.warning("Provider recovery task exited before completion issue_id=#{issue_id}: #{inspect(reason)}")
+        state = clear_provider_recovery_task(state, issue_id, task_ref)
+        notify_dashboard()
+        {:noreply, schedule_delivery_reconcile(state, provider_retry_delay())}
+
+      nil ->
+        case find_retry_lookup(state.retry_attempts, task_ref) do
+          {issue_id, retry_entry} ->
+            provider_wait? = github_gateway_open?() or provider_wait_error?(reason)
+            state = clear_retry_lookup_state(state, issue_id, retry_entry.attempt)
+            metadata = retry_metadata(retry_entry)
+
+            next_state =
+              schedule_issue_retry(
+                state,
+                issue_id,
+                if(provider_wait?, do: retry_entry.attempt, else: retry_entry.attempt + 1),
+                Map.merge(metadata, %{
+                  error: if(provider_wait?, do: metadata[:error], else: "retry lookup task exited: #{inspect(reason)}"),
+                  delay_type: if(provider_wait?, do: :provider, else: :failure)
+                })
+              )
+
+            notify_dashboard()
+            {:noreply, next_state}
+
+          nil ->
+            {:noreply, state}
+        end
     end
   end
 
@@ -2772,6 +2819,32 @@ defmodule SymphonyElixir.Orchestrator do
     %{state | delivery_reconcile_in_progress: false, delivery_reconcile_task_pid: nil, delivery_reconcile_task_ref: nil}
   end
 
+  defp find_provider_recovery_task(tasks, task_ref)
+       when is_map(tasks) and is_reference(task_ref) do
+    Enum.find_value(tasks, fn
+      {issue_id, %{task_ref: ^task_ref} = task} -> {issue_id, task}
+      _ -> nil
+    end)
+  end
+
+  defp find_provider_recovery_task(_tasks, _task_ref), do: nil
+
+  defp clear_provider_recovery_task(%State{} = state, issue_id, task_ref)
+       when is_binary(issue_id) and is_reference(task_ref) do
+    case Map.get(state.provider_recovery_tasks, issue_id) do
+      %{task_ref: ^task_ref} = task ->
+        if is_reference(task.timeout_timer_ref) do
+          Process.cancel_timer(task.timeout_timer_ref)
+        end
+
+        Process.demonitor(task_ref, [:flush])
+        %{state | provider_recovery_tasks: Map.delete(state.provider_recovery_tasks, issue_id)}
+
+      _ ->
+        state
+    end
+  end
+
   defp next_poll_in_ms(nil, _now_ms), do: nil
 
   defp next_poll_in_ms(next_poll_due_at_ms, now_ms) when is_integer(next_poll_due_at_ms) do
@@ -3635,32 +3708,83 @@ defmodule SymphonyElixir.Orchestrator do
   defp resume_provider_waits(%State{} = state, true) do
     Enum.reduce(state.deliveries, state, fn
       {issue_id, %Delivery{state: :waiting_provider} = delivery}, state ->
-        case resume_provider_delivery(delivery, state.delivery_runtime_dir) do
-          {:ok, %Delivery{} = resumed} ->
-            Logger.info(
-              "Provider recovered; resumed parked delivery issue_id=#{issue_id} " <>
-                "state=#{resumed.state} attempt=#{resumed.attempt}"
-            )
-
-            state
-            |> Map.put(:deliveries, Map.put(state.deliveries, issue_id, resumed))
-            |> apply_reconciled_delivery_state(issue_id, resumed)
-
-          {:error, reason, %Delivery{} = resumed} ->
-            Logger.warning("Unable to resume parked delivery issue_id=#{issue_id}: #{inspect(reason)}")
-
-            state
-            |> Map.put(:deliveries, Map.put(state.deliveries, issue_id, resumed))
-            |> apply_reconciled_delivery_state(issue_id, resumed)
-
-          {:error, reason} ->
-            Logger.warning("Unable to resume parked delivery issue_id=#{issue_id}: #{inspect(reason)}")
-            state
-        end
+        start_provider_recovery(state, issue_id, delivery)
 
       _entry, state ->
         state
     end)
+  end
+
+  defp start_provider_recovery(%State{} = state, issue_id, %Delivery{} = delivery)
+       when is_binary(issue_id) do
+    if Map.has_key?(state.provider_recovery_tasks, issue_id) do
+      state
+    else
+      try do
+        runtime_dir = state.delivery_runtime_dir
+
+        task =
+          Task.Supervisor.async_nolink(SymphonyElixir.TaskSupervisor, fn ->
+            resume_provider_delivery(delivery, runtime_dir)
+          end)
+
+        timeout_timer_ref =
+          Process.send_after(
+            self(),
+            {:provider_recovery_timeout, issue_id, task.ref},
+            @provider_recovery_timeout_ms
+          )
+
+        recovery_task = %{
+          pid: task.pid,
+          task_ref: task.ref,
+          timeout_timer_ref: timeout_timer_ref
+        }
+
+        %{state | provider_recovery_tasks: Map.put(state.provider_recovery_tasks, issue_id, recovery_task)}
+      rescue
+        error ->
+          Logger.warning("Unable to start provider recovery issue_id=#{issue_id}: #{Exception.message(error)}")
+          state
+      catch
+        :exit, reason ->
+          Logger.warning("Provider recovery supervisor unavailable issue_id=#{issue_id}: #{inspect(reason)}")
+          state
+      end
+    end
+  end
+
+  defp apply_provider_recovery_result(%State{} = state, issue_id, {:ok, %Delivery{} = resumed}) do
+    Logger.info(
+      "Provider recovered; resumed parked delivery issue_id=#{issue_id} " <>
+        "state=#{resumed.state} attempt=#{resumed.attempt}"
+    )
+
+    state
+    |> Map.put(:deliveries, Map.put(state.deliveries, issue_id, resumed))
+    |> apply_reconciled_delivery_state(issue_id, resumed)
+  end
+
+  defp apply_provider_recovery_result(
+         %State{} = state,
+         issue_id,
+         {:error, reason, %Delivery{} = resumed}
+       ) do
+    Logger.warning("Unable to resume parked delivery issue_id=#{issue_id}: #{inspect(reason)}")
+
+    state
+    |> Map.put(:deliveries, Map.put(state.deliveries, issue_id, resumed))
+    |> apply_reconciled_delivery_state(issue_id, resumed)
+  end
+
+  defp apply_provider_recovery_result(%State{} = state, issue_id, {:error, reason}) do
+    Logger.warning("Unable to resume parked delivery issue_id=#{issue_id}: #{inspect(reason)}")
+    state
+  end
+
+  defp apply_provider_recovery_result(%State{} = state, issue_id, result) do
+    Logger.warning("Invalid provider recovery result issue_id=#{issue_id}: #{inspect(result)}")
+    state
   end
 
   defp resume_provider_delivery(%Delivery{} = delivery, runtime_dir) when is_binary(runtime_dir) do
