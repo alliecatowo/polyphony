@@ -587,6 +587,8 @@ defmodule SymphonyElixir.Codex.AppServer do
         )
 
       {:ok, payload} ->
+        interrupt_sent? = maybe_interrupt_for_token_budget(port, payload, thread_id, turn_id, token_limit, interrupt_sent?)
+
         emit_message(
           on_message,
           :other_message,
@@ -647,7 +649,9 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp total_tokens_from_payload(payload) when is_map(payload) do
     [
       ["params", "tokenUsage", "total"],
-      ["params", "msg", "payload", "info", "total_token_usage"],
+      ["params", "msg", "payload", "info", "total_token_usage", "total_tokens"],
+      ["params", "msg", "info", "total_token_usage", "total_tokens"],
+      ["payload", "info", "total_token_usage", "total_tokens"],
       ["tokenUsage", "total"],
       ["totalTokens"]
     ]
@@ -658,9 +662,24 @@ defmodule SymphonyElixir.Codex.AppServer do
         _ -> nil
       end
     end)
+    |> case do
+      nil -> find_total_tokens_leaf(payload)
+      total -> total
+    end
   end
 
   defp total_tokens_from_payload(_payload), do: nil
+
+  defp find_total_tokens_leaf(%{"total_tokens" => value}) when is_integer(value), do: value
+  defp find_total_tokens_leaf(%{"total_tokens" => value}) when is_binary(value), do: parse_integer(value)
+
+  defp find_total_tokens_leaf(payload) when is_map(payload) do
+    payload
+    |> Map.values()
+    |> Enum.find_value(&find_total_tokens_leaf/1)
+  end
+
+  defp find_total_tokens_leaf(_payload), do: nil
 
   defp parse_integer(value) do
     case Integer.parse(value) do

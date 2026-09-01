@@ -187,6 +187,66 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server interrupts a turn when a token_count event crosses the budget" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-app-server-budget-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-BUDGET")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "trace")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace="#{trace_file}"
+      while IFS= read -r line; do
+        printf '%s\\n' "$line" >> "$trace"
+        case "$line" in
+          *initialize*) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          *'thread/start'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"budget-thread"}}}' ;;
+          *'turn/start'*)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"budget-turn"}}}'
+            (sleep 0.1; printf '%s\\n' '{"method":"codex/event/token_count","params":{"msg":{"type":"event_msg","info":{"total_token_usage":{"total_tokens":120}}}}}') &
+            ;;
+          *'turn/interrupt'*)
+            printf '%s\\n' '{"id":4,"result":{}}'
+            printf '%s\\n' '{"method":"turn/completed","params":{"turn":{"id":"budget-turn","status":"interrupted"}}}'
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_max_total_tokens: 100
+      )
+
+      issue = %Issue{
+        id: "issue-budget",
+        identifier: "MT-BUDGET",
+        title: "Validate token budget interrupt",
+        description: "Stop a pathological turn at the protocol boundary",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-BUDGET",
+        labels: []
+      }
+
+      assert {:error, {:token_budget_exhausted, 100}} = AppServer.run(workspace, "budget", issue)
+
+      trace = File.read!(trace_file)
+      assert trace =~ "\"method\":\"turn/interrupt\""
+      assert trace =~ "budget-thread"
+      assert trace =~ "budget-turn"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server fails closed when a resumed thread response has no valid id" do
     test_root =
       Path.join(
