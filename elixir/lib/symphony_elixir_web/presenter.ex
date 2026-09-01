@@ -31,11 +31,39 @@ defmodule SymphonyElixirWeb.Presenter do
         |> maybe_put_snapshot(snapshot, :control)
 
       :timeout ->
-        %{generated_at: generated_at, error: %{code: "snapshot_timeout", message: "Snapshot timed out"}}
+        case Orchestrator.cached_snapshot() do
+          %{} = snapshot -> snapshot_payload(snapshot, generated_at, true)
+          _ -> %{generated_at: generated_at, error: %{code: "snapshot_timeout", message: "Snapshot timed out"}}
+        end
 
       :unavailable ->
-        %{generated_at: generated_at, error: %{code: "snapshot_unavailable", message: "Snapshot unavailable"}}
+        case Orchestrator.cached_snapshot() do
+          %{} = snapshot -> snapshot_payload(snapshot, generated_at, true)
+          _ -> %{generated_at: generated_at, error: %{code: "snapshot_unavailable", message: "Snapshot unavailable"}}
+        end
     end
+  end
+
+  defp snapshot_payload(snapshot, generated_at, stale?) do
+    payload = %{
+      generated_at: generated_at,
+      counts: %{
+        running: length(snapshot.running),
+        retrying: length(snapshot.retrying)
+      },
+      running: Enum.map(snapshot.running, &running_entry_payload/1),
+      retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
+      codex_totals: snapshot.codex_totals,
+      rate_limits: snapshot.rate_limits,
+      snapshot_stale: stale?
+    }
+
+    payload
+    |> maybe_put_snapshot(snapshot, :deliveries, &delivery_payloads/1)
+    |> maybe_put_snapshot(snapshot, :github_api)
+    |> maybe_put_snapshot(snapshot, :github_events)
+    |> maybe_put_snapshot(snapshot, :polling)
+    |> maybe_put_snapshot(snapshot, :control)
   end
 
   @spec issue_payload(String.t(), GenServer.name(), timeout()) :: {:ok, map()} | {:error, :issue_not_found}

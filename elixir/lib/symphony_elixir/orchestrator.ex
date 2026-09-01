@@ -11,6 +11,8 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.GitHub.DeliveryAdapter
   alias SymphonyElixir.GitHub.Issue, as: GitHubIssue
   alias SymphonyElixir.GitHub.Gateway, as: GitHubGateway
+
+  @snapshot_cache_key {__MODULE__, :last_snapshot}
   alias SymphonyElixir.GitHub.Projection, as: GitHubProjection
   alias SymphonyElixir.Linear.Issue, as: LinearIssue
   @type tracker_issue :: GitHubIssue.t() | LinearIssue.t()
@@ -448,7 +450,7 @@ defmodule SymphonyElixir.Orchestrator do
         running_entry = Map.merge(running_entry, %{ref: ref, worker_host: worker_host, issue: issue})
 
         next_state =
-          state
+          clear_retry_schedule(state, issue_id)
           |> Map.put(:running, Map.put(state.running, issue_id, running_entry))
           |> refresh_control_obligations()
 
@@ -471,12 +473,13 @@ defmodule SymphonyElixir.Orchestrator do
                 Map.get(reservation, :attempt)
               )
 
+            next_state = clear_retry_schedule(state, issue_id)
+
             next_state = %{
-              state
-              | running: Map.put(state.running, issue_id, entry),
+              next_state
+              | running: Map.put(next_state.running, issue_id, entry),
                 reservations: reservations,
-                claimed: Enum.reduce(reserved_slice_member_ids, state.claimed, &MapSet.put(&2, &1)),
-                retry_attempts: Map.delete(state.retry_attempts, issue_id)
+                claimed: Enum.reduce(reserved_slice_member_ids, next_state.claimed, &MapSet.put(&2, &1))
             }
 
             next_state = refresh_control_obligations(next_state)
@@ -487,10 +490,12 @@ defmodule SymphonyElixir.Orchestrator do
             ref = Process.monitor(pid)
             entry = new_running_entry(pid, ref, issue, worker_host, slice_member_ids, nil)
 
+            next_state = clear_retry_schedule(state, issue_id)
+
             next_state = %{
-              state
-              | running: Map.put(state.running, issue_id, entry),
-                claimed: Enum.reduce(slice_member_ids, state.claimed, &MapSet.put(&2, &1))
+              next_state
+              | running: Map.put(next_state.running, issue_id, entry),
+                claimed: Enum.reduce(slice_member_ids, next_state.claimed, &MapSet.put(&2, &1))
             }
 
             next_state = refresh_control_obligations(next_state)
@@ -2209,6 +2214,19 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp clear_retry_schedule(%State{} = state, issue_id) when is_binary(issue_id) do
+    case Map.get(state.retry_attempts, issue_id) do
+      retry when is_map(retry) ->
+        if is_reference(Map.get(retry, :timer_ref)), do: Process.cancel_timer(retry.timer_ref)
+        if is_reference(Map.get(retry, :lookup_timeout_timer_ref)), do: Process.cancel_timer(retry.lookup_timeout_timer_ref)
+        if is_reference(Map.get(retry, :lookup_task_ref)), do: Process.demonitor(retry.lookup_task_ref, [:flush])
+        %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}
+
+      _ ->
+        state
+    end
+  end
+
   defp park_retry_for_provider(%State{} = state, issue_id, retry_token) do
     case Map.get(state.retry_attempts, issue_id) do
       %{attempt: attempt, retry_token: ^retry_token} = retry_entry ->
@@ -2695,6 +2713,11 @@ defmodule SymphonyElixir.Orchestrator do
   @spec snapshot() :: map() | :timeout | :unavailable
   def snapshot, do: snapshot(__MODULE__, 15_000)
 
+  @spec cached_snapshot() :: map() | nil
+  def cached_snapshot do
+    :persistent_term.get(@snapshot_cache_key, nil)
+  end
+
   @spec snapshot(GenServer.server(), timeout()) :: map() | :timeout | :unavailable
   def snapshot(server, timeout) do
     if Process.whereis(server) do
@@ -2753,8 +2776,7 @@ defmodule SymphonyElixir.Orchestrator do
         }
       end)
 
-    {:reply,
-     %{
+    snapshot = %{
        running: running,
        retrying: retrying,
        codex_totals: state.codex_totals,
@@ -2778,7 +2800,10 @@ defmodule SymphonyElixir.Orchestrator do
          Map.new(state.deliveries, fn {issue_id, delivery} ->
            {issue_id, Delivery.serialize(delivery)}
          end)
-     }, state}
+     }
+
+    :persistent_term.put(@snapshot_cache_key, snapshot)
+    {:reply, snapshot, state}
   end
 
   def handle_call({:control, command, params}, _from, %State{} = state)

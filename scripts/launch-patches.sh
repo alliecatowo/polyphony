@@ -31,6 +31,12 @@ fi
 cp "$repo_root/scripts/polyphony-codex-config.toml" "$polyphony_codex_home/config.toml"
 export CODEX_HOME="$polyphony_codex_home"
 export CODEX_APP_SERVER_SOCKET="$polyphony_codex_home/app-server-control/app-server-control.sock"
+# Never let an interactive Codex/desktop session identity or browser runtime
+# leak into the unattended daemon. These variables can cause app-managed MCP
+# surfaces to be injected even when the Polyphony config declares none.
+unset CODEX_CI CODEX_SESSION_ID CODEX_THREAD_ID CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED
+unset NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S NODE_REPL_TRUSTED_CODE_PATHS
+unset BROWSER_USE_AVAILABLE_BACKENDS BROWSER_USE_CODEX_APP_BUILD_FLAVOR BROWSER_USE_CODEX_APP_VERSION
 
 if [[ ! -f "$elixir_root/.env" ]]; then
   echo "Polyphony Patches launch refused: $elixir_root/.env is missing" >&2

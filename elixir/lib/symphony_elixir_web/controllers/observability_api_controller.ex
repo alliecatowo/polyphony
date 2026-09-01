@@ -15,10 +15,9 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
   @spec health(Conn.t(), map()) :: Conn.t()
   def health(conn, _params) do
-    case SymphonyElixir.Orchestrator.snapshot(orchestrator(), 2_000) do
-      %{} -> json(conn, %{ok: true, service: "polyphony-orchestrator"})
-      :timeout -> error_response(conn, 503, "orchestrator_timeout", "Orchestrator health check timed out")
-      :unavailable -> error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
+    case Process.whereis(orchestrator()) do
+      pid when is_pid(pid) -> json(conn, %{ok: true, service: "polyphony-orchestrator"})
+      _ -> error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
     end
   end
 
