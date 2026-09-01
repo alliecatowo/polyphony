@@ -76,9 +76,9 @@ worker:
   tasks_max: 1536
   cgroup_required: true
 agent:
-  # Three workers are enabled after the first end-to-end issue -> PR -> CI ->
-  # merge proof passed. The systemd/cgroup limits remain the hard safety bound.
-  max_concurrent_agents: 3
+  # Validate the bounded harness one worker at a time before scaling the pool
+  # back up. The systemd/cgroup limits remain the hard safety bound.
+  max_concurrent_agents: 1
   # One execution turn owns the slot. The harness then delivers and parks on
   # CI/merge webhooks; a red result resumes the same workspace/session.
   max_turns: 1
