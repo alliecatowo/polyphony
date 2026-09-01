@@ -89,8 +89,17 @@ defmodule SymphonyElixir.GitHub.DeliveryAdapter do
            "node_id" => pull_request_node_id_value(pull_request) || pull_request_id
          }}
       else
-        {:error, {:graphql_errors, errors}} when is_list(errors) ->
-          classify_graphql_errors(errors)
+        {:error, {:github_graphql_error, :already_enabled}} ->
+          {:ok, %{"enabled" => true, "already_enabled" => true}}
+
+        {:error, {:github_graphql_error, :rate_limited}} ->
+          {:error, {:github_rate_limited, nil, nil}}
+
+        {:error, {:github_graphql_error, :permission_denied}} ->
+          {:error, {:github_permission_denied, %{status: 200, kind: :graphql_permission_denied}}}
+
+        {:error, {:github_graphql_error, :api_error}} ->
+          {:error, {:github_api_error, %{kind: :graphql}}}
 
         {:error, reason} ->
           {:error, reason}
@@ -365,7 +374,7 @@ defmodule SymphonyElixir.GitHub.DeliveryAdapter do
 
     with {:ok, body} <- normalize_http_result(result, :post, context.graphql_url) do
       if is_map(body) and is_list(Map.get(body, "errors")) and Map.has_key?(body, "data") do
-        {:error, {:graphql_errors, Map.get(body, "errors")}}
+        {:error, {:github_graphql_error, classify_graphql_errors(Map.get(body, "errors"))}}
       else
         {:ok, body}
       end
@@ -417,18 +426,18 @@ defmodule SymphonyElixir.GitHub.DeliveryAdapter do
 
     cond do
       Enum.any?(errors, &already_enabled_error?/1) or String.contains?(downcased, "already enabled") ->
-        {:ok, %{"enabled" => true, "already_enabled" => true}}
+        :already_enabled
 
       Enum.any?(errors, &rate_limit_error?/1) ->
-        {:error, {:github_rate_limited, nil, nil}}
+        :rate_limited
 
       String.contains?(downcased, "forbidden") or
         String.contains?(downcased, "permission") or
           String.contains?(downcased, "resource not accessible") ->
-        {:error, {:github_permission_denied, %{status: 200, kind: :graphql_permission_denied}}}
+        :permission_denied
 
       true ->
-        {:error, {:github_api_error, %{kind: :graphql}}}
+        :api_error
     end
   end
 

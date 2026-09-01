@@ -217,6 +217,33 @@ defmodule SymphonyElixir.GitHub.DeliveryAdapterTest do
              )
   end
 
+  test "redacts GraphQL error payloads after classifying them", %{gateway: gateway} do
+    secret = "sensitive-graphql-response"
+
+    request = fn :post, _url, _headers, _body ->
+      {:ok,
+       response(200, %{
+         "data" => nil,
+         "errors" => [
+           %{
+             "message" => secret,
+             "path" => ["enablePullRequestAutoMerge", secret],
+             "extensions" => %{"requestId" => secret, "details" => secret},
+             "id" => secret
+           }
+         ]
+       })}
+    end
+
+    assert {:error, {:github_api_error, %{kind: :graphql} = metadata}} =
+             DeliveryAdapter.enable_auto_merge(
+               %{"number" => 22, "node_id" => "PR_node_22", "head" => "agent/redacted"},
+               attrs(gateway, request)
+             )
+
+    refute inspect(metadata) =~ secret
+  end
+
   test "inspects only one PR and reports aggregate failed checks", %{gateway: gateway} do
     request = fn :get, url, _headers, nil ->
       cond do
