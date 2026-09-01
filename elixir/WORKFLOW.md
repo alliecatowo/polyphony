@@ -174,6 +174,10 @@ Instructions:
 - If an issue already has a PR and there is actionable feedback, make and validate the required local correction. If it is merely waiting for CI/review/merge or its branch is not the provided workspace branch, record that state and return immediately without repeated remote queries.
 - One turn should complete one coherent local slice. An active tracker state is not a reason to keep the model alive after the slice is locally validated or externally blocked.
 - Context budget is a hard production constraint. Never `cat` or otherwise dump `tasks.md`, lockfiles, generated output, dependency directories, full logs, or a full repository diff. Use `rg` for targeted discovery and `sed -n` or `git diff -- <path>` for focused excerpts, keeping each excerpt under 200 lines. Bound command output with `head`/`tail`, do not repeat an unchanged command, and summarize results in the issue workpad instead of replaying them in later turns.
+- If a command runner reports `No such file or directory`, a rejected
+  process, or a sandbox/project-boundary error, do not retry the same command.
+  Record the exact error as a harness/environment blocker, perform at most one
+  alternate read-only probe from the current directory, and return control.
 - Do not use a browser login or other interactive external-auth flow. Record the exact access blocker and return control.
 
 ## Slice and stacked-PR policy
