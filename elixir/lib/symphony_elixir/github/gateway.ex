@@ -35,13 +35,19 @@ defmodule SymphonyElixir.GitHub.Gateway do
     server = Keyword.get(opts, :server, __MODULE__)
     timeout_ms = Keyword.get(opts, :timeout_ms, @request_timeout_ms)
     queue_timeout_ms = Keyword.get(opts, :queue_timeout_ms, timeout_ms + 5_000)
+    deadline_ms = System.monotonic_time(:millisecond) + queue_timeout_ms
     request_id = make_ref()
 
     with :ok <- ensure_started(server) do
-      case acquire(server, resource, request_id, queue_timeout_ms) do
+      case acquire(server, resource, request_id, deadline_ms, queue_timeout_ms) do
         {:ok, ^request_id} ->
-          result = invoke(fun, timeout_ms)
-          GenServer.call(server, {:complete, self(), request_id, result}, timeout_ms + 5_000)
+          if deadline_expired?(deadline_ms, System.monotonic_time(:millisecond)) do
+            GenServer.cast(server, {:cancel, self(), request_id})
+            queue_timeout_error(queue_timeout_ms)
+          else
+            result = invoke(fun, timeout_ms)
+            GenServer.call(server, {:complete, self(), request_id, result}, timeout_ms + 5_000)
+          end
 
         result ->
           result
@@ -76,24 +82,34 @@ defmodule SymphonyElixir.GitHub.Gateway do
      }, state}
   end
 
-  def handle_call({:acquire, pid, resource, request_id}, from, state) do
+  def handle_call(
+        {:acquire, pid, resource, request_id, deadline_ms, queue_timeout_ms},
+        from,
+        state
+      ) do
     now_ms = System.monotonic_time(:millisecond)
 
     if circuit_open?(state, now_ms) do
       {:reply, circuit_error(state, now_ms), state}
     else
-      request = %{
-        from: from,
-        monitor_ref: Process.monitor(pid),
-        pid: pid,
-        request_id: request_id,
-        resource: resource
-      }
-
-      if state.in_flight do
-        {:noreply, %{state | queue: :queue.in(request, state.queue)}}
+      if deadline_expired?(deadline_ms, now_ms) do
+        {:reply, queue_timeout_error(queue_timeout_ms), state}
       else
-        {:reply, {:ok, request_id}, %{state | in_flight: request}}
+        request = %{
+          deadline_ms: deadline_ms,
+          from: from,
+          monitor_ref: Process.monitor(pid),
+          pid: pid,
+          queue_timeout_ms: queue_timeout_ms,
+          request_id: request_id,
+          resource: resource
+        }
+
+        if state.in_flight do
+          {:noreply, %{state | queue: :queue.in(request, state.queue)}}
+        else
+          {:reply, {:ok, request_id}, %{state | in_flight: request}}
+        end
       end
     end
   end
@@ -150,18 +166,24 @@ defmodule SymphonyElixir.GitHub.Gateway do
     end
   end
 
-  defp acquire(server, resource, request_id, timeout_ms) do
+  defp acquire(server, resource, request_id, deadline_ms, timeout_ms) do
     try do
-      GenServer.call(server, {:acquire, self(), resource, request_id}, timeout_ms)
+      GenServer.call(
+        server,
+        {:acquire, self(), resource, request_id, deadline_ms, timeout_ms},
+        timeout_ms
+      )
     catch
       :exit, {:timeout, _} ->
         GenServer.cast(server, {:cancel, self(), request_id})
-        {:error, {:github_provider_unavailable, %{kind: :queue_timeout, timeout_ms: timeout_ms}}}
+        queue_timeout_error(timeout_ms)
     end
   end
 
   defp grant_next(%{in_flight: nil, queue: queue} = state) do
-    if circuit_open?(state, System.monotonic_time(:millisecond)) do
+    now_ms = System.monotonic_time(:millisecond)
+
+    if circuit_open?(state, now_ms) do
       reject_queued(state)
     else
       case :queue.out(queue) do
@@ -169,12 +191,19 @@ defmodule SymphonyElixir.GitHub.Gateway do
           state
 
         {{:value, request}, queue} ->
-          if Process.alive?(request.pid) do
-            GenServer.reply(request.from, {:ok, request.request_id})
-            %{state | in_flight: request, queue: queue}
-          else
-            Process.demonitor(request.monitor_ref, [:flush])
-            grant_next(%{state | queue: queue})
+          cond do
+            deadline_expired?(request.deadline_ms, System.monotonic_time(:millisecond)) ->
+              Process.demonitor(request.monitor_ref, [:flush])
+              GenServer.reply(request.from, queue_timeout_error(request.queue_timeout_ms))
+              grant_next(%{state | queue: queue})
+
+            Process.alive?(request.pid) ->
+              GenServer.reply(request.from, {:ok, request.request_id})
+              %{state | in_flight: request, queue: queue}
+
+            true ->
+              Process.demonitor(request.monitor_ref, [:flush])
+              grant_next(%{state | queue: queue})
           end
       end
     end
@@ -211,6 +240,12 @@ defmodule SymphonyElixir.GitHub.Gateway do
 
     Enum.each(dropped, &Process.demonitor(&1.monitor_ref, [:flush]))
     %{state | queue: :queue.from_list(kept)}
+  end
+
+  defp deadline_expired?(deadline_ms, now_ms), do: now_ms >= deadline_ms
+
+  defp queue_timeout_error(timeout_ms) do
+    {:error, {:github_provider_unavailable, %{kind: :queue_timeout, timeout_ms: timeout_ms}}}
   end
 
   defp ensure_started(server) when is_atom(server) do

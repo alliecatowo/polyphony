@@ -255,4 +255,49 @@ defmodule SymphonyElixir.GitHub.GatewayTest do
     assert {:ok, %{status: 200}} = Task.await(first)
     assert Gateway.snapshot(name).circuit == :closed
   end
+
+  test "an expired queued acquisition is never granted after in-flight work finishes" do
+    name = Module.concat(__MODULE__, "ExpiredQueue#{System.unique_integer([:positive])}")
+    start_supervised!({Gateway, name: name})
+    caller = self()
+
+    first =
+      Task.async(fn ->
+        Gateway.request(
+          :rest,
+          fn ->
+            send(caller, {:blocking_request_started, self()})
+
+            receive do
+              :finish_blocking_request -> {:ok, %{status: 200, headers: %{}, body: %{}}}
+            end
+          end,
+          server: name,
+          timeout_ms: 100
+        )
+      end)
+
+    assert_receive {:blocking_request_started, blocking_request_pid}
+    request_id = make_ref()
+    deadline_ms = System.monotonic_time(:millisecond) + 20
+
+    expired =
+      Task.async(fn ->
+        GenServer.call(
+          name,
+          {:acquire, self(), :rest, request_id, deadline_ms, 25},
+          200
+        )
+      end)
+
+    assert [%{request_id: ^request_id}] = :queue.to_list(:sys.get_state(name).queue)
+    Process.sleep(30)
+    send(blocking_request_pid, :finish_blocking_request)
+
+    assert {:error, {:github_provider_unavailable, %{kind: :queue_timeout, timeout_ms: 25}}} =
+             Task.await(expired)
+
+    assert {:ok, %{status: 200}} = Task.await(first)
+    assert Gateway.snapshot(name).request_count == 1
+  end
 end
