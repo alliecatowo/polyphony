@@ -3947,6 +3947,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp persist_control_state(%State{} = state), do: state
 
   defp apply_delivery_reconcile(state, issue_id, delivery, summary) do
+    delivery = refresh_delivery_head(delivery, summary)
+
     case reconcile_delivery(delivery, summary) do
       {:ok, %Delivery{} = reconciled} ->
         state
@@ -3963,6 +3965,13 @@ defmodule SymphonyElixir.Orchestrator do
         state
     end
   end
+
+  defp refresh_delivery_head(%Delivery{} = delivery, %{commit_sha: commit_sha})
+       when is_binary(commit_sha) and commit_sha != "" do
+    %{delivery | commit_sha: commit_sha}
+  end
+
+  defp refresh_delivery_head(%Delivery{} = delivery, _summary), do: delivery
 
   defp reconcile_delivery(%Delivery{} = delivery, summary) when is_map(summary) do
     with {:ok, controller} <-
