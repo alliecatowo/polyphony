@@ -1309,7 +1309,15 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_stalled_running_issues(%State{} = state, owner) when is_pid(owner) do
-    timeout_ms = Config.settings!().codex.stall_timeout_ms
+    timeout_ms =
+      case Config.settings() do
+        {:ok, config} ->
+          config.codex.stall_timeout_ms
+
+        {:error, reason} ->
+          Logger.error("Ignoring invalid runtime configuration during stall check: #{inspect(reason)}")
+          0
+      end
 
     cond do
       timeout_ms <= 0 ->
@@ -3135,13 +3143,18 @@ defmodule SymphonyElixir.Orchestrator do
   defp record_session_completion_totals(state, _running_entry), do: state
 
   defp refresh_runtime_config(%State{} = state) do
-    config = Config.settings!()
+    case Config.settings() do
+      {:ok, config} ->
+        %{
+          state
+          | poll_interval_ms: config.polling.interval_ms,
+            max_concurrent_agents: config.agent.max_concurrent_agents
+        }
 
-    %{
-      state
-      | poll_interval_ms: config.polling.interval_ms,
-        max_concurrent_agents: config.agent.max_concurrent_agents
-    }
+      {:error, reason} ->
+        Logger.error("Ignoring invalid runtime configuration; retaining last known-good settings: #{inspect(reason)}")
+        state
+    end
   end
 
   defp retry_candidate_issue?(%{} = issue, terminal_states) do
