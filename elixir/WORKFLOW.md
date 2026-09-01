@@ -139,7 +139,7 @@ codex:
   # transcript.
   # Keep pathological turns cheap enough that the first token-usage event
   # cannot consume the account allowance before the Elixir guard sees it.
-  max_total_tokens: 160000
+  max_total_tokens: 100000
 server:
   host: "127.0.0.1"
   port: 4000
