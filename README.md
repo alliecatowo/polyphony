@@ -3,10 +3,11 @@
 Polyphony turns project work into isolated, autonomous implementation runs, so teams can manage work
 instead of supervising coding agents.
 
-[![Polyphony demo video preview](.github/media/symphony-demo-poster.jpg)](.github/media/symphony-demo.mp4)
+[![Upstream Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](.github/media/symphony-demo.mp4)
 
-_The demo shows the orchestration model end to end: watch tracker work, spawn delegated agent runs,
-validate outcomes, and hand off via PR workflow with minimal human babysitting._
+_This demo is from OpenAI's [Symphony](https://github.com/openai/symphony), which Polyphony is derived
+from (see [NOTICE](NOTICE)). It shows the shared orchestration model: watch tracker work, spawn delegated
+agent runs, validate outcomes, and hand off via PR workflow. It is not a recording of Polyphony itself._
 
 > [!WARNING]
 > Polyphony is an engineering preview for trusted environments.
