@@ -34,10 +34,10 @@ defmodule SymphonyElixir.Application do
     ]
 
     case Supervisor.start_link(
-      children,
-      strategy: :one_for_one,
-      name: SymphonyElixir.Supervisor
-    ) do
+           children,
+           strategy: :one_for_one,
+           name: SymphonyElixir.Supervisor
+         ) do
       {:ok, pid} = result ->
         _ = OAuthBootstrap.maybe_open_browser()
         result

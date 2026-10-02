@@ -476,6 +476,7 @@ defmodule SymphonyElixir.Config.Schema do
         field_name
         |> to_string()
         |> String.trim()
+
       normalized_name = String.downcase(original_name)
 
       normalized_definition = normalize_required_project_field_definition(definition)

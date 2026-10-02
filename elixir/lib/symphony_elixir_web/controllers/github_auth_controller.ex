@@ -15,12 +15,13 @@ defmodule SymphonyElixirWeb.GitHubAuthController do
           scheme: "https",
           host: "github.com",
           path: "/login/oauth/authorize",
-          query: URI.encode_query(%{
-            "client_id" => client_id,
-            "redirect_uri" => callback_url,
-            "state" => state,
-            "scope" => scopes
-          })
+          query:
+            URI.encode_query(%{
+              "client_id" => client_id,
+              "redirect_uri" => callback_url,
+              "state" => state,
+              "scope" => scopes
+            })
         })
 
       redirect(conn, external: authorize_url)
