@@ -7,6 +7,7 @@ defmodule SymphonyElixirWeb.GitHubWebhookController do
 
   require Logger
 
+  alias Plug.Conn
   alias SymphonyElixir.Orchestrator
   alias SymphonyElixirWeb.Endpoint
 
@@ -20,6 +21,7 @@ defmodule SymphonyElixirWeb.GitHubWebhookController do
                     "projects_v2_item"
                   ])
 
+  @spec receive(Conn.t(), map()) :: Conn.t()
   def receive(conn, _params) do
     with :ok <- ensure_secret_configured(),
          :ok <- verify_signature(conn),
