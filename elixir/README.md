@@ -40,7 +40,7 @@ without leaving GitHub.
 ## Run
 
 ```bash
-git clone https://github.com/your-org/polyphony
+git clone https://github.com/alliecatowo/polyphony
 cd polyphony/elixir
 mise trust
 mise install

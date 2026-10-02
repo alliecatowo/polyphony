@@ -1,2 +1,12 @@
 .env
 
+
+# Elixir / build output
+_build/
+deps/
+.elixir_ls/
+*.log
+.DS_Store
+.env.*
+!.env.example
+.mcp.json

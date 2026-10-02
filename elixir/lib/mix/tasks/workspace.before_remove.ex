@@ -12,10 +12,10 @@ defmodule Mix.Tasks.Workspace.BeforeRemove do
 
       mix workspace.before_remove
       mix workspace.before_remove --branch feature/my-branch
-      mix workspace.before_remove --repo your-org/polyphony
+      mix workspace.before_remove --repo alliecatowo/polyphony
   """
 
-  @default_repo "your-org/polyphony"
+  @default_repo "alliecatowo/polyphony"
 
   @impl Mix.Task
   def run(args) do
