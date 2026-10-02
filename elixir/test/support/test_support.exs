@@ -34,6 +34,15 @@ defmodule SymphonyElixir.TestSupport do
 
         File.mkdir_p!(workflow_root)
         workflow_file = Path.join(workflow_root, "WORKFLOW.md")
+        runtime_root =
+          Path.join(
+            System.tmp_dir!(),
+            "symphony-elixir-runtime-#{System.unique_integer([:positive])}"
+          )
+
+        File.mkdir_p!(runtime_root)
+        previous_runtime_root = System.get_env("POLYPHONY_RUNTIME_STATE_DIR")
+        System.put_env("POLYPHONY_RUNTIME_STATE_DIR", runtime_root)
         write_workflow_file!(workflow_file)
         Workflow.set_workflow_file_path(workflow_file)
         if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
@@ -44,7 +53,9 @@ defmodule SymphonyElixir.TestSupport do
           Application.delete_env(:symphony_elixir, :server_port_override)
           Application.delete_env(:symphony_elixir, :memory_tracker_issues)
           Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+          restore_env("POLYPHONY_RUNTIME_STATE_DIR", previous_runtime_root)
           File.rm_rf(workflow_root)
+          File.rm_rf(runtime_root)
         end)
 
         :ok

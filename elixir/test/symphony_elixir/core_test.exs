@@ -117,7 +117,7 @@ defmodule SymphonyElixir.CoreTest do
     assert Map.get(worker, "ssh_hosts") == []
 
     codex = Map.get(config, "codex", %{})
-    assert Map.get(codex, "shared_app_server") == true
+    assert Map.get(codex, "shared_app_server") == false
     assert get_in(codex, ["models", "default"]) == "gpt-5.6-luna"
     assert get_in(codex, ["models", "review"]) == "gpt-5.6-terra"
     assert get_in(codex, ["models", "escalation"]) == "gpt-5.6-sol"
