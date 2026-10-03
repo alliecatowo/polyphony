@@ -38,7 +38,7 @@ defmodule SymphonyElixir.Application do
            strategy: :one_for_one,
            name: SymphonyElixir.Supervisor
          ) do
-      {:ok, pid} = result ->
+      {:ok, _pid} = result ->
         _ = OAuthBootstrap.maybe_open_browser()
         result
 

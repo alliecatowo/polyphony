@@ -49,6 +49,19 @@ mise exec -- mix build
 mise exec -- ./bin/symphony ./WORKFLOW.md
 ```
 
+### Toolchain notes
+
+`mise.toml` pins Erlang/OTP 29 and Elixir 1.20. mise installs Erlang from precompiled
+Ubuntu builds, which expect an OpenSSL that still exports `EVP_sm4_cbc`; distributions that
+strip SM4 from OpenSSL (Fedora) fail with `Unable to load crypto library ... undefined symbol:
+EVP_sm4_cbc`. Point mise at an Erlang built against your system's OpenSSL, for example Homebrew's
+(`brew install erlang`), with a git-ignored `elixir/mise.local.toml`:
+
+```toml
+[tools]
+erlang = "path:/home/linuxbrew/.linuxbrew/opt/erlang"
+```
+
 ## GitHub App Webhook (Local)
 
 If you run a private GitHub App with a local tunnel/Funnel, start the webhook receiver with:

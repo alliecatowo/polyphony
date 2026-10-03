@@ -10,3 +10,4 @@ deps/
 .env.*
 !.env.example
 .mcp.json
+mise.local.toml

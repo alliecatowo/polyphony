@@ -252,8 +252,6 @@ defmodule SymphonyElixir.Tracker do
       get_in(tracker_metadata, [:milestone, :number])
   end
 
-  defp fallback_milestone_number(_tracker_metadata), do: nil
-
   defp desired_assignees(%{tracker_metadata: tracker_metadata} = issue) when is_map(tracker_metadata) do
     override =
       Map.get(tracker_metadata, "project_desired_assignees") ||
@@ -379,8 +377,6 @@ defmodule SymphonyElixir.Tracker do
       get_in(tracker_metadata, [:parent, :id])
   end
 
-  defp hierarchy_parent_override(_tracker_metadata), do: nil
-
   defp hierarchy_sub_issues_override(tracker_metadata) when is_map(tracker_metadata) do
     Map.get(tracker_metadata, "project_desired_sub_issue_ids") ||
       Map.get(tracker_metadata, :project_desired_sub_issue_ids) ||
@@ -389,15 +385,11 @@ defmodule SymphonyElixir.Tracker do
       []
   end
 
-  defp hierarchy_sub_issues_override(_tracker_metadata), do: []
-
   defp fallback_sub_issues(tracker_metadata) when is_map(tracker_metadata) do
     Map.get(tracker_metadata, "sub_issues") ||
       Map.get(tracker_metadata, :sub_issues) ||
       []
   end
-
-  defp fallback_sub_issues(_tracker_metadata), do: []
 
   defp normalize_issue_ref_list(refs) when is_list(refs) do
     refs
@@ -452,8 +444,6 @@ defmodule SymphonyElixir.Tracker do
     end
   end
 
-  defp explicit_project_custom_fields(_tracker_metadata), do: %{}
-
   # Conservative policy defaults: only derive values when a GitHub project item context
   # exists, and only for fields we can infer safely from existing tracker metadata.
   defp policy_project_custom_fields(tracker_metadata) when is_map(tracker_metadata) do
@@ -468,8 +458,6 @@ defmodule SymphonyElixir.Tracker do
       %{}
     end
   end
-
-  defp policy_project_custom_fields(_tracker_metadata), do: %{}
 
   defp has_project_item_context?(tracker_metadata) do
     project_items =

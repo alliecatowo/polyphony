@@ -12,7 +12,7 @@ defmodule SymphonyElixir.MixProject do
         summary: [
           # Ratchet: the GitHub tracker modules (Client, Adapter, Auth, OAuthBootstrap, ...) landed
           # without tests, so 100% has been unreachable. Raise this as tests are added; never lower it.
-          threshold: 60
+          threshold: 70
         ],
         ignore_modules: [
           SymphonyElixir.Config,
@@ -73,11 +73,11 @@ defmodule SymphonyElixir.MixProject do
       {:phoenix, "~> 1.8.0"},
       {:phoenix_html, "~> 4.2"},
       {:phoenix_live_view, "~> 1.2.12"},
-      {:req, "~> 0.5"},
+      {:req, "~> 0.7"},
       {:jason, "~> 1.4"},
       {:yaml_elixir, "~> 2.12"},
       {:solid, "~> 1.2"},
-      {:ecto, "~> 3.13"},
+      {:ecto, "~> 3.14"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false}
     ]
