@@ -1362,9 +1362,10 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
 
   defp project_items(status_name, override_field_values) do
     field_nodes =
-      cond do
-        is_list(override_field_values) -> override_field_values
-        true -> status_field_nodes(status_name)
+      if is_list(override_field_values) do
+        override_field_values
+      else
+        status_field_nodes(status_name)
       end
 
     [
@@ -1448,15 +1449,13 @@ defmodule SymphonyElixir.GitHubClientIntegrationTest do
 
   defp status_map_to_yaml(status_map) when is_map(status_map) do
     status_map
-    |> Enum.map(fn {status_name, mapping} ->
+    |> Enum.map_join("\n", fn {status_name, mapping} ->
       entries =
         mapping
-        |> Enum.map(fn {k, v} -> "      #{k}: \"#{v}\"" end)
-        |> Enum.join("\n")
+        |> Enum.map_join("\n", fn {k, v} -> "      #{k}: \"#{v}\"" end)
 
       "    #{status_name}:\n#{entries}"
     end)
-    |> Enum.join("\n")
   end
 
   defp generate_rsa_private_key_pem do

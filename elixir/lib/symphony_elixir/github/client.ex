@@ -517,9 +517,8 @@ defmodule SymphonyElixir.GitHub.Client do
     with :ok <- reconcile_issue_hierarchy(issue, desired),
          :ok <- reconcile_structure_dependencies(issue_id, desired),
          :ok <- reconcile_taxonomy(issue_id, desired),
-         :ok <- reconcile_project_custom_fields(issue, desired),
-         :ok <- reconcile_state_projection(issue) do
-      :ok
+         :ok <- reconcile_project_custom_fields(issue, desired) do
+      reconcile_state_projection(issue)
     end
   end
 
@@ -548,9 +547,8 @@ defmodule SymphonyElixir.GitHub.Client do
 
     with :ok <- maybe_reconcile_parent_link(issue_id, current_parent_issue_id, desired_parent_issue_id),
          :ok <- apply_sub_issue_additions(issue_id, adds),
-         :ok <- apply_sub_issue_removals(issue_id, removes),
-         :ok <- maybe_reprioritize_sub_issues(issue_id, desired_sub_issue_ids, needs_reorder?) do
-      :ok
+         :ok <- apply_sub_issue_removals(issue_id, removes) do
+      maybe_reprioritize_sub_issues(issue_id, desired_sub_issue_ids, needs_reorder?)
     end
   end
 
@@ -657,9 +655,8 @@ defmodule SymphonyElixir.GitHub.Client do
          {:ok, current_numbers} <- fetch_blocked_by_numbers(tracker, headers, issue_number),
          {:ok, desired_numbers} <- parse_issue_numbers(desired_blocked_by_ids),
          adds <- desired_numbers -- current_numbers,
-         removes <- current_numbers -- desired_numbers,
-         :ok <- apply_blocked_by_deltas(tracker, headers, issue_number, adds, removes) do
-      :ok
+         removes <- current_numbers -- desired_numbers do
+      apply_blocked_by_deltas(tracker, headers, issue_number, adds, removes)
     end
   end
 
@@ -741,62 +738,46 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp ensure_project_context(tracker) do
-    owner_login = tracker.project_owner_login || tracker.repo_owner
-    owner_type = normalize_owner_type(tracker.project_owner_type)
-    project_title = normalized_project_title(tracker.project_title)
-    project_number = parse_project_number(tracker.project_slug)
+    ctx = %{
+      owner_login: tracker.project_owner_login || tracker.repo_owner,
+      owner_type: normalize_owner_type(tracker.project_owner_type),
+      project_title: normalized_project_title(tracker.project_title),
+      project_number: parse_project_number(tracker.project_slug)
+    }
 
-    with {:ok, maybe_repo_project} <- find_repository_project(tracker.repo_owner, tracker.repo_name, project_title) do
-      case maybe_repo_project do
-        %{"id" => project_id} when is_binary(project_id) ->
-          {:ok,
-           %{
-             owner_login: owner_login,
-             owner_type: owner_type,
-             owner_id: nil,
-             project_id: project_id
-           }}
+    with {:ok, maybe_repo_project} <- find_repository_project(tracker.repo_owner, tracker.repo_name, ctx.project_title) do
+      resolve_project_context(maybe_repo_project, ctx)
+    end
+  end
 
-        _ when is_integer(project_number) and project_number > 0 ->
-          with {:ok, project} <- find_owner_project_by_number(owner_login, owner_type, project_number) do
-            {:ok,
-             %{
-               owner_login: owner_login,
-               owner_type: owner_type,
-               owner_id: nil,
-               project_id: project["id"]
-             }}
-          end
+  defp resolve_project_context(%{"id" => project_id}, ctx) when is_binary(project_id) do
+    {:ok, %{owner_login: ctx.owner_login, owner_type: ctx.owner_type, owner_id: nil, project_id: project_id}}
+  end
 
-        _ ->
-          with {:ok, body} <-
-                 graphql(@owner_lookup_query, %{
-                   login: owner_login,
-                   isOrg: owner_type == "organization",
-                   isUser: owner_type == "user"
-                 }),
-               {:ok, owner} <- extract_owner_node(body, owner_type),
-               {:ok, project} <- find_or_create_project(owner, project_title) do
-            {:ok,
-             %{
-               owner_login: owner_login,
-               owner_type: owner_type,
-               owner_id: owner["id"],
-               project_id: project["id"]
-             }}
-          else
-            {:error, {:github_graphql_errors, errors}} ->
-              if create_project_permission_error?(errors) do
-                {:error, :github_project_create_forbidden}
-              else
-                {:error, {:github_graphql_errors, errors}}
-              end
+  defp resolve_project_context(_repo_project, %{project_number: number} = ctx) when is_integer(number) and number > 0 do
+    with {:ok, project} <- find_owner_project_by_number(ctx.owner_login, ctx.owner_type, number) do
+      {:ok, %{owner_login: ctx.owner_login, owner_type: ctx.owner_type, owner_id: nil, project_id: project["id"]}}
+    end
+  end
 
-            {:error, reason} ->
-              {:error, reason}
-          end
-      end
+  defp resolve_project_context(_repo_project, ctx) do
+    with {:ok, body} <-
+           graphql(@owner_lookup_query, %{
+             login: ctx.owner_login,
+             isOrg: ctx.owner_type == "organization",
+             isUser: ctx.owner_type == "user"
+           }),
+         {:ok, owner} <- extract_owner_node(body, ctx.owner_type),
+         {:ok, project} <- find_or_create_project(owner, ctx.project_title) do
+      {:ok, %{owner_login: ctx.owner_login, owner_type: ctx.owner_type, owner_id: owner["id"], project_id: project["id"]}}
     else
+      {:error, {:github_graphql_errors, errors}} ->
+        if create_project_permission_error?(errors) do
+          {:error, :github_project_create_forbidden}
+        else
+          {:error, {:github_graphql_errors, errors}}
+        end
+
       {:error, reason} ->
         {:error, reason}
     end
@@ -828,9 +809,8 @@ defmodule SymphonyElixir.GitHub.Client do
              number: number,
              isOrg: owner_type == "organization",
              isUser: owner_type == "user"
-           }),
-         {:ok, project} <- extract_owner_project_node(body, owner_type) do
-      {:ok, project}
+           }) do
+      extract_owner_project_node(body, owner_type)
     end
   end
 
@@ -916,9 +896,8 @@ defmodule SymphonyElixir.GitHub.Client do
 
   defp maybe_reconcile_parent_link(issue_id, current_parent_issue_id, desired_parent_issue_id)
        when is_binary(issue_id) and is_binary(desired_parent_issue_id) do
-    with :ok <- maybe_remove_from_current_parent(current_parent_issue_id, issue_id),
-         :ok <- add_sub_issue(desired_parent_issue_id, issue_id) do
-      :ok
+    with :ok <- maybe_remove_from_current_parent(current_parent_issue_id, issue_id) do
+      add_sub_issue(desired_parent_issue_id, issue_id)
     end
   end
 
@@ -970,9 +949,8 @@ defmodule SymphonyElixir.GitHub.Client do
     desired_assignees = Map.get(desired, :assignees, [])
 
     with :ok <- reconcile_issue_labels(issue_id, desired_labels),
-         :ok <- reconcile_issue_milestone(issue_id, desired_milestone),
-         :ok <- reconcile_issue_assignees(issue_id, desired_assignees) do
-      :ok
+         :ok <- reconcile_issue_milestone(issue_id, desired_milestone) do
+      reconcile_issue_assignees(issue_id, desired_assignees)
     end
   end
 
@@ -1880,14 +1858,12 @@ defmodule SymphonyElixir.GitHub.Client do
       |> List.first()
       |> then(&get_in(&1 || %{}, ["project", "id"]))
 
-    cond do
-      is_binary(project_id) and project_id != "" ->
-        {:ok, project_id}
-
-      true ->
-        with {:ok, project_ctx} <- ensure_project_context(tracker) do
-          {:ok, project_ctx.project_id}
-        end
+    if is_binary(project_id) and project_id != "" do
+      {:ok, project_id}
+    else
+      with {:ok, project_ctx} <- ensure_project_context(tracker) do
+        {:ok, project_ctx.project_id}
+      end
     end
   end
 
@@ -2140,9 +2116,8 @@ defmodule SymphonyElixir.GitHub.Client do
   defp apply_blocked_by_deltas(_tracker, _headers, _issue_number, [], []), do: :ok
 
   defp apply_blocked_by_deltas(tracker, headers, issue_number, adds, removes) do
-    with :ok <- Enum.reduce_while(adds, :ok, &add_blocked_by(tracker, headers, issue_number, &1, &2)),
-         :ok <- Enum.reduce_while(removes, :ok, &remove_blocked_by(tracker, headers, issue_number, &1, &2)) do
-      :ok
+    with :ok <- Enum.reduce_while(adds, :ok, &add_blocked_by(tracker, headers, issue_number, &1, &2)) do
+      Enum.reduce_while(removes, :ok, &remove_blocked_by(tracker, headers, issue_number, &1, &2))
     end
   end
 
@@ -2358,9 +2333,8 @@ defmodule SymphonyElixir.GitHub.Client do
              projectId: project_id,
              name: field_name,
              dataType: "SINGLE_SELECT"
-           }),
-         :ok <- ensure_single_select_options(project_id, field_name, definition["options"]) do
-      :ok
+           }) do
+      ensure_single_select_options(project_id, field_name, definition["options"])
     end
   end
 

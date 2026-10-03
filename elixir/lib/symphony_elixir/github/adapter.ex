@@ -104,9 +104,8 @@ defmodule SymphonyElixir.GitHub.Adapter do
   def apply_orchestrator_tracker_writes(issue, writes) when is_map(issue) and is_map(writes) do
     with :ok <- maybe_apply_project_custom_field_reconcile(issue, writes),
          :ok <- maybe_apply_project_item_field_updates(writes),
-         :ok <- maybe_apply_state_transition(issue, writes),
-         :ok <- maybe_apply_comments(issue, writes) do
-      :ok
+         :ok <- maybe_apply_state_transition(issue, writes) do
+      maybe_apply_comments(issue, writes)
     end
   end
 

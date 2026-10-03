@@ -391,50 +391,48 @@ defmodule SymphonyElixir.Config.Schema do
   @spec validate_status_map(Ecto.Changeset.t(), atom()) :: Ecto.Changeset.t()
   def validate_status_map(changeset, field) do
     validate_change(changeset, field, fn ^field, status_map ->
-      cond do
-        not is_map(status_map) ->
-          [{field, "must be a map of status => %{state, state_reason?}"}]
-
-        true ->
-          Enum.flat_map(status_map, fn {status_name, mapping} ->
-            cond do
-              to_string(status_name) == "" ->
-                [{field, "status names must not be blank"}]
-
-              not is_map(mapping) ->
-                [{field, "each status mapping must be a map"}]
-
-              true ->
-                state = mapping["state"]
-                state_reason = Map.get(mapping, "state_reason")
-
-                state_errors =
-                  if state in ["open", "closed"] do
-                    []
-                  else
-                    [{field, "mapping state must be \"open\" or \"closed\""}]
-                  end
-
-                state_reason_errors =
-                  cond do
-                    is_nil(state_reason) ->
-                      []
-
-                    state != "closed" ->
-                      [{field, "state_reason is only valid when state is \"closed\""}]
-
-                    state_reason in ["completed", "not_planned"] ->
-                      []
-
-                    true ->
-                      [{field, "state_reason must be \"completed\" or \"not_planned\""}]
-                  end
-
-                state_errors ++ state_reason_errors
-            end
-          end)
+      if is_map(status_map) do
+        Enum.flat_map(status_map, fn {status_name, mapping} ->
+          status_mapping_errors(field, status_name, mapping)
+        end)
+      else
+        [{field, "must be a map of status => %{state, state_reason?}"}]
       end
     end)
+  end
+
+  defp status_mapping_errors(field, status_name, mapping) do
+    cond do
+      to_string(status_name) == "" ->
+        [{field, "status names must not be blank"}]
+
+      not is_map(mapping) ->
+        [{field, "each status mapping must be a map"}]
+
+      true ->
+        state = mapping["state"]
+
+        state_errors =
+          if state in ["open", "closed"] do
+            []
+          else
+            [{field, "mapping state must be \"open\" or \"closed\""}]
+          end
+
+        state_errors ++ state_reason_errors(field, state, Map.get(mapping, "state_reason"))
+    end
+  end
+
+  defp state_reason_errors(_field, _state, nil), do: []
+
+  defp state_reason_errors(field, state, _state_reason) when state != "closed" do
+    [{field, "state_reason is only valid when state is \"closed\""}]
+  end
+
+  defp state_reason_errors(_field, _state, state_reason) when state_reason in ["completed", "not_planned"], do: []
+
+  defp state_reason_errors(field, _state, _state_reason) do
+    [{field, "state_reason must be \"completed\" or \"not_planned\""}]
   end
 
   @doc false
@@ -495,25 +493,27 @@ defmodule SymphonyElixir.Config.Schema do
   @spec validate_required_project_fields(Ecto.Changeset.t(), atom()) :: Ecto.Changeset.t()
   def validate_required_project_fields(changeset, field) do
     validate_change(changeset, field, fn ^field, required_fields ->
-      cond do
-        not is_map(required_fields) ->
-          [{field, "must be a map of field_name => %{type, options?}"}]
-
-        true ->
-          Enum.flat_map(required_fields, fn {field_name, definition} ->
-            cond do
-              to_string(field_name) == "" ->
-                [{field, "field names must not be blank"}]
-
-              not is_map(definition) ->
-                [{field, "each required project field definition must be a map"}]
-
-              true ->
-                validate_required_project_field_definition(field, definition)
-            end
-          end)
+      if is_map(required_fields) do
+        Enum.flat_map(required_fields, fn {field_name, definition} ->
+          required_project_field_errors(field, field_name, definition)
+        end)
+      else
+        [{field, "must be a map of field_name => %{type, options?}"}]
       end
     end)
+  end
+
+  defp required_project_field_errors(field, field_name, definition) do
+    cond do
+      to_string(field_name) == "" ->
+        [{field, "field names must not be blank"}]
+
+      not is_map(definition) ->
+        [{field, "each required project field definition must be a map"}]
+
+      true ->
+        validate_required_project_field_definition(field, definition)
+    end
   end
 
   defp changeset(attrs) do

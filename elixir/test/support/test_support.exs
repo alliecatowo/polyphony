@@ -10,8 +10,8 @@ defmodule SymphonyElixir.TestSupport do
       alias SymphonyElixir.CLI
       alias SymphonyElixir.Codex.AppServer
       alias SymphonyElixir.Config
-      alias SymphonyElixir.HttpServer
       alias SymphonyElixir.GitHub.Issue, as: GitHubIssue
+      alias SymphonyElixir.HttpServer
       alias SymphonyElixir.Linear.Client
       alias SymphonyElixir.Linear.Issue
       alias SymphonyElixir.Orchestrator

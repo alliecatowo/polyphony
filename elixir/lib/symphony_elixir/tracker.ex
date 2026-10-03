@@ -53,6 +53,8 @@ defmodule SymphonyElixir.Tracker do
         :ok
 
       function_exported?(tracker_adapter, :apply_orchestrator_tracker_writes, 2) ->
+        # Optional callback: not part of the Tracker behaviour, so the call is dynamic by design.
+        # credo:disable-for-next-line Credo.Check.Refactor.Apply
         apply(tracker_adapter, :apply_orchestrator_tracker_writes, [issue, writes])
 
       true ->
@@ -86,9 +88,8 @@ defmodule SymphonyElixir.Tracker do
          :ok <- maybe_reconcile_hierarchy(tracker_adapter, issue, desired.hierarchy),
          :ok <- maybe_reconcile_structure_dependencies(tracker_adapter, issue_id, desired),
          :ok <- maybe_reconcile_taxonomy(tracker_adapter, issue_id, desired),
-         :ok <- maybe_reconcile_project_custom_fields(tracker_adapter, issue, desired.project_custom_fields),
-         :ok <- maybe_reconcile_issue_state_projection(tracker_adapter, issue) do
-      :ok
+         :ok <- maybe_reconcile_project_custom_fields(tracker_adapter, issue, desired.project_custom_fields) do
+      maybe_reconcile_issue_state_projection(tracker_adapter, issue)
     end
   end
 
@@ -135,9 +136,8 @@ defmodule SymphonyElixir.Tracker do
 
   defp maybe_reconcile_pr_lifecycle_hooks(adapter_module, issue)
        when is_atom(adapter_module) and is_map(issue) do
-    with :ok <- maybe_call_reconcile_for_merged_pr(adapter_module, issue),
-         :ok <- maybe_call_reconcile_for_closed_pr_rework(adapter_module, issue) do
-      :ok
+    with :ok <- maybe_call_reconcile_for_merged_pr(adapter_module, issue) do
+      maybe_call_reconcile_for_closed_pr_rework(adapter_module, issue)
     end
   end
 
@@ -165,14 +165,12 @@ defmodule SymphonyElixir.Tracker do
              adapter_module,
              :reconcile_issue_milestone,
              [issue_id, desired.milestone_number]
-           ),
-         :ok <-
-           maybe_call_reconcile(
-             adapter_module,
-             :reconcile_issue_assignees,
-             [issue_id, desired.assignees]
            ) do
-      :ok
+      maybe_call_reconcile(
+        adapter_module,
+        :reconcile_issue_assignees,
+        [issue_id, desired.assignees]
+      )
     end
   end
 
