@@ -136,7 +136,6 @@ defmodule SymphonyElixir.Workspace do
 
     case workspace_path_for_issue(safe_id, worker_host) do
       {:ok, workspace} -> remove(workspace, worker_host)
-      {:error, _reason} -> :ok
     end
 
     :ok

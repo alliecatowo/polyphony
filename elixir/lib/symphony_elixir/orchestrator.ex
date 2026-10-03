@@ -542,8 +542,6 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp terminate_task(_pid), do: :ok
-
   defp choose_issues(issues, state) do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
@@ -813,8 +811,6 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp build_policy_desired_project_custom_fields(_issue), do: %{}
-
   defp maybe_put_points_default(fields, %{priority: priority}) when is_integer(priority) do
     points =
       case priority do
@@ -953,8 +949,6 @@ defmodule SymphonyElixir.Orchestrator do
         issue
     end
   end
-
-  defp reconcile_tracker_primitives_for_dispatch(issue), do: issue
 
   defp complete_issue(%State{} = state, issue_id) do
     %{
@@ -1173,8 +1167,6 @@ defmodule SymphonyElixir.Orchestrator do
   defp reconcile_issue_primitives(%{} = issue) do
     Tracker.reconcile_issue_primitives(issue)
   end
-
-  defp reconcile_issue_primitives(_issue), do: :ok
 
   defp apply_orchestrator_tracker_writes(%{tracker_metadata: tracker_metadata} = issue)
        when is_map(tracker_metadata) do

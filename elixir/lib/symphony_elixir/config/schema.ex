@@ -231,9 +231,23 @@ defmodule SymphonyElixir.Config.Schema do
         empty_values: []
       )
       |> validate_required([:command])
+      |> validate_not_empty(:command)
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+    end
+
+    # `cast(..., empty_values: [])` keeps "" as a value, and since Ecto 3.14
+    # `validate_required/2` only treats the changeset's configured empty values as blank,
+    # so reject the empty string explicitly (whitespace-only commands stay valid).
+    defp validate_not_empty(changeset, field) do
+      validate_change(changeset, field, fn _field, value ->
+        if value == "" do
+          [{field, {"can't be blank", [validation: :required]}}]
+        else
+          []
+        end
+      end)
     end
   end
 

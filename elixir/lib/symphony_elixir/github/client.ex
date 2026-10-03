@@ -1213,8 +1213,6 @@ defmodule SymphonyElixir.GitHub.Client do
     dedupe_linked_prs(graphql_prs ++ project_prs)
   end
 
-  defp normalize_linked_pr_signals(_), do: []
-
   defp normalize_linked_prs(prs) when is_list(prs) do
     Enum.map(prs, fn pr ->
       %{
@@ -1298,8 +1296,6 @@ defmodule SymphonyElixir.GitHub.Client do
       "has_conflict_signal" => has_conflict_signal?
     }
   end
-
-  defp normalize_pr_lifecycle(_issue), do: %{}
 
   defp normalize_milestone(nil), do: nil
 
@@ -1444,8 +1440,6 @@ defmodule SymphonyElixir.GitHub.Client do
     end
   end
 
-  defp hydrate_blocker_states(issues), do: issues
-
   defp blocked_by_ids(%Issue{} = issue) do
     issue
     |> Map.get(:tracker_metadata, %{})
@@ -1557,8 +1551,6 @@ defmodule SymphonyElixir.GitHub.Client do
       }
     end)
   end
-
-  defp normalize_dependency_links(_), do: []
 
   defp fetch_issue_workflow_states_by_ids([]), do: {:ok, %{}}
 
@@ -1729,8 +1721,6 @@ defmodule SymphonyElixir.GitHub.Client do
       Auth.authorization_token(tracker)
     end
   end
-
-  defp graphql_token(tracker), do: Auth.authorization_token(tracker)
 
   defp post_graphql_request(payload, headers) do
     Req.post(Config.settings!().tracker.endpoint,
@@ -2156,14 +2146,14 @@ defmodule SymphonyElixir.GitHub.Client do
   end
 
   defp validate_project_field_value(value) when is_map(value) do
-    allowed_keys = MapSet.new(["date", "iterationId", "number", "singleSelectOptionId", "text"])
+    allowed_keys = ["date", "iterationId", "number", "singleSelectOptionId", "text"]
     keys = value |> Map.keys() |> Enum.map(&to_string/1)
 
     cond do
       keys == [] ->
         {:error, :invalid_project_field_value}
 
-      Enum.all?(keys, &MapSet.member?(allowed_keys, &1)) ->
+      Enum.all?(keys, &(&1 in allowed_keys)) ->
         :ok
 
       true ->

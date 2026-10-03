@@ -1,6 +1,6 @@
 [tools]
-erlang = "28"
-elixir = "1.19.5-otp-28"
+erlang = "29"
+elixir = "1.20.4-otp-29"
 
 [tasks.webhook]
 description = "Start local Polyphony server with GitHub webhook endpoint at /github/webhook"

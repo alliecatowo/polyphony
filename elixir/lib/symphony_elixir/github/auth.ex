@@ -30,7 +30,6 @@ defmodule SymphonyElixir.GitHub.Auth do
           end
         else
           {:error, reason} -> {:error, reason}
-          _ -> {:error, :missing_github_api_token}
         end
     end
   end
