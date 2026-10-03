@@ -9,6 +9,8 @@ permissions:
 
 jobs:
   validate-pr-description:
+    # Dependabot PR bodies are generated and cannot follow the repo template.
+    if: github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     defaults:
       run:
