@@ -65,9 +65,8 @@ defmodule SymphonyElixir.GitHub.Auth do
 
   defp fetch_installation_token(app_id, private_key_pem, owner, repo, opts) do
     with {:ok, app_jwt} <- mint_app_jwt(app_id, private_key_pem, opts),
-         {:ok, installation_id} <- discover_installation_id(app_jwt, owner, repo, opts),
-         {:ok, token, expires_at} <- create_installation_token(app_jwt, installation_id, opts) do
-      {:ok, token, expires_at}
+         {:ok, installation_id} <- discover_installation_id(app_jwt, owner, repo, opts) do
+      create_installation_token(app_jwt, installation_id, opts)
     end
   end
 
